@@ -1,0 +1,4 @@
+PyQt5==5.15.14
+qrcode==8.2
+pillow==11.3.0
+PyYAML==6.0.3

@@ -100,6 +100,78 @@ def get_effective_ip():
         return "N/A", "N/A", "N/A"
 
 
+_cpu_times_prev = None
+
+
+def _read_windows_cpu_times():
+    import ctypes
+    from ctypes import wintypes
+
+    class FILETIME(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", wintypes.DWORD),
+                    ("dwHighDateTime", wintypes.DWORD)]
+
+    idle = FILETIME()
+    kernel = FILETIME()
+    user = FILETIME()
+    if not ctypes.windll.kernel32.GetSystemTimes(
+            ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
+        return None
+
+    def _to_int(ft):
+        return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+
+    return _to_int(idle), _to_int(kernel), _to_int(user)
+
+
+def _windows_cpu_percent():
+    """CPU usage via GetSystemTimes (no WMI performance counters)."""
+    global _cpu_times_prev
+    cur = _read_windows_cpu_times()
+    if cur is None:
+        return None
+    prev = _cpu_times_prev
+    if prev is None:
+        # First sample only: take a short second sample so a value is returned.
+        time.sleep(0.1)
+        prev, cur = cur, _read_windows_cpu_times()
+        if cur is None:
+            return None
+    _cpu_times_prev = cur
+    idle_delta = cur[0] - prev[0]
+    total_delta = (cur[1] - prev[1]) + (cur[2] - prev[2])
+    if total_delta <= 0:
+        return None
+    busy = total_delta - idle_delta
+    return max(0.0, min(100.0, busy / total_delta * 100.0))
+
+
+def _windows_memory():
+    """Memory usage via GlobalMemoryStatusEx."""
+    import ctypes
+
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+    stat = MEMORYSTATUSEX()
+    stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+        return None
+    total_gb = stat.ullTotalPhys / (1024 ** 3)
+    used_gb = (stat.ullTotalPhys - stat.ullAvailPhys) / (1024 ** 3)
+    if total_gb <= 0:
+        return None
+    return used_gb / total_gb * 100.0, used_gb, total_gb
+
+
 def get_system_stats():
     system = platform.system()
     try:
@@ -127,30 +199,11 @@ def get_system_stats():
             mem_pct = (used_bytes / total_bytes * 100) if total_bytes > 0 else 0
             return cpu_pct, mem_pct, used_gb, total_gb
         elif system == "Windows":
-            cpu_pct = 0.0
-            out = subprocess.check_output(
-                ["powershell", "-NoProfile", "-Command",
-                 "(Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter \"Name='_Total'\").PercentProcessorTime"],
-                text=True, encoding="gbk", errors="ignore")
-            for line in out.splitlines():
-                line = line.strip()
-                if line:
-                    try:
-                        cpu_pct = float(line)
-                    except ValueError:
-                        pass
-                    break
-            out = subprocess.check_output(
-                ["powershell", "-NoProfile", "-Command",
-                 "$o=Get-CimInstance Win32_OperatingSystem; $o.TotalVisibleMemorySize; $o.FreePhysicalMemory"],
-                text=True, encoding="gbk", errors="ignore")
-            nums = [l.strip() for l in out.splitlines() if l.strip().isdigit()]
-            total_kb = int(nums[0]) if len(nums) >= 1 else 0
-            free_kb = int(nums[1]) if len(nums) >= 2 else 0
-            used_kb = total_kb - free_kb
-            used_gb = used_kb / (1024 ** 2)
-            total_gb = total_kb / (1024 ** 2)
-            mem_pct = (used_kb / total_kb * 100) if total_kb > 0 else 0
+            cpu_pct = _windows_cpu_percent()
+            mem = _windows_memory()
+            if mem is None:
+                return None, None, None, None
+            mem_pct, used_gb, total_gb = mem
             return cpu_pct, mem_pct, used_gb, total_gb
     except Exception:
         pass

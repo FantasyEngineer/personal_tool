@@ -45,6 +45,18 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller --noconfirm toolbox.spec
 
+      - name: Ad-hoc codesign (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # Apple Silicon refuses to load unsigned Mach-O, which surfaces as
+          # "app is damaged". Sign the bundle and all nested binaries ad-hoc.
+          APP="dist/Toolbox/Toolbox.app"
+          if [ -d "$APP" ]; then
+            codesign --remove-signature "$APP" 2>/dev/null || true
+            codesign --force --deep --sign - "$APP"
+            codesign --verify --deep --strict --verbose=2 "$APP"
+          fi
+
       - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |

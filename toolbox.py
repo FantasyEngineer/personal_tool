@@ -18,6 +18,7 @@ import random
 import datetime
 import colorsys
 import decimal
+import shutil
 import yaml
 from PIL import Image
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -26,7 +27,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QGraphicsDropShadowEffect, QTextEdit, QSplitter,
                               QPlainTextEdit, QComboBox, QCheckBox, QStackedWidget,
                               QGridLayout, QSpinBox, QTabWidget, QColorDialog,
-                              QFileDialog)
+                              QFileDialog, QInputDialog)
 from PyQt5.QtCore import Qt, QPoint, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QCursor, QColor, QPixmap, QPainter
 
@@ -293,8 +294,8 @@ def kill_process(pid):
         return False
 
 
-TOOL_WIN_W = 900
-TOOL_WIN_H = 600
+TOOL_WIN_W = 720
+TOOL_WIN_H = 480
 
 
 def tool_win_geometry():
@@ -4695,8 +4696,7 @@ class MatrixRainOverlay(QWidget):
         self._rows = 0
         self._cw = 18
         self._ch = 22
-        codes = list(range(0xFF66, 0xFF9D)) + list(range(0x30, 0x3A)) + list(range(0x41, 0x5B))
-        self._chars = [chr(c) for c in codes]
+        self._chars = ["0", "1"]
         self._font = QFont("Menlo", 15)
         self._font.setStyleHint(QFont.Monospace)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -5138,11 +5138,200 @@ class CommandReferenceWindow(QMainWindow):
             self.close()
 
 
+SSH_KEY_NAMES = ["id_ed25519", "id_rsa", "id_ecdsa", "id_dsa"]
+
+
+def find_ssh_pubkey():
+    ssh_dir = os.path.join(os.path.expanduser("~"), ".ssh")
+    for name in SSH_KEY_NAMES:
+        pub = os.path.join(ssh_dir, name + ".pub")
+        if os.path.isfile(pub):
+            try:
+                with open(pub, "r", encoding="utf-8", errors="ignore") as f:
+                    return pub, f.read().strip()
+            except OSError:
+                continue
+    return None, None
+
+
+def create_ssh_keypair(email, algorithm="ed25519"):
+    ssh_dir = os.path.join(os.path.expanduser("~"), ".ssh")
+    os.makedirs(ssh_dir, exist_ok=True)
+    priv = os.path.join(ssh_dir, "id_" + algorithm)
+    if os.path.exists(priv):
+        priv = os.path.join(ssh_dir, "id_%s_%s" % (algorithm, str(int(time.time()))[-6:]))
+    if not shutil.which("ssh-keygen"):
+        raise RuntimeError("未找到 ssh-keygen，请安装 OpenSSH（Windows：设置 → 可选功能 → 添加 OpenSSH 客户端）")
+    cmd = ["ssh-keygen", "-t", algorithm, "-f", priv, "-N", "", "-C", email]
+    if platform.system() == "Windows":
+        cmd = subprocess.list2cmdline(cmd)
+    proc = subprocess.run(cmd, shell=False, capture_output=True, text=True,
+                          errors="ignore", **win_no_console())
+    if proc.returncode != 0:
+        raise RuntimeError("生成失败: %s" % (proc.stderr or "").strip())
+    return priv + ".pub"
+
+
+def win_no_console():
+    """Windows: keep console from flashing when spawning child processes."""
+    if platform.system() == "Windows":
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+    return {}
+
+
+class SshPubkeyWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("SSH 公钥")
+        self.setGeometry(*tool_win_geometry())
+        self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
+        self.pub_path = None
+        self.pub_text = None
+        self.init_ui()
+        self.refresh()
+
+    def init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(15, 15, 15, 10)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        title = QLabel("SSH 公钥")
+        title.setFont(QFont("PingFang SC", 12, QFont.Bold))
+        title.setStyleSheet("color: #333333;")
+        header.addWidget(title)
+        header.addStretch()
+
+        gen_btn = QPushButton("生成密钥")
+        gen_btn.setFixedSize(70, 28)
+        gen_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        gen_btn.setStyleSheet("""
+            QPushButton { color: #FFFFFF; background: #1A73E8; border: none; border-radius: 4px; font-size: 12px; }
+            QPushButton:hover { background: #1557B0; }
+        """)
+        gen_btn.clicked.connect(self.do_generate)
+        header.addWidget(gen_btn)
+
+        open_btn = QPushButton("打开目录")
+        open_btn.setFixedSize(70, 28)
+        open_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        open_btn.setStyleSheet("""
+            QPushButton { color: #333333; background: #F0F0F0; border: 1px solid #D0D0D0; border-radius: 4px; font-size: 12px; }
+            QPushButton:hover { background: #E0E0E0; }
+        """)
+        open_btn.clicked.connect(self.open_ssh_dir)
+        header.addWidget(open_btn)
+
+        refresh_btn = QPushButton("刷新")
+        refresh_btn.setFixedSize(60, 28)
+        refresh_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        refresh_btn.setStyleSheet("""
+            QPushButton { color: #333333; background: #F0F0F0; border: 1px solid #D0D0D0; border-radius: 4px; font-size: 12px; }
+            QPushButton:hover { background: #E0E0E0; }
+        """)
+        refresh_btn.clicked.connect(self.refresh)
+        header.addWidget(refresh_btn)
+
+        copy_btn = QPushButton("复制")
+        copy_btn.setFixedSize(60, 28)
+        copy_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        copy_btn.setStyleSheet("""
+            QPushButton { color: #333333; background: #F0F0F0; border: 1px solid #D0D0D0; border-radius: 4px; font-size: 12px; }
+            QPushButton:hover { background: #E0E0E0; }
+        """)
+        copy_btn.clicked.connect(self.do_copy)
+        header.addWidget(copy_btn)
+        layout.addLayout(header)
+
+        self.result_text = QTextEdit()
+        self.result_text.setReadOnly(True)
+        self.result_text.setStyleSheet("""
+            QTextEdit { border: 1px solid #D0D0D0; border-radius: 4px; padding: 8px;
+                font-family: "Consolas", "Menlo", monospace; font-size: 12px; background: #FAFAFA; }
+        """)
+        layout.addWidget(self.result_text)
+
+        self.status_label = QLabel()
+        self.status_label.setFont(QFont("PingFang SC", 11))
+        self.status_label.setStyleSheet("color: #999999; font-size: 11px;")
+        layout.addWidget(self.status_label)
+
+    def set_status(self, text, ok=True):
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet("color: %s; font-size: 11px;" % ("#188038" if ok else "#D93025"))
+
+    def refresh(self):
+        self.pub_path, self.pub_text = find_ssh_pubkey()
+        if self.pub_text:
+            self.result_text.setPlainText(self.pub_text)
+            self.set_status("公钥文件：%s" % self.pub_path, ok=True)
+        else:
+            self.result_text.clear()
+            self.set_status("未找到公钥，点击「生成密钥」创建", ok=False)
+
+    def do_copy(self):
+        if not self.pub_text:
+            self.set_status("没有可复制的公钥", ok=False)
+            return
+        QApplication.clipboard().setText(self.pub_text)
+        self.set_status("已复制到剪贴板", ok=True)
+
+    def open_ssh_dir(self):
+        ssh_dir = os.path.join(os.path.expanduser("~"), ".ssh")
+        if not os.path.isdir(ssh_dir):
+            self.set_status("目录不存在：%s（先生成密钥）" % ssh_dir, ok=False)
+            return
+        system = platform.system()
+        try:
+            if system == "Windows":
+                os.startfile(ssh_dir)
+            elif system == "Darwin":
+                subprocess.Popen(["open", ssh_dir])
+            else:
+                subprocess.Popen(["xdg-open", ssh_dir])
+            self.set_status("已打开目录：%s" % ssh_dir, ok=True)
+        except Exception as e:
+            self.set_status("打开目录失败: %s" % e, ok=False)
+
+    def do_generate(self):
+        existing_path, existing_text = find_ssh_pubkey()
+        if existing_text:
+            self.result_text.setPlainText(existing_text)
+            self.set_status("已存在公钥：%s" % existing_path, ok=True)
+            return
+        email, ok = QInputDialog.getText(self, "生成 SSH 密钥", "邮箱（用作密钥备注，可留空）:",
+                                         QLineEdit.Normal, "")
+        if not ok:
+            return
+        email = email.strip()
+        if not email:
+            email = "%s@%s" % (os.path.expanduser("~").split(os.sep)[-1], platform.node())
+        try:
+            pub = create_ssh_keypair(email)
+            with open(pub, "r", encoding="utf-8", errors="ignore") as f:
+                self.pub_path, self.pub_text = pub, f.read().strip()
+        except Exception as e:
+            self.result_text.setPlainText(str(e))
+            self.set_status("生成失败", ok=False)
+            return
+        self.result_text.setPlainText(self.pub_text)
+        self.set_status("已生成密钥：%s" % pub, ok=True)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+
+
 class ToolboxWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("系统工具箱")
-        self.setGeometry(200, 200, 700, 500)
+        screen = QApplication.primaryScreen().availableGeometry()
+        w, h = 700, min(500, screen.height() - 40)
+        self.setGeometry(screen.x() + (screen.width() - w) // 2,
+                         screen.y() + (screen.height() - h) // 2, w, h)
         self.setStyleSheet("""
             QMainWindow { background: #FFFFFF; }
         """)
@@ -5176,6 +5365,7 @@ class ToolboxWindow(QMainWindow):
         self.portscan_window = None
         self.speedtest_window = None
         self.cmdref_window = None
+        self.ssh_window = None
         self.init_ui()
 
     def init_ui(self):
@@ -5196,7 +5386,7 @@ class ToolboxWindow(QMainWindow):
 
         section1 = self.create_section("系统工具", [
             "获取进程", "端口扫描", "Ping 测试", "DNS 查询", "路由追踪",
-            "网络测速", "环境变量", "命令速查", "防黑屏", "文字雨"
+            "网络测速", "环境变量", "命令速查", "SSH 公钥", "防黑屏", "文字雨"
         ], {
             "获取进程": self.show_process_search,
             "端口扫描": self.show_portscan,
@@ -5205,7 +5395,8 @@ class ToolboxWindow(QMainWindow):
             "路由追踪": self.show_traceroute,
             "网络测速": self.show_speedtest,
             "环境变量": self.show_env_vars,
-            "命令速查": self.show_command_reference
+            "命令速查": self.show_command_reference,
+            "SSH 公钥": self.show_ssh_pubkey
         }, {
             "防黑屏": self.set_awake,
             "文字雨": self.set_matrix_rain
@@ -5510,6 +5701,12 @@ class ToolboxWindow(QMainWindow):
             self.cmdref_window = CommandReferenceWindow()
         self.cmdref_window.show()
         self.cmdref_window.activateWindow()
+
+    def show_ssh_pubkey(self):
+        if self.ssh_window is None:
+            self.ssh_window = SshPubkeyWindow()
+        self.ssh_window.show()
+        self.ssh_window.activateWindow()
 
     def show_unit_convert(self):
         if self.unit_window is None:

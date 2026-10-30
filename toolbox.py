@@ -19,6 +19,7 @@ import datetime
 import colorsys
 import decimal
 import shutil
+import shlex
 import yaml
 from PIL import Image
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -27,9 +28,9 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QGraphicsDropShadowEffect, QTextEdit, QSplitter,
                               QPlainTextEdit, QComboBox, QCheckBox, QStackedWidget,
                               QGridLayout, QSpinBox, QTabWidget, QColorDialog,
-                              QFileDialog, QInputDialog)
+                              QFileDialog, QInputDialog, QListWidget, QListWidgetItem)
 from PyQt5.QtCore import Qt, QPoint, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QFont, QCursor, QColor, QPixmap, QPainter
+from PyQt5.QtGui import QFont, QCursor, QColor, QPixmap, QPainter, QIcon
 
 
 def get_effective_ip():
@@ -311,6 +312,44 @@ def tool_win_geometry():
     except Exception:
         pass
     return x, y, w, h
+
+
+def app_icon():
+    """Window/taskbar icon from assets/, resolved for both dev runs and PyInstaller bundles."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    for name in ("icon.ico", "icon.icns", "icon.png"):
+        path = os.path.join(base, "assets", name)
+        if os.path.exists(path):
+            return QIcon(path)
+    return QIcon()
+
+
+HISTORY_LIMIT = 50
+JSON_HISTORY_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "json_history.json")
+
+
+def load_history(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def append_history(path, entry):
+    items = load_history(path)
+    if items and items[0].get("input") == entry.get("input"):
+        return items
+    items.insert(0, entry)
+    items = items[:HISTORY_LIMIT]
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False)
+    except OSError:
+        pass
+    return items
 
 
 class ProcessSearchPopup(QMainWindow):
@@ -670,6 +709,39 @@ class JsonFormatterWindow(QMainWindow):
 
         layout.addWidget(splitter)
 
+        history_layout = QHBoxLayout()
+        history_layout.setSpacing(8)
+        history_label = QLabel("历史")
+        history_label.setStyleSheet("color: #999999; font-size: 12px;")
+        history_layout.addWidget(history_label)
+
+        self.history_combo = QComboBox()
+        self.history_combo.setStyleSheet("""
+            QComboBox { border: 1px solid #D0D0D0; border-radius: 4px; padding: 3px 8px;
+                font-size: 12px; background: #FFFFFF; color: #333333; }
+            QComboBox:focus { border-color: #1A73E8; }
+            QComboBox::drop-down { border: none; width: 20px; }
+        """)
+        self.history_combo.activated.connect(self.load_history_entry)
+        history_layout.addWidget(self.history_combo, 1)
+        layout.addLayout(history_layout)
+
+        self.refresh_history()
+
+    def refresh_history(self):
+        self._history = load_history(JSON_HISTORY_PATH)
+        self.history_combo.blockSignals(True)
+        self.history_combo.clear()
+        for item in self._history:
+            head = (item.get("input") or "").strip().splitlines()
+            preview = head[0][:70] if head else ""
+            self.history_combo.addItem("%s  %s" % (item.get("time", ""), preview))
+        self.history_combo.blockSignals(False)
+
+    def load_history_entry(self, index):
+        if 0 <= index < len(self._history):
+            self.input_text.setPlainText(self._history[index]["input"])
+
     def do_format(self):
         raw = self.input_text.toPlainText().strip()
         if not raw:
@@ -679,6 +751,11 @@ class JsonFormatterWindow(QMainWindow):
             parsed = json.loads(raw)
             formatted = json.dumps(parsed, indent=2, ensure_ascii=False)
             self.output_text.setPlainText(formatted)
+            append_history(JSON_HISTORY_PATH, {
+                "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "input": raw,
+            })
+            self.refresh_history()
         except json.JSONDecodeError as e:
             self.output_text.setPlainText(f"JSON 格式错误:\n{e}")
 
@@ -1170,6 +1247,47 @@ class UnicodeEscapeWindow(QMainWindow):
             self.close()
 
 
+class TabbedToolWindow(QMainWindow):
+    """One entry point hosting several single-purpose tool windows as tabs."""
+
+    def __init__(self, title, tools):
+        super().__init__()
+        self.setWindowTitle(title)
+        self.setGeometry(*tool_win_geometry())
+        self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
+        tabs = QTabWidget()
+        tabs.setStyleSheet(_tab_style())
+        # Each tab is a central widget lifted out of its own window class; those
+        # owner objects hold the slots the tab's buttons are connected to.
+        self._owners = []
+        for cls, label in tools:
+            win = cls()
+            self._owners.append(win)
+            tabs.addTab(win.takeCentralWidget(), label)
+        self.setCentralWidget(tabs)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+
+
+class CodecWindow(TabbedToolWindow):
+    def __init__(self):
+        super().__init__("编解码", (
+            (Base64Window, "Base64"),
+            (UrlEncodeWindow, "URL"),
+            (UnicodeEscapeWindow, "Unicode 转义"),
+        ))
+
+
+class MarkupWindow(TabbedToolWindow):
+    def __init__(self):
+        super().__init__("JSON / XML", (
+            (JsonFormatterWindow, "JSON"),
+            (XmlFormatterWindow, "XML"),
+        ))
+
+
 class TextStatWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1270,6 +1388,21 @@ class ImageToolWindow(QMainWindow):
     EXT = {"PNG": "png", "JPEG": "jpg", "WEBP": "webp", "GIF": "gif", "BMP": "bmp", "TIFF": "tiff"}
     IMAGE_EXTS = ("png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif")
     QUALITY_FORMATS = ("JPEG", "WEBP")
+    # 300dpi 换算的常用尺寸：证件类为竖版，冲印类的“几寸”指长边英寸
+    PHOTO_SIZE_GROUPS = [
+        ("证件照", [
+            ("1寸 295×413 (2.5×3.5cm)", 295, 413),
+            ("小二寸 413×531 (3.5×4.5cm)", 413, 531),
+            ("大一寸 390×567 (3.3×4.8cm)", 390, 567),
+            ("2寸 413×626 (3.5×5.3cm)", 413, 626),
+            ("3寸 650×993 (5.5×8.4cm)", 650, 993),
+        ]),
+        ("冲印", [
+            ("5寸 1050×1500 (8.9×12.7cm)", 1050, 1500),
+            ("6寸 1200×1800 (10.2×15.2cm)", 1200, 1800),
+            ("7寸 1500×2100 (12.7×17.8cm)", 1500, 2100),
+        ]),
+    ]
 
     SEC_BTN = """
         QPushButton { color: #333333; background: #F0F0F0; border: 1px solid #D0D0D0;
@@ -1491,6 +1624,26 @@ class ImageToolWindow(QMainWindow):
         rsave.setFixedWidth(110)
         rsave.clicked.connect(self.resize_save)
         grid.addWidget(rsave, 2, 3, Qt.AlignRight)
+
+        grid.addWidget(self._lab("常用尺寸"), 3, 0)
+        self.r_preset = QComboBox()
+        self.r_preset.addItem("自定义", None)
+        for group, sizes in self.PHOTO_SIZE_GROUPS:
+            self.r_preset.insertSeparator(self.r_preset.count())
+            header = self.r_preset.count()
+            self.r_preset.addItem(group)
+            # Non-selectable group heading: separators alone do not label the group.
+            self.r_preset.model().item(header).setFlags(Qt.NoItemFlags)
+            for label, pw, ph in sizes:
+                self.r_preset.addItem(label, (pw, ph))
+        self.r_preset.setStyleSheet("QComboBox { %s }" % self.FIELD)
+        self.r_preset.currentIndexChanged.connect(self._apply_preset)
+        grid.addWidget(self.r_preset, 3, 1, 1, 2)
+
+        self.r_crop = QCheckBox("居中裁剪填充")
+        self.r_crop.setStyleSheet("QCheckBox { font-family: 'PingFang SC'; font-size: 12px; color: #333; }")
+        self.r_crop.setToolTip("按目标比例从中心裁掉多余部分，避免证件照被拉伸变形")
+        grid.addWidget(self.r_crop, 3, 3, Qt.AlignRight)
         v.addLayout(grid)
 
         self.r_status = QLabel("留空的维度按比例自动计算；修改宽/高即可联动。")
@@ -1660,7 +1813,10 @@ class ImageToolWindow(QMainWindow):
             self.r_status.setStyleSheet("color: #D93025; font-family: 'PingFang SC'; font-size: 12px;")
             return
         try:
-            resized = self.pil_img.resize((w, h), Image.LANCZOS)
+            src = self.pil_img
+            if self.r_crop.isChecked():
+                src = self._crop_to_aspect(src, w, h)
+            resized = src.resize((w, h), Image.LANCZOS)
         except Exception as e:
             self.r_status.setText(f"缩放失败: {e}")
             self.r_status.setStyleSheet("color: #D93025; font-family: 'PingFang SC'; font-size: 12px;")
@@ -1673,6 +1829,37 @@ class ImageToolWindow(QMainWindow):
         if not save_path:
             return
         self._save(resized, fmt, self.r_quality.value(), save_path, self.r_status)
+
+    def _apply_preset(self, index):
+        size = self.r_preset.itemData(index)
+        if not size:
+            return
+        w, h = size
+        # Block the aspect linkage while filling both fields, otherwise the width
+        # change would rewrite the preset height from the source image ratio.
+        self._aspect_lock = True
+        try:
+            self.rw.setText(str(w))
+            self.rh.setText(str(h))
+        finally:
+            self._aspect_lock = False
+        self.r_crop.setChecked(True)
+        self.r_status.setText("已选 %s，居中裁剪填充。" % self.r_preset.itemText(index))
+        self.r_status.setStyleSheet("color: #666666; font-family: 'PingFang SC'; font-size: 12px;")
+
+    @staticmethod
+    def _crop_to_aspect(img, w, h):
+        target = w / float(h)
+        ow, oh = img.width, img.height
+        if abs(ow / float(oh) - target) < 1e-3:
+            return img
+        if ow / float(oh) > target:
+            crop_w = max(1, int(round(oh * target)))
+            left = (ow - crop_w) // 2
+            return img.crop((left, 0, left + crop_w, oh))
+        crop_h = max(1, int(round(ow / target)))
+        top = (oh - crop_h) // 2
+        return img.crop((0, top, ow, top + crop_h))
 
     def _save(self, img, fmt, quality, save_path, status_label):
         try:
@@ -3733,36 +3920,73 @@ class PortScanWindow(QMainWindow):
 
 class SpeedTestWorker(QThread):
     speed_done = pyqtSignal(str, str)
+    progress = pyqtSignal(str)
+
+    SAMPLE_BYTES = 8 * 1024 * 1024
+    TIME_BUDGET = 20
+    SOCKET_TIMEOUT = 10
 
     def __init__(self):
         super().__init__()
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
 
     def run(self):
         urls = [
-            "https://speed.cloudflare.com/__down?bytes=25000000",
+            "https://speed.cloudflare.com/__down?bytes=%d" % self.SAMPLE_BYTES,
             "https://speed.hetzner.de/100MB.bin",
         ]
         last_err = None
         for url in urls:
+            if self._cancelled:
+                self.speed_done.emit("已取消", "")
+                return
             try:
-                start_time = time.time()
-                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                response = urllib.request.urlopen(req, timeout=15)
-                total = 0
-                while True:
-                    chunk = response.read(65536)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                duration = time.time() - start_time
-
-                size_mb = total / (1024 * 1024)
-                speed_mbps = (size_mb * 8) / duration if duration > 0 else 0
-                self.speed_done.emit("测速完成", f"下载速度: {speed_mbps:.1f} Mbps\n({size_mb:.1f} MB / {duration:.1f} 秒)")
+                result = self._measure(url)
+                if result is None:
+                    self.speed_done.emit("已取消", "")
+                    return
+                self.speed_done.emit("测速完成", result)
                 return
             except Exception as e:
                 last_err = e
-        self.speed_done.emit("测速失败", f"错误: {last_err}")
+        self.speed_done.emit("测速失败", "错误: %s" % last_err)
+
+    def _measure(self, url):
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        response = urllib.request.urlopen(req, timeout=self.SOCKET_TIMEOUT)
+        total = 0
+        start = time.perf_counter()
+        last_report = start
+        try:
+            while total < self.SAMPLE_BYTES:
+                if self._cancelled:
+                    return None
+                chunk = response.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                now = time.perf_counter()
+                elapsed = now - start
+                if now - last_report >= 0.5:
+                    self.progress.emit("%s Mbps（已下载 %.1f MB）" % (
+                        self._mbps(total, elapsed), total / 1048576.0))
+                    last_report = now
+                if elapsed >= self.TIME_BUDGET:
+                    break
+        finally:
+            response.close()
+        duration = time.perf_counter() - start
+        if total == 0 or duration <= 0:
+            raise RuntimeError("未收到数据")
+        return "下载速度: %s Mbps\n(%.1f MB / %.1f 秒)" % (
+            self._mbps(total, duration), total / 1048576.0, duration)
+
+    @staticmethod
+    def _mbps(total_bytes, seconds):
+        return "%.1f" % ((total_bytes / 1048576.0 * 8) / seconds) if seconds > 0 else "0.0"
 
 
 class SpeedTestWindow(QMainWindow):
@@ -3818,19 +4042,28 @@ class SpeedTestWindow(QMainWindow):
         layout.addStretch()
 
     def do_test(self):
-        if not self.test_btn.isEnabled():
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.cancel()
+            self.status_label.setText("正在取消...")
             return
-        self.status_label.setText("正在下载测试文件...")
+        self.status_label.setText("正在连接测速节点...")
         self.result_label.setText("")
-        self.test_btn.setEnabled(False)
+        self.test_btn.setText("取消")
         self.worker = SpeedTestWorker()
         self.worker.speed_done.connect(self.show_speed_result)
+        self.worker.progress.connect(self.status_label.setText)
         self.worker.start()
 
     def show_speed_result(self, status, result):
         self.status_label.setText(status)
         self.result_label.setText(result)
-        self.test_btn.setEnabled(True)
+        self.test_btn.setText("开始测速")
+
+    def closeEvent(self, event):
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.cancel()
+            self.worker.wait(3000)
+        super().closeEvent(event)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
@@ -4351,6 +4584,133 @@ class TimestampWindow(QMainWindow):
             self.close()
 
 
+POSIX_ENV_FILE = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "env.sh")
+POSIX_RC_MARKER = "# personal_toolbox env"
+SHELL_RC_FILES = (".zshrc", ".bashrc")
+WIN_ENV_SUBKEY = "Environment"
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def user_env_location():
+    return r"HKCU\Environment" if os.name == "nt" else POSIX_ENV_FILE
+
+
+def load_user_env():
+    return _win_load_env() if os.name == "nt" else _posix_load_env()
+
+
+def save_user_env(name, value):
+    if os.name == "nt":
+        _win_save_env(name, value)
+        _win_broadcast_env()
+    else:
+        items = _posix_load_env()
+        items[name] = value
+        _posix_write_env(items)
+    os.environ[name] = value
+
+
+def remove_user_env(name):
+    if os.name == "nt":
+        _win_remove_env(name)
+        _win_broadcast_env()
+    else:
+        items = _posix_load_env()
+        items.pop(name, None)
+        _posix_write_env(items)
+    os.environ.pop(name, None)
+
+
+def _win_load_env():
+    import winreg
+    items = {}
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WIN_ENV_SUBKEY) as key:
+            for i in range(winreg.QueryInfoKey(key)[1]):
+                name, value, _type = winreg.EnumValue(key, i)
+                items[name] = value
+    except OSError:
+        pass
+    return items
+
+
+def _win_save_env(name, value):
+    import winreg
+    # %VAR% references only survive as REG_EXPAND_SZ; REG_SZ would freeze them literally.
+    vtype = winreg.REG_EXPAND_SZ if "%" in value else winreg.REG_SZ
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, WIN_ENV_SUBKEY) as key:
+        winreg.SetValueEx(key, name, 0, vtype, value)
+
+
+def _win_remove_env(name):
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WIN_ENV_SUBKEY, 0, winreg.KEY_SET_VALUE) as key:
+        winreg.DeleteValue(key, name)
+
+
+def _win_broadcast_env():
+    """Tell running shells/Explorer to reload the environment; best effort."""
+    try:
+        import ctypes
+        HWND_BROADCAST = 0xFFFF
+        WM_SETTINGCHANGE = 0x1A
+        SMTO_ABORTIFHUNG = 0x0002
+        ctypes.windll.user32.SendMessageTimeoutW(
+            HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment", SMTO_ABORTIFHUNG, 5000, None)
+    except Exception:
+        pass
+
+
+def _posix_load_env():
+    items = {}
+    try:
+        with open(POSIX_ENV_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line.startswith("export "):
+                    continue
+                name, sep, raw = line[len("export "):].partition("=")
+                if not sep or not ENV_NAME_RE.match(name):
+                    continue
+                try:
+                    # shlex does not treat "=" as a separator, so unquote the value alone.
+                    parts = shlex.split(raw)
+                except ValueError:
+                    continue
+                items[name] = parts[0] if parts else ""
+    except OSError:
+        pass
+    return items
+
+
+def _posix_write_env(items):
+    try:
+        os.makedirs(os.path.dirname(POSIX_ENV_FILE), exist_ok=True)
+        with open(POSIX_ENV_FILE, "w", encoding="utf-8") as f:
+            for name in sorted(items):
+                f.write("export %s=%s\n" % (name, shlex.quote(items[name])))
+    except OSError as e:
+        raise RuntimeError("无法写入 %s: %s" % (POSIX_ENV_FILE, e))
+    _posix_ensure_rc()
+
+
+def _posix_ensure_rc():
+    """Source the env file from interactive shells, once per rc file."""
+    for rc in SHELL_RC_FILES:
+        path = os.path.join(os.path.expanduser("~"), rc)
+        try:
+            existing = ""
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    existing = f.read()
+            if POSIX_RC_MARKER in existing:
+                continue
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n%s\n. %s\n" % (POSIX_RC_MARKER, shlex.quote(POSIX_ENV_FILE)))
+        except OSError:
+            continue
+
+
 class EnvVarWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -4360,19 +4720,23 @@ class EnvVarWindow(QMainWindow):
         self.init_ui()
 
     def init_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
+        tabs = QTabWidget()
+        tabs.setStyleSheet(_tab_style())
+        tabs.addTab(self._build_process_tab(), "当前进程")
+        tabs.addTab(_UserEnvPage(), "用户级 (永久)")
+        self.setCentralWidget(tabs)
+
+    def _build_process_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
         layout.setContentsMargins(15, 15, 15, 10)
         layout.setSpacing(10)
 
-        search_layout = QHBoxLayout()
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("搜索变量名或值...")
         self.search_input.setStyleSheet(_lineedit_style())
         self.search_input.textChanged.connect(self.filter_vars)
-        search_layout.addWidget(self.search_input)
-        layout.addLayout(search_layout)
+        layout.addWidget(self.search_input)
 
         self.result_text = QTextEdit()
         self.result_text.setReadOnly(True)
@@ -4381,6 +4745,7 @@ class EnvVarWindow(QMainWindow):
 
         self._all_vars = dict(os.environ)
         self.filter_vars()
+        return page
 
     def filter_vars(self):
         keyword = self.search_input.text().strip().lower()
@@ -4396,46 +4761,206 @@ class EnvVarWindow(QMainWindow):
             self.close()
 
 
-class UnitConvertWindow(QMainWindow):
-    BYTE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]
-    TIME_UNITS = ["纳秒", "微秒", "毫秒", "秒", "分钟", "小时", "天"]
+class _UserEnvPage(QWidget):
+    """增删改用户级环境变量：Windows 落到注册表，macOS/Linux 写入 env.sh 并由 shell 加载。"""
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("单位换算")
-        self.setGeometry(*tool_win_geometry())
-        self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
-        self.init_ui()
-
-    def init_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 15, 15, 10)
-        layout.setSpacing(12)
+        layout.setSpacing(10)
 
-        type_layout = QHBoxLayout()
-        type_layout.addWidget(QLabel("类别:"))
-        self.type_combo = QComboBox()
-        self.type_combo.addItems(["字节 (B/KB/MB/GB)", "时间 (ms/s/min)"])
-        self.type_combo.setStyleSheet(_combo_style())
-        self.type_combo.currentIndexChanged.connect(self.on_type_change)
-        type_layout.addWidget(self.type_combo)
-        type_layout.addStretch()
-        layout.addLayout(type_layout)
+        row = QHBoxLayout()
+        for text, slot, primary in (("添加", self.do_add, True), ("修改", self.do_edit, False),
+                                    ("删除", self.do_delete, False), ("刷新", self.refresh, False)):
+            btn = QPushButton(text)
+            btn.setFixedSize(72, 30)
+            btn.setCursor(QCursor(Qt.PointingHandCursor))
+            btn.setStyleSheet(_primary_btn() if primary else _secondary_btn())
+            btn.clicked.connect(slot)
+            row.addWidget(btn)
+        row.addStretch()
+        location = QLabel("保存位置: " + user_env_location())
+        location.setStyleSheet("color: #999999; font-family: 'PingFang SC'; font-size: 11px;")
+        row.addWidget(location)
+        layout.addLayout(row)
 
-        val_layout = QHBoxLayout()
-        val_layout.addWidget(QLabel("数值:"))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("搜索变量名或值...")
+        self.search_input.setStyleSheet(_lineedit_style())
+        self.search_input.textChanged.connect(self.refresh)
+        layout.addWidget(self.search_input)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setStyleSheet("""
+            QListWidget { border: 1px solid #D0D0D0; border-radius: 6px; background: #FAFAFA;
+                font-family: "Menlo", "Consolas", monospace; font-size: 12px; color: #333333; }
+            QListWidget::item { padding: 4px 8px; }
+            QListWidget::item:selected { background: #E8F0FE; color: #1A73E8; }
+        """)
+        layout.addWidget(self.list_widget)
+
+        self.status_label = QLabel("双击条目可直接修改。")
+        self.status_label.setStyleSheet("color: #999999; font-family: 'PingFang SC'; font-size: 12px;")
+        layout.addWidget(self.status_label)
+
+        self._items = {}
+        self.list_widget.itemDoubleClicked.connect(lambda _i: self.do_edit())
+        self.refresh()
+
+    def _set_status(self, text, color):
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet("color: %s; font-family: 'PingFang SC'; font-size: 12px;" % color)
+
+    def refresh(self):
+        self._items = load_user_env()
+        keyword = self.search_input.text().strip().lower()
+        self.list_widget.clear()
+        for name in sorted(self._items, key=str.upper):
+            value = self._items[name]
+            if keyword and keyword not in name.lower() and keyword not in value.lower():
+                continue
+            item = QListWidgetItem("%s = %s" % (name, value))
+            item.setData(Qt.UserRole, name)
+            self.list_widget.addItem(item)
+        if not self.list_widget.count():
+            self.list_widget.addItem(QListWidgetItem("无匹配变量"))
+
+    def _selected_name(self):
+        item = self.list_widget.currentItem()
+        if item is None:
+            return None
+        return item.data(Qt.UserRole)
+
+    def do_add(self):
+        name, ok = QInputDialog.getText(self, "添加环境变量", "变量名 (如 MY_TOOL):")
+        name = name.strip()
+        if not ok or not self._check_name(name):
+            return
+        if name in self._items:
+            answer = QMessageBox.question(
+                self, "已存在", "%s 已存在，覆盖其值？" % name,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+        value = self._ask_value(name, self._items.get(name, ""))
+        if value is None:
+            return
+        self._apply(name, value, "已保存")
+
+    def do_edit(self):
+        name = self._selected_name()
+        if not name:
+            self._set_status("请先选中一个变量。", "#D93025")
+            return
+        value = self._ask_value(name, self._items.get(name, ""))
+        if value is None:
+            return
+        self._apply(name, value, "已更新")
+
+    def do_delete(self):
+        name = self._selected_name()
+        if not name:
+            self._set_status("请先选中一个变量。", "#D93025")
+            return
+        answer = QMessageBox.question(
+            self, "删除确认",
+            "从用户环境变量中删除 %s？\n已打开的程序不会立即感知，需要重启。" % name,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            remove_user_env(name)
+        except Exception as e:
+            self._fail("删除失败", e)
+            return
+        self.refresh()
+        self._set_status("已删除 %s。" % name, "#188038")
+
+    def _path_mode(self):
+        box = QMessageBox(self)
+        box.setWindowTitle("PATH 处理")
+        box.setText("已有用户级 PATH。\n追加＝把新值拼到末尾；整条覆盖＝用新值替换整个 PATH。")
+        append_btn = box.addButton("追加到末尾", QMessageBox.AcceptRole)
+        overwrite_btn = box.addButton("整条覆盖", QMessageBox.DestructiveRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(append_btn)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is append_btn:
+            return "append"
+        if clicked is overwrite_btn:
+            return "overwrite"
+        return None
+
+    def _ask_value(self, name, current):
+        mode = "set"
+        prefill = current
+        if name.upper() == "PATH" and current:
+            mode = self._path_mode()
+            if mode is None:
+                return None
+            if mode == "append":
+                prefill = ""
+        text, ok = QInputDialog.getText(self, "变量值", "%s 的值:" % name, QLineEdit.Normal, prefill)
+        if not ok:
+            return None
+        if mode == "append":
+            if not text.strip():
+                return current
+            return current.rstrip(os.pathsep) + os.pathsep + text.strip().strip(os.pathsep)
+        return text
+
+    def _apply(self, name, value, verb):
+        if "\n" in value:
+            self._set_status("变量值不能包含换行。", "#D93025")
+            return
+        try:
+            save_user_env(name, value)
+        except Exception as e:
+            self._fail("保存失败", e)
+            return
+        self.refresh()
+        self._set_status("%s %s = %s（%s）" % (verb, name, value, user_env_location()), "#188038")
+
+    def _check_name(self, name):
+        if not name:
+            return False
+        if not ENV_NAME_RE.match(name):
+            self._set_status("变量名只能由字母、数字、下划线组成，且不能以数字开头。", "#D93025")
+            return False
+        return True
+
+    def _fail(self, title, error):
+        self._set_status("%s: %s" % (title, error), "#D93025")
+        QMessageBox.warning(self, title, str(error), QMessageBox.Ok)
+
+
+class _UnitConvertPage(QWidget):
+    """一个换算类别：输入数值和源单位，一次列出该类别下所有单位的结果。"""
+
+    def __init__(self, units, factors):
+        super().__init__()
+        self._units = units
+        self._factors = factors
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(15, 15, 15, 10)
+        layout.setSpacing(10)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("数值:"))
         self.value_input = QLineEdit()
         self.value_input.setPlaceholderText("输入数值...")
         self.value_input.setStyleSheet(_lineedit_style())
         self.value_input.textChanged.connect(self.do_convert)
-        val_layout.addWidget(self.value_input)
+        row.addWidget(self.value_input, 1)
         self.src_combo = QComboBox()
+        self.src_combo.addItems(units)
         self.src_combo.setStyleSheet(_combo_style())
         self.src_combo.currentIndexChanged.connect(self.do_convert)
-        val_layout.addWidget(self.src_combo)
-        layout.addLayout(val_layout)
+        row.addWidget(self.src_combo)
+        layout.addLayout(row)
 
         result_label = QLabel("换算结果")
         result_label.setFont(QFont("PingFang SC", 12, QFont.Bold))
@@ -4454,16 +4979,6 @@ class UnitConvertWindow(QMainWindow):
         clear_btn.clicked.connect(self.do_clear)
         layout.addWidget(clear_btn)
 
-        self.on_type_change()
-
-    def on_type_change(self):
-        units = self.BYTE_UNITS if self.type_combo.currentIndex() == 0 else self.TIME_UNITS
-        self.src_combo.blockSignals(True)
-        self.src_combo.clear()
-        self.src_combo.addItems(units)
-        self.src_combo.blockSignals(False)
-        self.do_convert()
-
     def do_convert(self):
         raw = self.value_input.text().strip()
         if not raw:
@@ -4474,29 +4989,41 @@ class UnitConvertWindow(QMainWindow):
         except ValueError:
             self.result_text.setPlainText("请输入有效数字")
             return
-        idx = self.src_combo.currentIndex()
-        lines = []
-        if self.type_combo.currentIndex() == 0:
-            base_bytes = val * (1024 ** idx)
-            for i, unit in enumerate(self.BYTE_UNITS):
-                v = base_bytes / (1024 ** i)
-                lines.append(f"{self._fmt(v)} {unit}")
-        else:
-            ns_per = [1, 1000, 1000000, 1000000000, 60000000000, 3600000000000, 86400000000000]
-            total_ns = val * ns_per[idx]
-            for i, unit in enumerate(self.TIME_UNITS):
-                v = total_ns / ns_per[i]
-                lines.append(f"{self._fmt(v)} {unit}")
-        self.result_text.setPlainText('\n'.join(lines))
-
-    def _fmt(self, v):
-        if v == int(v) and abs(v) < 1e15:
-            return str(int(v))
-        return f"{v:.6g}"
+        total = val * self._factors[self.src_combo.currentIndex()]
+        lines = ["%s %s" % (self._fmt(total / factor), unit)
+                 for unit, factor in zip(self._units, self._factors)]
+        self.result_text.setPlainText("\n".join(lines))
 
     def do_clear(self):
-        self.value_input.setText("")
+        self.value_input.clear()
         self.result_text.setPlainText("")
+
+    @staticmethod
+    def _fmt(v):
+        if v == int(v) and abs(v) < 1e15:
+            return str(int(v))
+        return "%.6g" % v
+
+
+class UnitConvertWindow(QMainWindow):
+    BYTE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]
+    TIME_UNITS = ["纳秒", "微秒", "毫秒", "秒", "分钟", "小时", "天"]
+    NS_PER_UNIT = [1, 1000, 1000000, 1000000000, 60000000000, 3600000000000, 86400000000000]
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("单位转换")
+        self.setGeometry(*tool_win_geometry())
+        self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
+        self.init_ui()
+
+    def init_ui(self):
+        tabs = QTabWidget()
+        tabs.setStyleSheet(_tab_style())
+        byte_factors = [1024 ** i for i in range(len(self.BYTE_UNITS))]
+        tabs.addTab(_UnitConvertPage(self.BYTE_UNITS, byte_factors), "字节")
+        tabs.addTab(_UnitConvertPage(self.TIME_UNITS, self.NS_PER_UNIT), "时间")
+        self.setCentralWidget(tabs)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
@@ -4646,6 +5173,16 @@ def _output_style():
     return """
         QTextEdit { border: 1px solid #D0D0D0; border-radius: 4px; padding: 8px;
             font-family: "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13px; background: #FAFAFA; }
+    """
+
+
+def _tab_style():
+    return """
+        QTabWidget::pane { background: #FFFFFF; border: 1px solid #D0D0D0; border-radius: 4px; }
+        QTabBar::tab { background: #F0F0F0; color: #333333; border: 1px solid #D0D0D0;
+            border-bottom: none; border-top-left-radius: 4px; border-top-right-radius: 4px;
+            padding: 6px 14px; margin-right: 2px; font-size: 12px; }
+        QTabBar::tab:selected { background: #FFFFFF; color: #1A73E8; }
     """
 
 
@@ -5324,6 +5861,129 @@ class SshPubkeyWindow(QMainWindow):
             self.close()
 
 
+class MortgageWindow(QMainWindow):
+    """房贷计算：等额本息 / 等额本金。"""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("房贷计算器")
+        self.setGeometry(*tool_win_geometry())
+        self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
+        self.init_ui()
+
+    def init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(15, 15, 15, 10)
+        layout.setSpacing(10)
+
+        form = QGridLayout()
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(10)
+        self.amount_input = QLineEdit()
+        self.amount_input.setPlaceholderText("如: 100")
+        self.rate_input = QLineEdit()
+        self.rate_input.setPlaceholderText("如: 3.6")
+        self.years_input = QLineEdit()
+        self.years_input.setPlaceholderText("如: 30")
+        for edit in (self.amount_input, self.rate_input, self.years_input):
+            edit.setStyleSheet(_lineedit_style())
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["等额本息", "等额本金"])
+        self.mode_combo.setStyleSheet(_combo_style())
+
+        rows = [("贷款金额(万元)", self.amount_input),
+                ("年利率(%)", self.rate_input),
+                ("贷款年限(年)", self.years_input),
+                ("还款方式", self.mode_combo)]
+        for i, (label, widget) in enumerate(rows):
+            form.addWidget(QLabel(label), i, 0)
+            form.addWidget(widget, i, 1)
+        form.setColumnStretch(1, 1)
+        layout.addLayout(form)
+
+        btn_row = QHBoxLayout()
+        calc_btn = QPushButton("计算")
+        calc_btn.setFixedSize(70, 30)
+        calc_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        calc_btn.setStyleSheet(_primary_btn())
+        calc_btn.clicked.connect(self.do_calc)
+        btn_row.addWidget(calc_btn)
+
+        clear_btn = QPushButton("清空")
+        clear_btn.setFixedSize(70, 30)
+        clear_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        clear_btn.setStyleSheet(_secondary_btn())
+        clear_btn.clicked.connect(self.do_clear)
+        btn_row.addWidget(clear_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        result_label = QLabel("计算结果")
+        result_label.setFont(QFont("PingFang SC", 12, QFont.Bold))
+        result_label.setStyleSheet("color: #333333;")
+        layout.addWidget(result_label)
+
+        self.result_text = QTextEdit()
+        self.result_text.setReadOnly(True)
+        self.result_text.setStyleSheet(_output_style())
+        layout.addWidget(self.result_text)
+
+    def do_calc(self):
+        try:
+            principal = float(self.amount_input.text().strip()) * 10000
+            rate = float(self.rate_input.text().strip()) / 100
+            years = float(self.years_input.text().strip())
+        except ValueError:
+            self.result_text.setPlainText("请输入有效数字")
+            return
+        if principal <= 0 or years <= 0 or rate < 0:
+            self.result_text.setPlainText("贷款金额和年限需大于 0，年利率不能为负")
+            return
+
+        n = int(round(years * 12))
+        monthly_rate = rate / 12
+        base_monthly = principal / n
+        lines = ["贷款本金: %s 元" % format(principal, ",.2f"),
+                 "年利率: %s%%   期数: %d 期" % (format(rate * 100, ".4g"), n)]
+
+        if self.mode_combo.currentIndex() == 0:
+            if monthly_rate == 0:
+                monthly = base_monthly
+            else:
+                factor = (1 + monthly_rate) ** n
+                monthly = principal * monthly_rate * factor / (factor - 1)
+            total = monthly * n
+            lines += ["每月还款: %s 元" % format(monthly, ",.2f"),
+                      "还款总额: %s 元" % format(total, ",.2f"),
+                      "利息总额: %s 元" % format(total - principal, ",.2f")]
+        else:
+            if monthly_rate == 0:
+                first = last = base_monthly
+                interest = 0.0
+            else:
+                first = base_monthly + principal * monthly_rate
+                last = base_monthly * (1 + monthly_rate)
+                interest = principal * monthly_rate * (n + 1) / 2
+            lines += ["首月还款: %s 元（每月递减 %s 元）" % (
+                          format(first, ",.2f"), format(base_monthly * monthly_rate, ",.2f")),
+                      "末月还款: %s 元" % format(last, ",.2f"),
+                      "还款总额: %s 元" % format(principal + interest, ",.2f"),
+                      "利息总额: %s 元" % format(interest, ",.2f")]
+
+        self.result_text.setPlainText("\n".join(lines))
+
+    def do_clear(self):
+        for edit in (self.amount_input, self.rate_input, self.years_input):
+            edit.clear()
+        self.result_text.setPlainText("")
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+
+
 class ToolboxWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -5337,10 +5997,8 @@ class ToolboxWindow(QMainWindow):
         """)
         self.ip, self.mac, self.adapter = get_effective_ip()
         self.popup = None
-        self.json_window = None
-        self.xml_window = None
-        self.base64_window = None
-        self.url_window = None
+        self.markup_window = None
+        self.codec_window = None
         self.hash_window = None
         self.regex_window = None
         self.uuid_window = None
@@ -5353,7 +6011,6 @@ class ToolboxWindow(QMainWindow):
         self.unit_window = None
         self.random_window = None
         self.textstat_window = None
-        self.unicode_window = None
         self.cron_window = None
         self.color_window = None
         self.image_window = None
@@ -5366,6 +6023,7 @@ class ToolboxWindow(QMainWindow):
         self.speedtest_window = None
         self.cmdref_window = None
         self.ssh_window = None
+        self.mortgage_window = None
         self.init_ui()
 
     def init_ui(self):
@@ -5378,7 +6036,7 @@ class ToolboxWindow(QMainWindow):
         content_area = QWidget()
         content_layout = QVBoxLayout(content_area)
         content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.setSpacing(15)
+        content_layout.setSpacing(8)
 
         self.toggle_buttons = {}
         self._caffeinate = None
@@ -5386,7 +6044,7 @@ class ToolboxWindow(QMainWindow):
 
         section1 = self.create_section("系统工具", [
             "获取进程", "端口扫描", "Ping 测试", "DNS 查询", "路由追踪",
-            "网络测速", "环境变量", "命令速查", "SSH 公钥", "防黑屏", "文字雨"
+            "网络测速", "环境变量", "SSH 公钥"
         ], {
             "获取进程": self.show_process_search,
             "端口扫描": self.show_portscan,
@@ -5395,57 +6053,62 @@ class ToolboxWindow(QMainWindow):
             "路由追踪": self.show_traceroute,
             "网络测速": self.show_speedtest,
             "环境变量": self.show_env_vars,
-            "命令速查": self.show_command_reference,
             "SSH 公钥": self.show_ssh_pubkey
-        }, {
-            "防黑屏": self.set_awake,
-            "文字雨": self.set_matrix_rain
         })
         content_layout.addWidget(section1)
 
         section3 = self.create_section("文本处理", [
-            "JSON 处理", "XML 格式化", "Base64 编解码", "URL 编解码",
-            "哈希计算", "正则测试", "UUID 生成", "二维码生成",
-            "JSON-YAML", "时间戳", "Unicode 转义", "文本统计", "Cron 表达式", "颜色转换"
+            "JSON/XML", "编解码", "哈希计算",
+            "正则测试", "UUID 生成", "二维码生成",
+            "JSON-YAML", "时间戳", "文本统计", "Cron 表达式", "颜色转换"
         ], {
-            "JSON 处理": self.show_json_formatter,
-            "XML 格式化": self.show_xml_formatter,
-            "Base64 编解码": self.show_base64,
-            "URL 编解码": self.show_url_encode,
+            "JSON/XML": self.show_markup,
+            "编解码": self.show_codec,
             "哈希计算": self.show_hash,
             "正则测试": self.show_regex,
             "UUID 生成": self.show_uuid,
             "二维码生成": self.show_qrcode,
             "JSON-YAML": self.show_json_yaml,
             "时间戳": self.show_timestamp,
-            "Unicode 转义": self.show_unicode,
             "文本统计": self.show_textstat,
             "Cron 表达式": self.show_cron,
             "颜色转换": self.show_color
         })
         content_layout.addWidget(section3)
 
+        section6 = self.create_section("其他", [
+            "命令速查", "房贷计算器", "图片处理", "文字雨", "防黑屏"
+        ], {
+            "命令速查": self.show_command_reference,
+            "房贷计算器": self.show_mortgage,
+            "图片处理": self.show_image_tool
+        }, {
+            "文字雨": self.set_matrix_rain,
+            "防黑屏": self.set_awake
+        })
+        content_layout.addWidget(section6)
+
         section4 = self.create_section("数学工具", [
-            "进制转换", "商余计算", "单位换算", "随机数", "金额大写", "罗马数字"
+            "进制转换", "商余计算", "单位转换", "随机数", "金额大写", "罗马数字"
         ], {
             "进制转换": self.show_base_convert,
             "商余计算": self.show_divmod,
-            "单位换算": self.show_unit_convert,
+            "单位转换": self.show_unit_convert,
             "随机数": self.show_random,
             "金额大写": self.show_rmb,
             "罗马数字": self.show_roman
         })
         content_layout.addWidget(section4)
 
-        section5 = self.create_section("图片工具", [
-            "图片处理"
-        ], {
-            "图片处理": self.show_image_tool
-        })
-        content_layout.addWidget(section5)
-
         content_layout.addStretch()
-        main_layout.addWidget(content_area, 1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        scroll.viewport().setStyleSheet("background: #FFFFFF;")
+        scroll.setWidget(content_area)
+        main_layout.addWidget(scroll, 1)
 
         bottom_bar = QFrame()
         bottom_bar.setStyleSheet("QFrame { background: #FFFFFF; }")
@@ -5464,6 +6127,13 @@ class ToolboxWindow(QMainWindow):
 
         bottom_layout.addStretch()
 
+        repo_label = QLabel('<a href="https://github.com/FantasyEngineer/personal_tool">仓库</a>')
+        repo_label.setFont(QFont("PingFang SC", 10))
+        repo_label.setCursor(QCursor(Qt.PointingHandCursor))
+        repo_label.setToolTip("在 GitHub 上查看源码")
+        repo_label.setOpenExternalLinks(True)
+        bottom_layout.addWidget(repo_label)
+
         ip_text = f"IP: {self.ip}"
         mac_text = f"MAC: {self.mac}" if self.mac and self.mac != "-" else ""
         info_text = f"{ip_text}  |  {mac_text}" if mac_text else ip_text
@@ -5472,8 +6142,8 @@ class ToolboxWindow(QMainWindow):
         info_label.setFont(QFont("PingFang SC", 10))
         info_label.setStyleSheet("color: #999999;")
         info_label.setCursor(QCursor(Qt.PointingHandCursor))
-        info_label.setToolTip("点击复制")
-        info_label.mousePressEvent = lambda e: self.copy_to_clipboard(info_text)
+        info_label.setToolTip("点击复制 IP")
+        info_label.mousePressEvent = lambda e: self.copy_to_clipboard(self.ip)
         bottom_layout.addWidget(info_label)
 
         main_layout.addWidget(bottom_bar)
@@ -5618,29 +6288,17 @@ class ToolboxWindow(QMainWindow):
         self.popup = ProcessSearchPopup(self)
         self.popup.show()
 
-    def show_json_formatter(self):
-        if self.json_window is None:
-            self.json_window = JsonFormatterWindow()
-        self.json_window.show()
-        self.json_window.activateWindow()
+    def show_markup(self):
+        if self.markup_window is None:
+            self.markup_window = MarkupWindow()
+        self.markup_window.show()
+        self.markup_window.activateWindow()
 
-    def show_xml_formatter(self):
-        if self.xml_window is None:
-            self.xml_window = XmlFormatterWindow()
-        self.xml_window.show()
-        self.xml_window.activateWindow()
-
-    def show_base64(self):
-        if self.base64_window is None:
-            self.base64_window = Base64Window()
-        self.base64_window.show()
-        self.base64_window.activateWindow()
-
-    def show_url_encode(self):
-        if self.url_window is None:
-            self.url_window = UrlEncodeWindow()
-        self.url_window.show()
-        self.url_window.activateWindow()
+    def show_codec(self):
+        if self.codec_window is None:
+            self.codec_window = CodecWindow()
+        self.codec_window.show()
+        self.codec_window.activateWindow()
 
     def show_hash(self):
         if self.hash_window is None:
@@ -5708,6 +6366,12 @@ class ToolboxWindow(QMainWindow):
         self.ssh_window.show()
         self.ssh_window.activateWindow()
 
+    def show_mortgage(self):
+        if self.mortgage_window is None:
+            self.mortgage_window = MortgageWindow()
+        self.mortgage_window.show()
+        self.mortgage_window.activateWindow()
+
     def show_unit_convert(self):
         if self.unit_window is None:
             self.unit_window = UnitConvertWindow()
@@ -5719,12 +6383,6 @@ class ToolboxWindow(QMainWindow):
             self.random_window = RandomWindow()
         self.random_window.show()
         self.random_window.activateWindow()
-
-    def show_unicode(self):
-        if self.unicode_window is None:
-            self.unicode_window = UnicodeEscapeWindow()
-        self.unicode_window.show()
-        self.unicode_window.activateWindow()
 
     def show_textstat(self):
         if self.textstat_window is None:
@@ -5800,6 +6458,7 @@ class ToolboxWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setWindowIcon(app_icon())
     window = ToolboxWindow()
     window.show()
     sys.exit(app.exec_())

@@ -17,11 +17,16 @@ if sys.platform == "darwin" and os.path.exists(ICON_MAC):
 elif os.name == "nt" and os.path.exists(ICON_WIN):
     icon = ICON_WIN
 
+# Ship the icon files so the running app can load them for the window/taskbar.
+ICON_ASSETS = [(os.path.join("assets", f), "assets")
+               for f in ("icon.ico", "icon.icns", "icon.png")
+               if os.path.exists(os.path.join("assets", f))]
+
 a = Analysis(
     ["toolbox.py"],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=ICON_ASSETS,
     # qrcode picks its PIL image backend lazily; make sure it is bundled.
     hiddenimports=["qrcode.pil", "qrcode.image.pil"],
     hookspath=[],

@@ -28,7 +28,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QGridLayout, QSpinBox, QTabWidget, QColorDialog,
                               QFileDialog)
 from PyQt5.QtCore import Qt, QPoint, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QFont, QCursor, QColor, QPixmap
+from PyQt5.QtGui import QFont, QCursor, QColor, QPixmap, QPainter
 
 
 def get_effective_ip():
@@ -127,21 +127,26 @@ def get_system_stats():
             mem_pct = (used_bytes / total_bytes * 100) if total_bytes > 0 else 0
             return cpu_pct, mem_pct, used_gb, total_gb
         elif system == "Windows":
-            out = subprocess.check_output("wmic cpu get loadpercentage /value", shell=True, text=True, encoding="gbk", errors="ignore")
-            cpu_pct = 0
+            cpu_pct = 0.0
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter \"Name='_Total'\").PercentProcessorTime"],
+                text=True, encoding="gbk", errors="ignore")
             for line in out.splitlines():
-                if '=' in line:
+                line = line.strip()
+                if line:
                     try:
-                        cpu_pct = float(line.split('=')[1].strip())
+                        cpu_pct = float(line)
                     except ValueError:
                         pass
-            out = subprocess.check_output("wmic OS get TotalVisibleMemorySize,FreePhysicalMemory /value", shell=True, text=True, encoding="gbk", errors="ignore")
-            total_kb = free_kb = 0
-            for line in out.splitlines():
-                if 'TotalVisibleMemorySize' in line and '=' in line:
-                    total_kb = int(line.split('=')[1].strip())
-                elif 'FreePhysicalMemory' in line and '=' in line:
-                    free_kb = int(line.split('=')[1].strip())
+                    break
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command",
+                 "$o=Get-CimInstance Win32_OperatingSystem; $o.TotalVisibleMemorySize; $o.FreePhysicalMemory"],
+                text=True, encoding="gbk", errors="ignore")
+            nums = [l.strip() for l in out.splitlines() if l.strip().isdigit()]
+            total_kb = int(nums[0]) if len(nums) >= 1 else 0
+            free_kb = int(nums[1]) if len(nums) >= 2 else 0
             used_kb = total_kb - free_kb
             used_gb = used_kb / (1024 ** 2)
             total_gb = total_kb / (1024 ** 2)
@@ -374,10 +379,16 @@ class ProcessSearchPopup(QMainWindow):
             return
 
         cmds = []
-        if port:
-            cmds.append(f"lsof -i :{port}")
-        if keyword:
-            cmds.append(f"ps aux | grep {keyword}")
+        if platform.system() == "Windows":
+            if port:
+                cmds.append(f"netstat -ano | findstr :{port}")
+            if keyword:
+                cmds.append(f'tasklist /FI "IMAGENAME eq {keyword}*"')
+        else:
+            if port:
+                cmds.append(f"lsof -i :{port}")
+            if keyword:
+                cmds.append(f"ps aux | grep {keyword}")
         self.status_label.setText("执行: " + " && ".join(cmds))
 
         processes = search_processes(port, keyword)
@@ -4584,6 +4595,496 @@ def _output_style():
     """
 
 
+def _mac_cover_menu_bar(widget):
+    """把原生 NSWindow 抬到菜单栏之上（屏幕保护程序用的 window level），
+    并让它覆盖所有 Space。纯 Qt 无法盖住 macOS 系统菜单栏，必须走 AppKit。"""
+    import ctypes
+    import ctypes.util
+    objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+    objc.sel_registerName.restype = ctypes.c_void_p
+    objc.sel_registerName.argtypes = [ctypes.c_char_p]
+    objc.objc_msgSend.restype = ctypes.c_void_p
+    objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+    def sel(name):
+        return objc.sel_registerName(name.encode())
+
+    view_ptr = int(widget.winId())
+    window = objc.objc_msgSend(view_ptr, sel("window"))
+    if not window:
+        return False
+
+    cg = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreGraphics"))
+    cg.CGShieldingWindowLevel.restype = ctypes.c_int
+    level = cg.CGShieldingWindowLevel()
+
+    objc.objc_msgSend.restype = ctypes.c_void_p
+    objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_longlong]
+    # NSWindowCollectionBehavior: CanJoinAllSpaces(1<<0) | Stationary(1<<2) | FullScreenAuxiliary(1<<7)
+    behavior = (1 << 0) | (1 << 2) | (1 << 7)
+    objc.objc_msgSend(window, sel("setCollectionBehavior:"), behavior)
+    objc.objc_msgSend(window, sel("setLevel:"), level)
+
+    objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+    objc.objc_msgSend(window, sel("setHidesOnDeactivate:"), 0)
+    return True
+
+
+class MatrixRainOverlay(QWidget):
+    """全屏黑客帝国代码雨覆盖层，置顶并覆盖菜单栏；ESC 或双击任意处关闭。"""
+
+    def __init__(self, on_close=None):
+        super().__init__()
+        self._on_close = on_close
+        self._canvas = None
+        self._drops = []
+        self._cols = 0
+        self._rows = 0
+        self._cw = 18
+        self._ch = 22
+        codes = list(range(0xFF66, 0xFF9D)) + list(range(0x30, 0x3A)) + list(range(0x41, 0x5B))
+        self._chars = [chr(c) for c in codes]
+        self._font = QFont("Menlo", 15)
+        self._font.setStyleHint(QFont.Monospace)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._timer = QTimer(self)
+        self._timer.setInterval(50)
+        self._timer.timeout.connect(self._step)
+
+    def start(self):
+        screen = QApplication.primaryScreen().geometry()
+        self.setGeometry(screen)
+        self._rebuild_canvas()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.setFocus()
+        if platform.system() == "Darwin" and QApplication.platformName() == "cocoa":
+            try:
+                _mac_cover_menu_bar(self)
+            except Exception:
+                pass
+        self._timer.start()
+
+    def stop(self):
+        self._timer.stop()
+        self.hide()
+
+    def _rebuild_canvas(self):
+        w = max(self.width(), 1)
+        h = max(self.height(), 1)
+        self._canvas = QPixmap(w, h)
+        p = QPainter(self._canvas)
+        p.fillRect(self._canvas.rect(), QColor(0, 0, 0))
+        p.end()
+        self._cols = w // self._cw + 1
+        self._rows = h // self._ch + 1
+        self._drops = [random.randint(0, self._rows) for _ in range(self._cols)]
+
+    def resizeEvent(self, e):
+        if self._canvas is not None:
+            self._rebuild_canvas()
+
+    def _step(self):
+        if self._canvas is None:
+            return
+        p = QPainter(self._canvas)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0, 0, 0, 40))
+        p.drawRect(self._canvas.rect())
+        p.setFont(self._font)
+        for i in range(self._cols):
+            ch = random.choice(self._chars)
+            x = i * self._cw
+            y = self._drops[i] * self._ch
+            p.setPen(QColor(180, 255, 180))
+            p.drawText(x, y, ch)
+            self._drops[i] += 1
+            if y > self.height() and random.random() > 0.975:
+                self._drops[i] = random.randint(0, 2)
+        p.end()
+        self.update()
+
+    def paintEvent(self, e):
+        if self._canvas is None:
+            return
+        p = QPainter(self)
+        p.drawPixmap(0, 0, self._canvas)
+        p.end()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape:
+            self._dismiss()
+        else:
+            super().keyPressEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._dismiss()
+
+    def _dismiss(self):
+        self._timer.stop()
+        if self._on_close:
+            self._on_close()
+        self.hide()
+
+
+COMMAND_ITEMS = [
+    # ---------- Docker ----------
+    ("docker ps", "查看运行中的容器", "Docker"),
+    ("docker ps -a", "查看所有容器（含已停止）", "Docker"),
+    ("docker images", "列出本地镜像", "Docker"),
+    ("docker pull nginx", "拉取镜像", "Docker"),
+    ("docker run -d --name web -p 8080:80 nginx", "后台启动容器并映射端口", "Docker"),
+    ("docker exec -it 容器ID bash", "进入容器交互式 shell", "Docker"),
+    ("docker logs -f 容器ID", "实时查看容器日志", "Docker"),
+    ("docker stop 容器ID", "停止容器", "Docker"),
+    ("docker rm 容器ID", "删除容器", "Docker"),
+    ("docker rmi 镜像名", "删除镜像", "Docker"),
+    ("docker build -t myimage .", "用当前目录 Dockerfile 构建镜像", "Docker"),
+    ("docker compose up -d", "后台启动 compose 编排的服务", "Docker"),
+    ("docker compose down", "停止并移除 compose 服务", "Docker"),
+    ("docker compose ps", "查看 compose 服务状态", "Docker"),
+    ("docker inspect 容器ID", "查看容器详细配置（JSON）", "Docker"),
+    ("docker network ls", "列出 Docker 网络", "Docker"),
+    ("docker volume ls", "列出数据卷", "Docker"),
+    ("docker system df", "查看 Docker 磁盘占用", "Docker"),
+    ("docker system prune -a", "清理未使用的镜像/容器/网络", "Docker"),
+    ("docker cp 容器ID:/path ./local", "从容器复制文件到主机", "Docker"),
+    ("docker run -v /data:/data -e KEY=val 镜像", "挂载卷并传入环境变量启动", "Docker"),
+    ("docker stats", "实时查看各容器 CPU/内存", "Docker"),
+    ("docker stats 容器ID", "查看指定容器资源占用", "Docker"),
+    ("docker compose logs -f", "跟踪 compose 服务日志", "Docker"),
+    ("docker compose build", "重新构建 compose 服务镜像", "Docker"),
+    ("docker start 容器ID", "启动已停止的容器", "Docker"),
+    ("docker restart 容器ID", "重启容器", "Docker"),
+    ("docker tag 镜像 仓库/名:tag", "给镜像打标签准备推送", "Docker"),
+    ("docker push 仓库/名:tag", "推送镜像到远程仓库", "Docker"),
+    ("docker save -o a.tar 镜像", "把镜像导出为 tar 包", "Docker"),
+    ("docker load -i a.tar", "从 tar 包导入镜像", "Docker"),
+    ("docker commit 容器ID 新镜像", "把容器当前状态保存为镜像", "Docker"),
+    ("docker history 镜像", "查看镜像各层构建历史", "Docker"),
+    ("docker attach 容器ID", "附着到容器主进程终端", "Docker"),
+    # ---------- Linux ----------
+    ("ls -lh", "以易读大小列出文件", "Linux"),
+    ("cd /var/log", "切换目录", "Linux"),
+    ("pwd", "显示当前工作目录", "Linux"),
+    ("cp -r src dst", "递归复制目录", "Linux"),
+    ("mv old new", "移动 / 重命名", "Linux"),
+    ("rm -rf dir", "递归强制删除（危险）", "Linux"),
+    ("mkdir -p a/b/c", "递归创建多级目录", "Linux"),
+    ("cat file", "查看文件内容", "Linux"),
+    ("less file", "分页查看文件", "Linux"),
+    ("tail -f app.log", "实时跟踪日志末尾", "Linux"),
+    ("head -n 20 file", "查看文件前 20 行", "Linux"),
+    ("grep -rn \"text\" .", "递归搜索文本并显示行号", "Linux"),
+    ("find . -name \"*.log\"", "按名称查找文件", "Linux"),
+    ("chmod +x script.sh", "赋予执行权限", "Linux"),
+    ("chown user:group file", "修改属主属组", "Linux"),
+    ("ps aux | grep nginx", "查找指定进程", "Linux"),
+    ("top", "实时查看进程与资源占用", "Linux"),
+    ("df -h", "查看磁盘空间使用", "Linux"),
+    ("du -sh dir", "查看目录总大小", "Linux"),
+    ("free -h", "查看内存使用", "Linux"),
+    ("systemctl status nginx", "查看服务状态", "Linux"),
+    ("systemctl restart nginx", "重启服务", "Linux"),
+    ("journalctl -u nginx -f", "跟踪某服务日志", "Linux"),
+    ("ss -tulpn", "查看监听端口与进程", "Linux"),
+    ("ssh user@host", "远程登录", "Linux"),
+    ("scp file user@host:/path", "远程复制文件", "Linux"),
+    ("tar -czf a.tar.gz dir/", "打包压缩目录", "Linux"),
+    ("tar -xzf a.tar.gz", "解压 tar.gz", "Linux"),
+    ("kill -9 PID", "强制结束进程", "Linux"),
+    ("nohup cmd &", "后台运行且退出终端不中断", "Linux"),
+    ("rm 文件.txt", "删除单个文件", "Linux"),
+    ("rm -f 文件.txt", "强制删除文件，不存在也不报错", "Linux"),
+    ("rm -i 文件.txt", "删除前逐个确认", "Linux"),
+    ("rm *.log", "删除当前目录所有 .log 文件", "Linux"),
+    ("rm -r 目录/", "递归删除目录及其内容", "Linux"),
+    ("rm -rf ./目录/*", "清空目录内容但保留目录本身（危险）", "Linux"),
+    ("rmdir 空目录", "删除空目录", "Linux"),
+    ("find . -name \"*.tmp\" -delete", "按名称批量删除匹配文件", "Linux"),
+    ("unlink 文件.txt", "删除单个文件（底层系统调用）", "Linux"),
+    ("nano 文件.txt", "用 nano 打开 / 新建文件", "Linux"),
+    ("nano +65 文件.txt", "打开并跳转到第 65 行", "Linux"),
+    ("nano -m 文件.txt", "保存时不自动折行", "Linux"),
+    ("nano -B 文件.txt", "保存时生成 .bak 备份", "Linux"),
+    ("Ctrl+O 回车", "nano 保存（写入）文件", "Linux"),
+    ("Ctrl+X", "nano 退出", "Linux"),
+    ("Ctrl+K", "nano 剪切（删除）当前行", "Linux"),
+    ("Ctrl+U", "nano 粘贴刚剪切的内容", "Linux"),
+    ("Ctrl+W", "nano 搜索文本", "Linux"),
+    ("Ctrl+\\ (或 Ctrl+R)", "nano 查找并替换", "Linux"),
+    ("Ctrl+A / Ctrl+E", "nano 跳到行首 / 行尾", "Linux"),
+    ("Ctrl+D", "nano 删除光标处字符", "Linux"),
+    ("Ctrl+_ (或 Ctrl+3)", "nano 跳转到指定行号", "Linux"),
+    ("Ctrl+J", "nano 切换自动换行", "Linux"),
+    ("Ctrl+G", "nano 查看帮助", "Linux"),
+    ("Alt+U / Alt+E", "nano 撤销 / 重做", "Linux"),
+    ("pkill -f nginx", "按名称结束进程", "Linux"),
+    ("killall 进程名", "结束同名所有进程", "Linux"),
+    ("lsof -i :8080", "查看占用 8080 端口的进程", "Linux"),
+    ("fuser -k 8080/tcp", "结束占用该端口的进程", "Linux"),
+    ("ln -s 目标路径 链接名", "创建软链接", "Linux"),
+    ("crontab -l", "列出当前用户的定时任务", "Linux"),
+    ("crontab -e", "编辑当前用户的定时任务", "Linux"),
+    ("sed -i 's/foo/bar/g' f.txt", "原地批量替换文本", "Linux"),
+    ("awk '{print $1}' f.txt", "按列提取文本", "Linux"),
+    ("sort f.txt | uniq -c", "排序并统计每行出现次数", "Linux"),
+    ("cut -d: -f1 /etc/passwd", "按分隔符取字段", "Linux"),
+    ("zip -r a.zip 目录/", "递归压缩为 zip", "Linux"),
+    ("unzip a.zip -d 目标目录", "解压 zip 到指定目录", "Linux"),
+    ("source ~/.bashrc", "重新加载 shell 配置", "Linux"),
+    ("uname -a", "查看内核与系统信息", "Linux"),
+    ("env | grep PATH", "查看环境变量", "Linux"),
+    ("chmod 755 目录/", "设置目录权限 rwxr-xr-x", "Linux"),
+    ("history", "查看命令历史", "Linux"),
+    ("which python3", "查看命令所在路径", "Linux"),
+    ("echo \"文本\" >> f.txt", "追加内容到文件末尾", "Linux"),
+    # ---------- Windows ----------
+    ("ipconfig /all", "查看完整网络配置", "Windows"),
+    ("ping 8.8.8.8", "测试网络连通", "Windows"),
+    ("tracert baidu.com", "路由追踪", "Windows"),
+    ("netstat -ano", "查看所有连接与监听端口（含 PID）", "Windows"),
+    ("tasklist", "列出运行中的进程", "Windows"),
+    ("taskkill /PID 1234 /F", "强制结束指定进程", "Windows"),
+    ("systeminfo", "查看系统详细信息", "Windows"),
+    ("sfc /scannow", "扫描并修复系统文件（管理员）", "Windows"),
+    ("chkdsk C: /f", "检查并修复磁盘（管理员）", "Windows"),
+    ("shutdown /s /t 0", "立即关机", "Windows"),
+    ("shutdown /r /t 0", "立即重启", "Windows"),
+    ("nslookup baidu.com", "DNS 查询", "Windows"),
+    ("route print", "查看路由表", "Windows"),
+    ("dir", "列出目录内容（cmd）", "Windows"),
+    ("Get-Process", "查看进程（PowerShell）", "Windows"),
+    ("Get-Service", "查看服务（PowerShell）", "Windows"),
+    ("Get-NetIPAddress", "查看 IP 地址（PowerShell）", "Windows"),
+    ("Get-CimInstance Win32_OperatingSystem", "查看操作系统信息（PowerShell）", "Windows"),
+    ("Set-ExecutionPolicy RemoteSigned", "允许运行脚本（管理员，PowerShell）", "Windows"),
+    ("winget install 包名", "用 winget 安装软件", "Windows"),
+    ("Get-ChildItem", "列出目录内容（PowerShell 版 dir）", "Windows"),
+    ("New-Item -ItemType Directory 名", "新建文件夹（PowerShell）", "Windows"),
+    ("Remove-Item -Recurse -Force 路径", "递归强制删除（PowerShell，危险）", "Windows"),
+    ("Select-String \"text\" *.log", "在文件中搜索文本（PowerShell 版 grep）", "Windows"),
+    ("Stop-Process -Name firefox -Force", "按名称强制结束进程（PowerShell）", "Windows"),
+    ("Test-NetConnection 1.1.1.1 -Port 443", "测试主机端口连通（PowerShell）", "Windows"),
+    ("Resolve-DnsName baidu.com", "DNS 解析（PowerShell）", "Windows"),
+    ("Get-Service | Where Status -eq 'Running'", "列出正在运行的服务（PowerShell）", "Windows"),
+    ("DISM /Online /Cleanup-Image /RestoreHealth", "修复系统镜像（管理员）", "Windows"),
+    ("schtasks /create /tn 任务 /tr cmd /sc daily /st 09:00", "创建每日计划任务", "Windows"),
+    ("reg query HKCU\\Software", "查询注册表项", "Windows"),
+    ("gpupdate /force", "强制刷新组策略", "Windows"),
+    ("wsl --install", "安装 Windows Subsystem for Linux", "Windows"),
+    ("powercfg /batteryreport", "生成电池健康报告", "Windows"),
+    ("net user", "查看本机用户列表", "Windows"),
+    # ---------- Git ----------
+    ("git init", "初始化仓库", "Git"),
+    ("git clone <url>", "克隆远程仓库", "Git"),
+    ("git status", "查看工作区状态", "Git"),
+    ("git add .", "暂存所有改动", "Git"),
+    ("git commit -m \"msg\"", "提交改动", "Git"),
+    ("git log --oneline --graph", "简洁查看提交历史", "Git"),
+    ("git diff", "查看未暂存的差异", "Git"),
+    ("git branch", "列出本地分支", "Git"),
+    ("git checkout -b feature", "新建并切换到分支", "Git"),
+    ("git switch main", "切换分支（新语法）", "Git"),
+    ("git merge feature", "合并分支到当前分支", "Git"),
+    ("git pull", "拉取并合并远程更新", "Git"),
+    ("git push origin main", "推送到远程", "Git"),
+    ("git stash", "暂存当前未提交改动", "Git"),
+    ("git stash pop", "恢复最近一次暂存", "Git"),
+    ("git reset --soft HEAD~1", "撤销上次提交但保留改动", "Git"),
+    ("git reset --hard HEAD", "丢弃工作区改动（危险）", "Git"),
+    ("git revert <commitID>", "生成一次反做提交", "Git"),
+    ("git remote -v", "查看远程仓库地址", "Git"),
+    ("git tag -a v1.0 -m \"note\"", "打一个带说明的标签", "Git"),
+    ("git rebase -i HEAD~3", "交互式改写最近 3 次提交", "Git"),
+    ("git commit --amend -m \"新信息\"", "修改上一次提交", "Git"),
+    ("git add -p", "分块（逐段）暂存改动", "Git"),
+    ("git cherry-pick <commitID>", "把某次提交应用到当前分支", "Git"),
+    ("git restore 文件", "丢弃工作区某文件的改动", "Git"),
+    ("git restore --staged 文件", "把已暂存文件退回工作区", "Git"),
+    ("git clean -fd", "删除未跟踪的文件和目录（危险）", "Git"),
+    ("git push -u origin 分支", "首次推送并设置上游跟踪", "Git"),
+    ("git push --force-with-lease", "较安全的强制推送", "Git"),
+    ("git branch -d 分支", "删除已合并的分支", "Git"),
+    ("git branch -D 分支", "强制删除分支", "Git"),
+    ("git fetch --all", "拉取所有远程的更新（不合并）", "Git"),
+    ("git blame 文件", "逐行查看代码最后修改者", "Git"),
+    ("git shortlog -sn", "统计各作者提交数", "Git"),
+    ("git stash list", "查看暂存记录列表", "Git"),
+    ("git push origin --delete 分支", "删除远程分支", "Git"),
+]
+
+COMMAND_CAT_COLORS = {
+    "Docker": "#1D63ED",
+    "Linux": "#E8590C",
+    "Windows": "#1A7F37",
+    "Git": "#D81E06",
+}
+
+
+class CommandRow(QWidget):
+    def __init__(self, cmd, desc, cat, on_copy):
+        super().__init__()
+        self._cmd = cmd
+        self._on_copy = on_copy
+        self.setObjectName("cmdRow")
+        self.setCursor(QCursor(Qt.PointingHandCursor))
+        self.setMinimumHeight(46)
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(12, 6, 12, 6)
+        outer.setSpacing(10)
+
+        text_box = QVBoxLayout()
+        text_box.setSpacing(2)
+        cmd_label = QLabel(cmd)
+        mono = QFont("Menlo", 13)
+        mono.setStyleHint(QFont.TypeWriter)
+        cmd_label.setFont(mono)
+        cmd_label.setStyleSheet("color: #1A73E8; background: transparent;")
+        cmd_label.setTextInteractionFlags(Qt.NoTextInteraction)
+        desc_label = QLabel(desc)
+        desc_label.setFont(QFont("PingFang SC", 12))
+        desc_label.setStyleSheet("color: #555555; background: transparent;")
+        desc_label.setWordWrap(True)
+        text_box.addWidget(cmd_label)
+        text_box.addWidget(desc_label)
+        outer.addLayout(text_box, 1)
+
+        cat_label = QLabel(cat)
+        cat_label.setFont(QFont("PingFang SC", 11, QFont.Bold))
+        cat_label.setStyleSheet(
+            "color: %s; background: transparent;" % COMMAND_CAT_COLORS.get(cat, "#999999"))
+        outer.addWidget(cat_label)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._on_copy(self._cmd)
+
+
+class CommandReferenceWindow(QMainWindow):
+    CATEGORIES = ["全部", "Docker", "Linux", "Windows", "Git"]
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("命令速查")
+        self.setGeometry(*tool_win_geometry())
+        self._current_cat = "全部"
+        self.setStyleSheet("""
+            QMainWindow { background: #FFFFFF; }
+            #cmdRow { background: transparent; border-radius: 6px; }
+            #cmdRow:hover { background: #F3F8FF; }
+        """)
+        self.init_ui()
+        self.apply_filter()
+
+    def init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(15, 15, 15, 10)
+        layout.setSpacing(10)
+
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("搜索命令或中文说明，例如 容器、端口、分支、log…")
+        self.search_edit.setStyleSheet("""
+            QLineEdit { border: 1px solid #D0D0D0; border-radius: 4px; padding: 7px 10px;
+                font-family: "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13px; }
+            QLineEdit:focus { border-color: #1A73E8; }
+        """)
+        self.search_edit.textChanged.connect(self.apply_filter)
+        layout.addWidget(self.search_edit)
+
+        cat_bar = QHBoxLayout()
+        cat_bar.setSpacing(8)
+        self._cat_buttons = []
+        for cat in self.CATEGORIES:
+            btn = QPushButton(cat)
+            btn.setCheckable(True)
+            btn.setCursor(QCursor(Qt.PointingHandCursor))
+            btn.setChecked(cat == "全部")
+            btn.setStyleSheet("""
+                QPushButton { color: #333; background: #FFFFFF; border: 1px solid #D0D0D0;
+                    border-radius: 4px; padding: 5px 14px; font-size: 12px; }
+                QPushButton:hover { border-color: #1A73E8; color: #1A73E8; }
+                QPushButton:checked { color: #FFFFFF; background: #1A73E8; border-color: #1A73E8; }
+            """)
+            btn.clicked.connect(lambda checked, c=cat: self.select_category(c))
+            cat_bar.addWidget(btn)
+            self._cat_buttons.append(btn)
+        cat_bar.addStretch()
+        layout.addLayout(cat_bar)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._results = QWidget()
+        self._results_layout = QVBoxLayout(self._results)
+        self._results_layout.setContentsMargins(0, 4, 8, 4)
+        self._results_layout.setSpacing(4)
+        self._results_layout.addStretch()
+        scroll.setWidget(self._results)
+        layout.addWidget(scroll, 1)
+
+        self.status_label = QLabel("")
+        self.status_label.setFont(QFont("PingFang SC", 11))
+        self.status_label.setStyleSheet("color: #999999;")
+        layout.addWidget(self.status_label)
+
+    def select_category(self, cat):
+        self._current_cat = cat
+        for btn in self._cat_buttons:
+            btn.setChecked(btn.text() == cat)
+        self.apply_filter()
+
+    def _clear_results(self):
+        while self._results_layout.count():
+            item = self._results_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+    def apply_filter(self):
+        query = self.search_edit.text().strip().lower()
+        self._clear_results()
+        count = 0
+        for cmd, desc, cat in COMMAND_ITEMS:
+            if self._current_cat != "全部" and cat != self._current_cat:
+                continue
+            if query and query not in cmd.lower() and query not in desc.lower():
+                continue
+            row = CommandRow(cmd, desc, cat, self.copy_command)
+            self._results_layout.addWidget(row)
+            count += 1
+        if count == 0:
+            empty = QLabel("没有匹配的命令")
+            empty.setFont(QFont("PingFang SC", 12))
+            empty.setStyleSheet("color: #999999; padding: 30px;")
+            empty.setAlignment(Qt.AlignCenter)
+            self._results_layout.addWidget(empty)
+        self._results_layout.addStretch()
+        self.status_label.setText("共 %d 条 · 点击任意命令即可复制" % count)
+
+    def copy_command(self, cmd):
+        QApplication.clipboard().setText(cmd)
+        self.status_label.setText("已复制：%s" % cmd)
+        self.status_label.setStyleSheet("color: #1A73E8;")
+        QTimer.singleShot(1500, self._reset_status)
+
+    def _reset_status(self):
+        self.status_label.setStyleSheet("color: #999999;")
+        self.apply_filter()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+
+
 class ToolboxWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -4621,6 +5122,7 @@ class ToolboxWindow(QMainWindow):
         self.traceroute_window = None
         self.portscan_window = None
         self.speedtest_window = None
+        self.cmdref_window = None
         self.init_ui()
 
     def init_ui(self):
@@ -4637,10 +5139,11 @@ class ToolboxWindow(QMainWindow):
 
         self.toggle_buttons = {}
         self._caffeinate = None
+        self._rain_overlay = None
 
         section1 = self.create_section("系统工具", [
             "获取进程", "端口扫描", "Ping 测试", "DNS 查询", "路由追踪",
-            "网络测速", "环境变量", "防黑屏"
+            "网络测速", "环境变量", "命令速查", "防黑屏", "文字雨"
         ], {
             "获取进程": self.show_process_search,
             "端口扫描": self.show_portscan,
@@ -4648,9 +5151,11 @@ class ToolboxWindow(QMainWindow):
             "DNS 查询": self.show_dns,
             "路由追踪": self.show_traceroute,
             "网络测速": self.show_speedtest,
-            "环境变量": self.show_env_vars
+            "环境变量": self.show_env_vars,
+            "命令速查": self.show_command_reference
         }, {
-            "防黑屏": self.set_awake
+            "防黑屏": self.set_awake,
+            "文字雨": self.set_matrix_rain
         })
         content_layout.addWidget(section1)
 
@@ -4839,9 +5344,25 @@ class ToolboxWindow(QMainWindow):
             from PyQt5.QtWidgets import QMessageBox
             QMessageBox.warning(self, "防黑屏", f"无法启动防休眠: {e}")
 
+    def set_matrix_rain(self, active):
+        if active:
+            if self._rain_overlay is None:
+                self._rain_overlay = MatrixRainOverlay(
+                    on_close=lambda: self.toggle_buttons["文字雨"].setChecked(False)
+                )
+            self._rain_overlay.start()
+        else:
+            if self._rain_overlay is not None:
+                self._rain_overlay.stop()
+
     def closeEvent(self, event):
         try:
             self.set_awake(False)
+        except Exception:
+            pass
+        try:
+            if self._rain_overlay is not None:
+                self._rain_overlay.stop()
         except Exception:
             pass
         super().closeEvent(event)
@@ -4930,6 +5451,12 @@ class ToolboxWindow(QMainWindow):
             self.envvar_window = EnvVarWindow()
         self.envvar_window.show()
         self.envvar_window.activateWindow()
+
+    def show_command_reference(self):
+        if self.cmdref_window is None:
+            self.cmdref_window = CommandReferenceWindow()
+        self.cmdref_window.show()
+        self.cmdref_window.activateWindow()
 
     def show_unit_convert(self):
         if self.unit_window is None:

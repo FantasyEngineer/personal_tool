@@ -50,18 +50,20 @@ jobs:
         run: |
           # Apple Silicon refuses to load unsigned Mach-O, which surfaces as
           # "app is damaged". Sign the bundle and all nested binaries ad-hoc.
-          APP="dist/Toolbox/Toolbox.app"
-          if [ -d "$APP" ]; then
-            codesign --remove-signature "$APP" 2>/dev/null || true
-            codesign --force --deep --sign - "$APP"
-            codesign --verify --deep --strict --verbose=2 "$APP"
-          fi
+          APP="$(find "$GITHUB_WORKSPACE/dist" -maxdepth 3 -name 'Toolbox.app' -type d | head -n1)"
+          if [ -z "$APP" ]; then echo "Toolbox.app not found under dist/"; ls -R dist; exit 1; fi
+          echo "Signing: $APP"
+          codesign --remove-signature "$APP" 2>/dev/null || true
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |
-          cd dist
-          ditto -c -k --sequesterRsrc --keepParent Toolbox ../${{ matrix.zip_name }}
+          APP="$(find "$GITHUB_WORKSPACE/dist" -maxdepth 3 -name 'Toolbox.app' -type d | head -n1)"
+          PARENT="$(dirname "$APP")"
+          NAME="$(basename "$APP")"
+          ( cd "$PARENT" && ditto -c -k --sequesterRsrc --keepParent "$NAME" "$GITHUB_WORKSPACE/${{ matrix.zip_name }}" )
 
       - name: Package (Windows)
         if: runner.os == 'Windows'

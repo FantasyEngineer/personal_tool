@@ -56,3 +56,21 @@ coll = COLLECT(
     upx=False,
     name=APP_NAME,
 )
+
+# On macOS, wrap the onedir output into a real .app bundle (with Info.plist).
+# Without this, onedir only produces a bare Mach-O executable, not an app.
+if sys.platform == "darwin":
+    app_bundle = BUNDLE(
+        coll,
+        name=APP_NAME + ".app",
+        icon=icon,
+        bundle_identifier="com.jimmy.personal_tool",
+        info_plist={
+            "CFBundleName": APP_NAME,
+            "CFBundleDisplayName": "系统工具箱",
+            "CFBundleShortVersionString": "1.0.0",
+            "CFBundleVersion": "1.0.0",
+            "NSHighResolutionCapable": True,
+            "NSPrincipalClass": "NSApplication",
+        },
+    )

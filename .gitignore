@@ -4,5 +4,6 @@ __pycache__/
 *.pyc
 build/
 dist/
+*.log
 vibe_images/
 .DS_Store

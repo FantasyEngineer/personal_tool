@@ -21,10 +21,10 @@ jobs:
         include:
           - os: macos-latest
             artifact_name: Toolbox-macos
-            zip_name: Toolbox-macos.zip
+            asset_name: Toolbox-macos.zip
           - os: windows-latest
             artifact_name: Toolbox-windows
-            zip_name: Toolbox-windows.zip
+            asset_name: Toolbox-windows.exe
 
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -63,18 +63,20 @@ jobs:
           APP="$(find "$GITHUB_WORKSPACE/dist" -maxdepth 3 -name 'Toolbox.app' -type d | head -n1)"
           PARENT="$(dirname "$APP")"
           NAME="$(basename "$APP")"
-          ( cd "$PARENT" && ditto -c -k --sequesterRsrc --keepParent "$NAME" "$GITHUB_WORKSPACE/${{ matrix.zip_name }}" )
+          ( cd "$PARENT" && ditto -c -k --sequesterRsrc --keepParent "$NAME" "$GITHUB_WORKSPACE/${{ matrix.asset_name }}" )
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path dist/Toolbox -DestinationPath ${{ matrix.zip_name }}
+        run: |
+          if (-not (Test-Path dist/Toolbox.exe)) { Write-Error "dist/Toolbox.exe not found"; exit 1 }
+          Copy-Item dist/Toolbox.exe ${{ matrix.asset_name }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.zip_name }}
+          path: ${{ matrix.asset_name }}
           if-no-files-found: error
 
       - name: Publish GitHub Release
@@ -82,5 +84,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            ${{ matrix.zip_name }}
+            ${{ matrix.asset_name }}
           generate_release_notes: true

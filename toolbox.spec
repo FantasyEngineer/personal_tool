@@ -1,12 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec for the single-file PyQt5 toolbox.
 # Build:  pyinstaller --noconfirm toolbox.spec
-# Output: dist/Toolbox/  (a "one-dir" bundle; on macOS it contains Toolbox.app)
+# Output: Windows: dist/Toolbox.exe (single file, double-click to run)
+#         macOS:   dist/Toolbox/Toolbox.app (one-dir bundle)
 
 import os
 import sys
 
 APP_NAME = "Toolbox"
+
+# Windows ships a single exe: no _internal folder to lose when copying or
+# extracting, which is the most common "double-click does nothing" cause.
+ONEFILE = sys.platform == "win32"
 
 ICON_MAC = os.path.join("assets", "icon.icns")
 ICON_WIN = os.path.join("assets", "icon.ico")
@@ -40,11 +45,7 @@ a = Analysis(
 
 pyz = PYZ(a.pure)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    [],
-    exclude_binaries=True,
+EXE_OPTS = dict(
     name=APP_NAME,
     debug=False,
     bootloader_ignore_signals=False,
@@ -54,14 +55,20 @@ exe = EXE(
     icon=icon,
 )
 
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=False,
-    name=APP_NAME,
-)
+if ONEFILE:
+    exe = EXE(pyz, a.scripts, a.binaries, a.datas, [], **EXE_OPTS)
+    coll = None
+else:
+    exe = EXE(pyz, a.scripts, [], exclude_binaries=True, **EXE_OPTS)
+
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=False,
+        name=APP_NAME,
+    )
 
 # On macOS, wrap the onedir output into a real .app bundle (with Info.plist).
 # Without this, onedir only produces a bare Mach-O executable, not an app.

@@ -2,6 +2,8 @@ import sys
 import os
 import platform
 import subprocess
+import traceback
+import faulthandler
 import re
 import socket
 import json
@@ -9072,9 +9074,77 @@ class ToolboxWindow(QMainWindow):
         QMessageBox.information(self, "已复制", f"已复制到剪贴板:\n{text}", QMessageBox.Ok)
 
 
+def startup_log_path():
+    """启动日志：打包后放 exe 旁边，开发时放项目目录，不可写再退回用户目录。"""
+    if getattr(sys, "frozen", False):
+        folders = [os.path.dirname(sys.executable),
+                   os.path.join(os.path.expanduser("~"), ".personal_toolbox")]
+    else:
+        folders = [os.path.dirname(os.path.abspath(__file__)),
+                   os.path.join(os.path.expanduser("~"), ".personal_toolbox")]
+    for folder in folders:
+        path = os.path.join(folder, "startup.log")
+        try:
+            os.makedirs(folder, exist_ok=True)
+            with open(path, "a", encoding="utf-8"):
+                pass
+            return path
+        except OSError:
+            continue
+    return None
+
+
+def write_startup_log(text, reset=False):
+    path = startup_log_path()
+    if not path:
+        return
+    try:
+        with open(path, "w" if reset else "a", encoding="utf-8") as f:
+            f.write(text.rstrip() + "\n")
+    except OSError:
+        pass
+
+
+def fatal_dialog(text):
+    """启动失败时弹出看得见的提示；Qt 建不起来就用 Win32 弹窗兜底。"""
+    try:
+        QMessageBox.critical(None, "系统工具箱启动失败", text)
+        return
+    except Exception:
+        pass
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(0, text, "系统工具箱启动失败", 0x10)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    app.setWindowIcon(app_icon())
-    window = ToolboxWindow()
-    window.show()
-    sys.exit(app.exec_())
+    write_startup_log(
+        "[%s] 启动 pid=%d frozen=%s exe=%s cwd=%s"
+        % (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), os.getpid(),
+           getattr(sys, "frozen", False), sys.executable, os.getcwd()),
+        reset=True)
+    # Qt 初始化失败时是在 C++ 层直接 abort，Python 的 try 捕不到；
+    # faulthandler 能把这类原生崩溃的栈写进同一个日志。
+    crash_file = None
+    log_path = startup_log_path()
+    if log_path:
+        try:
+            crash_file = open(log_path, "a", encoding="utf-8")
+            faulthandler.enable(file=crash_file, all_threads=True)
+        except OSError:
+            crash_file = None
+    try:
+        app = QApplication(sys.argv)
+        app.setWindowIcon(app_icon())
+        window = ToolboxWindow()
+        window.show()
+        write_startup_log("界面已显示")
+        exit_code = app.exec_()
+    except Exception:
+        detail = traceback.format_exc()
+        write_startup_log("启动失败：\n" + detail)
+        fatal_dialog("启动失败，详细信息已写入同目录的 startup.log：\n\n" + detail[-2000:])
+        raise
+    sys.exit(exit_code)

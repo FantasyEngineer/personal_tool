@@ -2,7 +2,9 @@ name: build
 
 # Builds a macOS .app and a Windows .exe with PyInstaller on native runners.
 # - Push to `main` (or manual run): produces downloadable artifacts.
-# - Push a tag like `v1.0.0`: additionally publishes a GitHub Release with both zips.
+# - Push a tag like `v1.0.0`: additionally publishes a GitHub Release.
+# - Windows releases are code-signed through SignPath when the credentials
+#   below are configured (see "Signing setup" at the end of this file).
 
 on:
   push:
@@ -12,6 +14,8 @@ on:
 
 permissions:
   contents: write
+  # The SignPath action downloads the unsigned artifact through the API.
+  actions: read
 
 jobs:
   build:
@@ -28,6 +32,11 @@ jobs:
 
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+
+    env:
+      # Empty until the SignPath API token secret is added; signing steps are
+      # skipped in that case so ordinary pushes keep working.
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
 
     steps:
       - uses: actions/checkout@v4
@@ -57,6 +66,41 @@ jobs:
           codesign --force --deep --sign - "$APP"
           codesign --verify --deep --strict --verbose=2 "$APP"
 
+      # Signing runs on tags and manual runs only: every request has to be
+      # approved in SignPath and counts against the OSS plan's quota.
+      - name: Upload unsigned exe (Windows)
+        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != '' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
+        id: upload-unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-windows
+          path: dist/Toolbox.exe
+          if-no-files-found: error
+
+      - name: Sign with SignPath (Windows)
+        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != '' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+
+      - name: Verify signature (Windows)
+        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != '' && (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch')
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path signed -Filter Toolbox.exe -Recurse -ErrorAction SilentlyContinue |
+                 Select-Object -First 1
+          if (-not $exe) { Write-Error "signed exe not found under signed/"; exit 1 }
+          $sig = Get-AuthenticodeSignature $exe.FullName
+          Write-Host "Signer: $($sig.SignerCertificate.Subject)"
+          Write-Host "Status: $($sig.Status) $($sig.StatusMessage)"
+          if ($sig.Status -ne 'Valid') { Write-Error "signature is not valid"; exit 1 }
+
       - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -69,8 +113,13 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          if (-not (Test-Path dist/Toolbox.exe)) { Write-Error "dist/Toolbox.exe not found"; exit 1 }
-          Copy-Item dist/Toolbox.exe ${{ matrix.asset_name }}
+          # Use the signed exe when SignPath produced one, else the raw build.
+          $signed = Get-ChildItem -Path signed -Filter Toolbox.exe -Recurse -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+          $src = if ($signed) { $signed.FullName } else { 'dist/Toolbox.exe' }
+          if (-not (Test-Path $src)) { Write-Error "no Toolbox.exe to package"; exit 1 }
+          Write-Host "Packaging $src"
+          Copy-Item $src ${{ matrix.asset_name }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -86,3 +135,10 @@ jobs:
           files: |
             ${{ matrix.asset_name }}
           generate_release_notes: true
+
+# Signing setup (one-time, done in the GitHub UI):
+#   Secret   SIGNPATH_API_TOKEN            API token created in SignPath
+#   Variable SIGNPATH_ORGANIZATION_ID      SignPath organization id
+#   Variable SIGNPATH_PROJECT_SLUG         e.g. personal-tool
+#   Variable SIGNPATH_SIGNING_POLICY_SLUG  e.g. release-signing
+# Artifact configuration is left to the project default configured in SignPath.

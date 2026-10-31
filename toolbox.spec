@@ -28,7 +28,8 @@ a = Analysis(
     binaries=[],
     datas=ICON_ASSETS,
     # qrcode picks its PIL image backend lazily; make sure it is bundled.
-    hiddenimports=["qrcode.pil", "qrcode.image.pil"],
+    # cryptography's Rust binding is an extension module the 加解密 pages need at runtime.
+    hiddenimports=["qrcode.pil", "qrcode.image.pil", "cryptography.hazmat.bindings._rust"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

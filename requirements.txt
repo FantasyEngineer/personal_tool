@@ -2,3 +2,4 @@ PyQt5==5.15.11
 qrcode==8.2
 pillow==11.3.0
 PyYAML==6.0.3
+cryptography==50.0.2

@@ -21,8 +21,21 @@ import decimal
 import shutil
 import shlex
 import csv
+import difflib
+import hmac
+import secrets
+import string
 import yaml
 from PIL import Image
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives import padding as sym_padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives.asymmetric import rsa, utils as der_utils
+from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+from cryptography.hazmat.primitives.asymmetric.ec import ECDSA
+from cryptography.exceptions import InvalidSignature, InvalidTag
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QHBoxLayout, QLabel, QPushButton, QFrame,
                               QScrollArea, QMessageBox, QLineEdit,
@@ -30,9 +43,10 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QPlainTextEdit, QComboBox, QCheckBox, QStackedWidget,
                               QGridLayout, QSpinBox, QTabWidget, QColorDialog,
                               QFileDialog, QInputDialog, QListWidget, QListWidgetItem,
-                              QTreeWidget, QTreeWidgetItem, QHeaderView)
-from PyQt5.QtCore import Qt, QPoint, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QFont, QCursor, QColor, QPixmap, QPainter, QIcon
+                              QTreeWidget, QTreeWidgetItem, QHeaderView,
+                              QStyledItemDelegate, QStyle)
+from PyQt5.QtCore import Qt, QPoint, QPointF, QRectF, QThread, pyqtSignal, QTimer
+from PyQt5.QtGui import QFont, QCursor, QColor, QPen, QPixmap, QPainter, QIcon
 
 
 def get_effective_ip():
@@ -1285,6 +1299,368 @@ class MarkupWindow(TabbedToolWindow):
             (JsonFormatterWindow, "JSON"),
             (XmlFormatterWindow, "XML"),
         ))
+
+
+class GeneratorWindow(TabbedToolWindow):
+    def __init__(self):
+        super().__init__("UUID/二维码", (
+            (UuidWindow, "UUID"),
+            (QrCodeWindow, "二维码"),
+        ))
+
+
+class ConvertWindow(TabbedToolWindow):
+    def __init__(self):
+        super().__init__("格式转换", (
+            (ColorWindow, "颜色"),
+            (TimestampWindow, "时间戳"),
+            (JsonYamlWindow, "JSON-YAML"),
+        ))
+
+
+DIFF_AUTO_LIMIT = 4000
+DIFF_ROW_LIMIT = 5000
+DIFF_CHAR_LIMIT = 4000
+DIFF_COLORS = {"insert": "#E6F4EA", "delete": "#FCE8E6", "replace": "#FEF7E0"}
+DIFF_LABELS = {"equal": "相同", "insert": "新增", "delete": "删除", "replace": "修改"}
+DIFF_DELTA_BG = "#F6C7C2"
+DIFF_DELTA_FG = "#A50E0E"
+
+
+def load_text_file(path):
+    """Decode a user-picked file: BOM, UTF-8, then GBK, never giving up on bytes."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    for encoding in ("utf-8-sig", "utf-8", "gbk"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+def _diff_key(line, ignore_space, ignore_case):
+    text = " ".join(line.split()) if ignore_space else line
+    return text.lower() if ignore_case else text
+
+
+def diff_rows(left, right, ignore_space=False, ignore_case=False):
+    """行级并排差异：(类型, 左行号, 左内容, 右行号, 右内容)，行号从 1 开始。"""
+    l_lines, r_lines = left.splitlines(), right.splitlines()
+    cmp_l = [_diff_key(l, ignore_space, ignore_case) for l in l_lines]
+    cmp_r = [_diff_key(r, ignore_space, ignore_case) for r in r_lines]
+    matcher = difflib.SequenceMatcher(None, cmp_l, cmp_r, autojunk=False)
+    rows = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            rows.extend(("equal", i1 + k + 1, l_lines[i1 + k], j1 + k + 1, r_lines[j1 + k])
+                        for k in range(i2 - i1))
+            continue
+        if tag == "delete":
+            rows.extend(("delete", k + 1, l_lines[k], None, "") for k in range(i1, i2))
+            continue
+        if tag == "insert":
+            rows.extend(("insert", None, "", k + 1, r_lines[k]) for k in range(j1, j2))
+            continue
+        pairs = min(i2 - i1, j2 - j1)
+        rows.extend(("replace", i1 + k + 1, l_lines[i1 + k], j1 + k + 1, r_lines[j1 + k])
+                    for k in range(pairs))
+        rows.extend(("delete", k + 1, l_lines[k], None, "") for k in range(i1 + pairs, i2))
+        rows.extend(("insert", None, "", k + 1, r_lines[k]) for k in range(j1 + pairs, j2))
+    return rows
+
+
+def diff_segments(left_line, right_line):
+    """一行内哪些字符变了：返回 (左区间, 右区间)，每项是 [起点, 终点) 且互不重叠。"""
+    if max(len(left_line), len(right_line)) > DIFF_CHAR_LIMIT:
+        return ([(0, len(left_line))] if left_line else [],
+                [(0, len(right_line))] if right_line else [])
+    l_segs, r_segs = [], []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, left_line, right_line,
+                                                      autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        if i2 > i1:
+            l_segs.append((i1, i2))
+        if j2 > j1:
+            r_segs.append((j1, j2))
+    return l_segs, r_segs
+
+
+def _text_pieces(text, segments):
+    """把一行拆成 (片段, 是否改动)，未命中的空隙补成正常片段。"""
+    pieces = []
+    pos = 0
+    for start, end in segments:
+        if start > pos:
+            pieces.append((text[pos:start], False))
+        pieces.append((text[start:end], True))
+        pos = end
+    if pos < len(text):
+        pieces.append((text[pos:], False))
+    return pieces
+
+
+class _DiffCellDelegate(QStyledItemDelegate):
+    """「修改」行的正文自己画：只有真正改动的字符带上红底红字。"""
+
+    TEXT_COLUMNS = (1, 3)
+
+    def paint(self, painter, option, index):
+        segments = index.data(Qt.UserRole)
+        if (index.column() not in self.TEXT_COLUMNS or not segments
+                or option.state & QStyle.State_Selected):
+            super().paint(painter, option, index)
+            return
+        text = index.data(Qt.DisplayRole) or ""
+        rect = option.rect
+        painter.save()
+        painter.setClipRect(rect)
+        painter.fillRect(rect, QColor("#FFFFFF"))
+        metrics = option.fontMetrics
+        painter.setFont(option.font)
+        baseline = float(rect.center().y()) + metrics.ascent() - metrics.height() / 2.0
+        x = float(rect.left()) + 4
+        for piece, changed in _text_pieces(text, segments):
+            if not piece:
+                continue
+            width = metrics.horizontalAdvance(piece)
+            if changed:
+                painter.fillRect(QRectF(x, float(rect.top()), float(width), float(rect.height())),
+                                 QColor(DIFF_DELTA_BG))
+                painter.setPen(QPen(QColor(DIFF_DELTA_FG)))
+            else:
+                painter.setPen(QPen(QColor("#202124")))
+            painter.drawText(QPointF(x, baseline), piece)
+            x += width
+        painter.restore()
+
+
+class DiffWindow(QMainWindow):
+    """左右两段文本的对比：改了哪几行、加了几行、删了几行，一眼看清。"""
+
+    COLUMNS = ("原文行", "原文", "对比行", "对比后")
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("文本对比")
+        self.setGeometry(*tool_win_geometry())
+        self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.run_diff)
+        self.init_ui()
+
+    def init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(15, 15, 15, 10)
+        layout.setSpacing(10)
+
+        options = QHBoxLayout()
+        options.setSpacing(10)
+        run_btn = QPushButton("对比")
+        run_btn.setFixedSize(56, 28)
+        run_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        run_btn.setStyleSheet(_primary_btn())
+        run_btn.clicked.connect(lambda _c: self.run_diff(True))
+        options.addWidget(run_btn)
+        self.space_check = QCheckBox("忽略空白")
+        self.space_check.setStyleSheet("QCheckBox { font-family: 'PingFang SC'; font-size: 12px; }")
+        self.space_check.toggled.connect(lambda _c: self.run_diff())
+        options.addWidget(self.space_check)
+        self.case_check = QCheckBox("忽略大小写")
+        self.case_check.setStyleSheet("QCheckBox { font-family: 'PingFang SC'; font-size: 12px; }")
+        self.case_check.toggled.connect(lambda _c: self.run_diff())
+        options.addWidget(self.case_check)
+        self.only_check = QCheckBox("只看差异")
+        self.only_check.setStyleSheet("QCheckBox { font-family: 'PingFang SC'; font-size: 12px; }")
+        self.only_check.toggled.connect(lambda _c: self.run_diff())
+        options.addWidget(self.only_check)
+        options.addStretch()
+
+        swap_btn = QPushButton("交换左右")
+        swap_btn.setFixedSize(74, 28)
+        swap_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        swap_btn.setStyleSheet(_secondary_btn())
+        swap_btn.clicked.connect(self.swap_sides)
+        options.addWidget(swap_btn)
+
+        copy_btn = QPushButton("复制 diff")
+        copy_btn.setFixedSize(74, 28)
+        copy_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        copy_btn.setStyleSheet(_secondary_btn())
+        copy_btn.clicked.connect(self.copy_unified)
+        options.addWidget(copy_btn)
+
+        clear_btn = QPushButton("清空")
+        clear_btn.setFixedSize(56, 28)
+        clear_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        clear_btn.setStyleSheet(_secondary_btn())
+        clear_btn.clicked.connect(self.do_clear)
+        options.addWidget(clear_btn)
+        layout.addLayout(options)
+
+        body = QSplitter(Qt.Vertical)
+        panes = QWidget()
+        pane_layout = QHBoxLayout(panes)
+        pane_layout.setContentsMargins(0, 0, 0, 0)
+        pane_layout.setSpacing(10)
+        self.left_edit, left_pane = self._build_pane("原文", "onlDiffL")
+        self.right_edit, right_pane = self._build_pane("对比后", "onlDiffR")
+        pane_layout.addWidget(left_pane, 1)
+        pane_layout.addWidget(right_pane, 1)
+        body.addWidget(panes)
+
+        self.result_tree = QTreeWidget()
+        self.result_tree.setColumnCount(len(self.COLUMNS))
+        self.result_tree.setHeaderLabels(self.COLUMNS)
+        self.result_tree.setRootIsDecorated(False)
+        self.result_tree.setAlternatingRowColors(False)
+        self.result_tree.setSelectionMode(QTreeWidget.ExtendedSelection)
+        self.result_tree.setItemDelegate(_DiffCellDelegate(self.result_tree))
+        self.result_tree.setStyleSheet("""
+            QTreeWidget { border: 1px solid #D0D0D0; border-radius: 6px; background: #FFFFFF;
+                font-family: "Menlo", "Consolas", monospace; font-size: 12px; }
+            QTreeWidget::item { padding: 2px 4px; }
+            QHeaderView::section { background: #F5F5F5; border: none; padding: 4px;
+                font-family: "PingFang SC"; font-size: 11px; color: #666666; }
+        """)
+        header = self.result_tree.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        body.addWidget(self.result_tree)
+        body.setStretchFactor(0, 2)
+        body.setStretchFactor(1, 3)
+        layout.addWidget(body, 1)
+
+        self.status_label = QLabel("粘贴两段文本即可自动对比；也可以点「打开」直接读文件。")
+        self.status_label.setFont(QFont("PingFang SC", 11))
+        self.status_label.setStyleSheet("color: #999999;")
+        layout.addWidget(self.status_label)
+
+    def _build_pane(self, title, object_name):
+        container = QWidget()
+        box = QVBoxLayout(container)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(6)
+
+        row = QHBoxLayout()
+        label = QLabel(title)
+        label.setFont(QFont("PingFang SC", 12, QFont.Bold))
+        label.setStyleSheet("color: #333333;")
+        row.addWidget(label)
+        row.addStretch()
+        open_btn = QPushButton("打开")
+        open_btn.setFixedSize(52, 24)
+        open_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        open_btn.setStyleSheet(_secondary_btn())
+        row.addWidget(open_btn)
+        box.addLayout(row)
+
+        edit = QPlainTextEdit()
+        edit.setObjectName(object_name)
+        edit.setStyleSheet(_plain_style())
+        edit.setPlaceholderText("在此粘贴 %s ..." % title)
+        edit.textChanged.connect(self.schedule_diff)
+        box.addWidget(edit, 1)
+        open_btn.clicked.connect(lambda _c, e=edit: self.load_into(e))
+        return edit, container
+
+    def load_into(self, edit):
+        path, _selected = QFileDialog.getOpenFileName(self, "选择文本文件", os.path.expanduser("~"),
+                                                    "文本文件 (*.txt *.md *.json *.yaml *.py *.log);;所有文件 (*)")
+        if not path:
+            return
+        try:
+            edit.setPlainText(load_text_file(path))
+        except OSError as e:
+            self.status_label.setText("读取失败：%s" % e)
+            return
+        self.status_label.setText("已读入 %s" % path)
+
+    def schedule_diff(self):
+        self._timer.start(350)
+
+    def swap_sides(self):
+        left, right = self.left_edit.toPlainText(), self.right_edit.toPlainText()
+        self.left_edit.setPlainText(right)
+        self.right_edit.setPlainText(left)
+
+    def do_clear(self):
+        self.left_edit.clear()
+        self.right_edit.clear()
+        self.result_tree.clear()
+        self.status_label.setText("已清空。")
+
+    def run_diff(self, force=False):
+        self._timer.stop()
+        left = self.left_edit.toPlainText()
+        right = self.right_edit.toPlainText()
+        if not left and not right:
+            self.result_tree.clear()
+            self.status_label.setText("两段文本都是空的。")
+            return
+        l_count, r_count = len(left.splitlines()), len(right.splitlines())
+        if max(l_count, r_count) > DIFF_AUTO_LIMIT and not force:
+            self.result_tree.clear()
+            self.status_label.setText("文本较大（%d / %d 行），点「对比」强制执行。" % (l_count, r_count))
+            return
+        rows = diff_rows(left, right, self.space_check.isChecked(), self.case_check.isChecked())
+        counts = {kind: 0 for kind in DIFF_LABELS}
+        for row in rows:
+            counts[row[0]] += 1
+        if self.only_check.isChecked():
+            shown = [row for row in rows if row[0] != "equal"]
+        else:
+            shown = rows
+        self.result_tree.clear()
+        limit = min(len(shown), DIFF_ROW_LIMIT)
+        for kind, l_no, l_text, r_no, r_text in shown[:limit]:
+            item = QTreeWidgetItem(["" if l_no is None else str(l_no), l_text,
+                                   "" if r_no is None else str(r_no), r_text])
+            color = DIFF_COLORS.get(kind)
+            if color:
+                for column in range(len(self.COLUMNS)):
+                    item.setBackground(column, QColor(color))
+                    item.setToolTip(column, DIFF_LABELS[kind])
+            if kind == "replace":
+                l_segs, r_segs = diff_segments(l_text, r_text)
+                for column, segs in ((1, l_segs), (3, r_segs)):
+                    item.setData(column, Qt.UserRole, segs)
+                    item.setBackground(column, QColor("#FFFFFF"))
+            self.result_tree.addTopLevelItem(item)
+        if not any(counts[kind] for kind in ("insert", "delete", "replace")):
+            self.status_label.setText("两段文本一致（%d 行%s）。"
+                                      % (counts["equal"], "，忽略空白/大小写"
+                                         if (self.space_check.isChecked() or self.case_check.isChecked()) else ""))
+            self.status_label.setStyleSheet("color: #188038; font-family: 'PingFang SC'; font-size: 11px;")
+            return
+        self.status_label.setStyleSheet("color: #999999; font-family: 'PingFang SC'; font-size: 11px;")
+        text = ("差异：修改 %d · 新增 %d · 删除 %d · 相同 %d 行"
+                % (counts["replace"], counts["insert"], counts["delete"], counts["equal"]))
+        if len(shown) > limit:
+            text += "（仅显示前 %d 行）" % limit
+        if self.only_check.isChecked():
+            text += " · 已过滤相同行"
+        self.status_label.setText(text)
+
+    def copy_unified(self):
+        left = self.left_edit.toPlainText().splitlines()
+        right = self.right_edit.toPlainText().splitlines()
+        diff = list(difflib.unified_diff(left, right, "原文", "对比后", lineterm="", n=3))
+        if not diff:
+            self.status_label.setText("两段文本没有差异。")
+            return
+        QApplication.clipboard().setText("\n".join(diff))
+        self.status_label.setText("已复制标准 diff（%d 行）。" % len(diff))
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
 
 
 class TextStatWindow(QMainWindow):
@@ -3214,6 +3590,925 @@ class HashWindow(QMainWindow):
             self.close()
 
 
+JWT_HS_ALGS = {"HS256": hashlib.sha256, "HS384": hashlib.sha384, "HS512": hashlib.sha512}
+JWT_PUB_ALGS = {"RS256": hashes.SHA256, "RS384": hashes.SHA384, "RS512": hashes.SHA512,
+                "PS256": hashes.SHA256, "PS384": hashes.SHA384, "PS512": hashes.SHA512,
+                "ES256": hashes.SHA256, "ES384": hashes.SHA384, "ES512": hashes.SHA512}
+# ES* 的签名是定长 r||s；ES512 走 P-521，所以每段 66 字节
+JWT_EC_PART = {"ES256": 32, "ES384": 48, "ES512": 66}
+JWT_TIME_CLAIMS = (("iat", "签发"), ("nbf", "生效"), ("exp", "过期"))
+
+
+def b64url_encode(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def b64url_decode(text):
+    try:
+        return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+    except ValueError:
+        raise ValueError("Base64URL 段解不开：%s" % text[:24])
+
+
+def jwt_parts(token):
+    """拆 JWT，返回 (头部, 载荷, 签名, 待签名内容)。"""
+    parts = token.strip().split(".")
+    if len(parts) < 2:
+        raise ValueError("看不到 . 分隔的段，不像 JWT")
+    try:
+        header = json.loads(b64url_decode(parts[0]).decode("utf-8", "replace"))
+        payload = json.loads(b64url_decode(parts[1]).decode("utf-8", "replace"))
+    except ValueError:
+        raise ValueError("头部或载荷不是 JSON，检查是否粘全了三段")
+    if not isinstance(header, dict) or not isinstance(payload, dict):
+        raise ValueError("头部和载荷得是 JSON 对象")
+    signature = b64url_decode(parts[2]) if len(parts) > 2 and parts[2] else b""
+    return header, payload, signature, ".".join(parts[:2]).encode()
+
+
+def load_pem_key(text):
+    """先当公钥读，读不通再当私钥读；私钥里也带公钥，本地自测方便。"""
+    data = text.strip().encode("utf-8")
+    try:
+        return serialization.load_pem_public_key(data)
+    except ValueError:
+        return serialization.load_pem_private_key(data, password=None)
+
+
+def as_public(key):
+    """私钥对象顺手取它的公钥；本来就是公钥则原样返回。"""
+    return key.public_key() if hasattr(key, "public_key") else key
+
+
+def jwt_verify(alg, signing_input, signature, key_text):
+    """返回 (True/False/None, 说明)；None 表示手头条件验不了。"""
+    if alg.lower() == "none":
+        return None, "alg=none，这个 token 压根没签名，别信"
+    if not signature:
+        return None, "缺少签名段，只能看内容"
+    if alg in JWT_HS_ALGS:
+        if not key_text.strip():
+            return None, "要验 %s 还需要填共享密钥" % alg
+        mac = hmac.new(key_text.encode("utf-8"), signing_input, JWT_HS_ALGS[alg]).digest()
+        if hmac.compare_digest(mac, signature):
+            return True, "%s 验签通过（共享密钥）" % alg
+        return False, "%s 验签失败：密钥不对，或 token 被改过" % alg
+    if alg not in JWT_PUB_ALGS:
+        return None, "算法 %s 还不支持验签，只看内容" % alg
+    if not key_text.strip():
+        return None, "要验 %s 还需要填 PEM 公钥" % alg
+    hash_cls = JWT_PUB_ALGS[alg]
+    try:
+        public = as_public(load_pem_key(key_text))
+    except Exception as e:
+        return None, "公钥读不出来：%s" % e
+    try:
+        if alg.startswith("RS"):
+            public.verify(signature, signing_input, asym_padding.PKCS1v15(), hash_cls())
+        elif alg.startswith("PS"):
+            public.verify(signature, signing_input,
+                          asym_padding.PSS(mgf=asym_padding.MGF1(hash_cls()),
+                                            salt_length=hash_cls().digest_size), hash_cls())
+        else:
+            half = JWT_EC_PART[alg]
+            if len(signature) != half * 2:
+                return None, "%s 签名长度应为 %d 字节，实际 %d" % (alg, half * 2, len(signature))
+            r = int.from_bytes(signature[:half], "big")
+            s = int.from_bytes(signature[half:], "big")
+            public.verify(der_utils.encode_dss_signature(r, s), signing_input, ECDSA(hash_cls()))
+    except InvalidSignature:
+        return False, "%s 验签失败：签名和密钥不匹配" % alg
+    except Exception as e:
+        return None, "%s 没法验签：%s" % (alg, e)
+    return True, "%s 验签通过" % alg
+
+
+def span_text(seconds):
+    seconds = int(abs(seconds))
+    for unit, size in (("天", 86400), ("小时", 3600), ("分钟", 60)):
+        if seconds >= size:
+            return "%d%s" % (seconds // size, unit)
+    return "%d秒" % seconds
+
+
+def jwt_claim_notes(payload):
+    notes = []
+    now = time.time()
+    for name, cn in JWT_TIME_CLAIMS:
+        val = payload.get(name)
+        if not isinstance(val, (int, float)):
+            continue
+        local = datetime.datetime.fromtimestamp(val).strftime("%Y-%m-%d %H:%M:%S")
+        note = "%s %s：%s" % (cn, name, local)
+        if name == "exp":
+            note += "（已过期 %s）" % span_text(val - now) if val < now else "（还剩 %s）" % span_text(val - now)
+        notes.append(note)
+    return notes
+
+
+class _CryptoPage(QWidget):
+    """加解密各页共用的布局小工具。"""
+
+    def __init__(self):
+        super().__init__()
+        self.box = QVBoxLayout(self)
+        self.box.setContentsMargins(15, 15, 15, 10)
+        self.box.setSpacing(8)
+
+    def label(self, text):
+        item = QLabel(text)
+        item.setFont(QFont("PingFang SC", 12, QFont.Bold))
+        item.setStyleSheet("color: #333333;")
+        return item
+
+    def row(self):
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.box.addLayout(row)
+        return row
+
+    def button(self, text, handler, primary=False, width=84):
+        btn = QPushButton(text)
+        btn.setFixedSize(width, 28)
+        btn.setCursor(QCursor(Qt.PointingHandCursor))
+        btn.setStyleSheet(_primary_btn() if primary else _secondary_btn())
+        btn.clicked.connect(handler)
+        return btn
+
+    def combo(self, items, width=140):
+        box = QComboBox()
+        box.addItems(list(items))
+        box.setFixedWidth(width)
+        box.setStyleSheet(_combo_style())
+        return box
+
+    def line(self, placeholder=""):
+        edit = QLineEdit()
+        edit.setStyleSheet(_lineedit_style())
+        if placeholder:
+            edit.setPlaceholderText(placeholder)
+        return edit
+
+    def area(self, height, placeholder=""):
+        edit = QPlainTextEdit()
+        edit.setFixedHeight(height)
+        edit.setStyleSheet(_plain_style())
+        if placeholder:
+            edit.setPlaceholderText(placeholder)
+        return edit
+
+    def output(self):
+        view = QTextEdit()
+        view.setReadOnly(True)
+        view.setStyleSheet(_output_style())
+        return view
+
+    def add_status(self):
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        self.box.addWidget(self.status_label)
+        self._set_status("")
+
+    def _set_status(self, text, ok=True):
+        color = "#188038" if ok is True else ("#9AA0A6" if ok is None else "#D93025")
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet("color: %s; font-family: 'PingFang SC'; font-size: 11px;" % color)
+
+    def copy_text(self, text, empty="没有可复制的内容。"):
+        if not text:
+            self._set_status(empty, ok=False)
+            return
+        QApplication.clipboard().setText(text.strip())
+        self._set_status("已复制到剪贴板。")
+
+
+class _JwtPage(_CryptoPage):
+    """JWT 只看内容不安全，所以顺手把 HS*/RS*/PS*/ES* 的签名也验了。"""
+
+    def __init__(self):
+        super().__init__()
+        self.box.addWidget(self.label("Token"))
+        self.token_edit = self.area(110, "粘贴 eyJ... 开头的 JWT")
+        self.box.addWidget(self.token_edit)
+        self.box.addWidget(self.label("密钥 / 公钥"))
+        self.key_edit = self.area(64, "HS* 填共享密钥；RS*/PS*/ES* 填 PEM 公钥")
+        self.box.addWidget(self.key_edit)
+        row = self.row()
+        row.addWidget(self.button("解析", self.do_parse, True, 72))
+        row.addWidget(self.button("复制载荷", self.copy_payload))
+        row.addWidget(self.button("清空", self.do_clear, width=64))
+        row.addStretch()
+        self.result_text = self.output()
+        self.box.addWidget(self.result_text, 1)
+        self.add_status()
+        self._payload = ""
+
+    def do_parse(self):
+        token = self.token_edit.toPlainText().strip()
+        if not token:
+            self.result_text.setPlainText("")
+            self._set_status("先粘贴一段 JWT。", ok=False)
+            return
+        try:
+            header, payload, signature, signing_input = jwt_parts(token)
+        except ValueError as e:
+            self.result_text.setPlainText("")
+            self._set_status("解析失败：%s" % e, ok=False)
+            return
+        self._payload = json.dumps(payload, ensure_ascii=False, indent=2)
+        head_text = json.dumps(header, ensure_ascii=False, indent=2)
+        blocks = ["头部", head_text, "", "载荷", self._payload]
+        notes = jwt_claim_notes(payload)
+        if notes:
+            blocks += ["", "时间声明"] + notes
+        verdict, note = jwt_verify(str(header.get("alg", "")), signing_input, signature,
+                                  self.key_edit.toPlainText())
+        blocks += ["", "签名 " + (b64url_encode(signature) if signature else "（无）"),
+                   "验签：" + note]
+        self.result_text.setPlainText("\n".join(blocks))
+        self._set_status(note, ok=verdict)
+
+    def copy_payload(self):
+        self.copy_text(self._payload, "先解析一段 JWT。")
+
+    def do_clear(self):
+        self.token_edit.clear()
+        self.key_edit.clear()
+        self.result_text.setPlainText("")
+        self._payload = ""
+        self._set_status("")
+
+
+class _AesPage(_CryptoPage):
+    """口令派生的 AES 密文自带模式和盐，解密时不用再猜参数。"""
+
+    def __init__(self):
+        super().__init__()
+        row = self.row()
+        row.addWidget(QLabel("模式"))
+        self.mode_combo = self.combo(AES_MODES, 140)
+        row.addWidget(self.mode_combo)
+        row.addWidget(QLabel("密钥"))
+        self.src_combo = self.combo(AES_KEY_SOURCES, 150)
+        row.addWidget(self.src_combo)
+        row.addWidget(QLabel("输出"))
+        self.out_combo = self.combo(("Base64", "Hex"), 90)
+        row.addWidget(self.out_combo)
+        row.addStretch()
+        self.key_line = self.line("口令，或 16/32 字节 Hex 密钥")
+        self.box.addWidget(self.key_line)
+        self.box.addWidget(self.label("内容"))
+        self.input_edit = self.area(90, "加密前放明文，解密时把密文整段粘进来")
+        self.box.addWidget(self.input_edit)
+        row = self.row()
+        row.addWidget(self.button("加密", self.do_encrypt, True, 72))
+        row.addWidget(self.button("解密", self.do_decrypt, True, 72))
+        row.addWidget(self.button("复制结果", self.copy_result))
+        row.addWidget(self.button("清空", self.do_clear, width=64))
+        row.addStretch()
+        self.result_text = self.output()
+        self.box.addWidget(self.result_text, 1)
+        self.add_status()
+        self.mode_combo.currentTextChanged.connect(self._hint)
+        self.src_combo.currentIndexChanged.connect(self._key_placeholder)
+        self._key_placeholder()
+        self._hint(self.mode_combo.currentText())
+
+    def _key_placeholder(self):
+        derived = self.src_combo.currentIndex() == 0
+        self.key_line.setPlaceholderText("口令（PBKDF2-SHA256 %d 次派生，每次加密随机盐）" % AES_PBKDF2_ROUNDS
+                                        if derived else "原始密钥 Hex，长度要匹配模式")
+
+    def _hint(self, mode):
+        if mode.endswith("GCM"):
+            self._set_status("%s 自带完整性校验，推荐用这个；密文头已写入模式和盐，解密不用再选。" % mode)
+        elif mode.endswith("CBC"):
+            self._set_status("%s 没有完整性校验，只用来和别的系统互通；自己的数据选 GCM。" % mode, ok=False)
+        else:
+            self._set_status("%s 不校验完整性，且同一个密钥下 IV 绝不能复用。" % mode, ok=False)
+
+    def _derive_key(self):
+        text = self.key_line.text()
+        if self.src_combo.currentIndex() == 0:
+            if not text:
+                raise ValueError("请输入口令")
+            return text, None
+        raw = bytes.fromhex("".join(text.split()))
+        size = AES_KEY_BYTES[self.mode_combo.currentText()]
+        if len(raw) != size:
+            raise ValueError("这个模式需要 %d 字节（%d 个 Hex 字符）密钥，当前 %d 字节"
+                            % (size, size * 2, len(raw)))
+        return None, raw
+
+    def do_encrypt(self):
+        data = self.input_edit.toPlainText().encode("utf-8")
+        if not data:
+            self._set_status("先输入要加密的明文。", ok=False)
+            return
+        try:
+            passphrase, raw_key = self._derive_key()
+            blob = aes_encrypt(data, self.mode_combo.currentText(), passphrase, raw_key)
+        except ValueError as e:
+            self._set_status("加密失败：%s" % e, ok=False)
+            return
+        self.result_text.setPlainText(encode_blob(blob, self.out_combo.currentText()))
+        self._set_status("已加密：%s，密文 %d 字节。" % (self.mode_combo.currentText(), len(blob)))
+
+    def do_decrypt(self):
+        try:
+            blob = decode_blob(self.input_edit.toPlainText(), self.out_combo.currentText())
+            passphrase, raw_key = self._derive_key()
+            plain = aes_decrypt(blob, passphrase, raw_key)
+        except InvalidTag:
+            self._set_status("解密失败：口令/密钥不对，或密文被改过（GCM 校验不通过）。", ok=False)
+            return
+        except ValueError as e:
+            self._set_status("解密失败：%s" % e, ok=False)
+            return
+        try:
+            text = plain.decode("utf-8")
+        except UnicodeDecodeError:
+            text = encode_blob(plain, self.out_combo.currentText())
+            self._set_status("解出来的不是 UTF-8 文本，已按原样给出字节。", ok=False)
+        else:
+            self._set_status("解密成功：%d 字符。" % len(text))
+        self.result_text.setPlainText(text)
+
+    def copy_result(self):
+        self.copy_text(self.result_text.toPlainText(), "还没有结果。")
+
+    def do_clear(self):
+        self.key_line.clear()
+        self.input_edit.clear()
+        self.result_text.setPlainText("")
+        self._set_status("")
+
+
+AES_MODES = ("AES-256-GCM", "AES-128-GCM", "AES-256-CBC", "AES-256-CTR")
+AES_KEY_SOURCES = ("口令派生（推荐）", "Hex 原始密钥")
+AES_KEY_BYTES = {"AES-256-GCM": 32, "AES-128-GCM": 16, "AES-256-CBC": 32, "AES-256-CTR": 32}
+AES_IV_BYTES = {"AES-256-GCM": 12, "AES-128-GCM": 12, "AES-256-CBC": 16, "AES-256-CTR": 16}
+AES_MAGIC = b"TBX1"
+AES_PBKDF2_ROUNDS = 210000
+AES_SALT_BYTES = 16
+
+
+def encode_blob(data, encoding):
+    return data.hex() if encoding == "Hex" else base64.b64encode(data).decode()
+
+
+def decode_blob(text, encoding):
+    text = text.strip()
+    if not text:
+        raise ValueError("先输入密文")
+    if encoding == "Hex":
+        return bytes.fromhex("".join(text.split()))
+    return base64.b64decode("".join(text.split()), validate=True)
+
+
+def pbkdf2_key(passphrase, salt, length, rounds=AES_PBKDF2_ROUNDS):
+    return PBKDF2HMAC(algorithm=hashes.SHA256(), length=length, salt=salt,
+                      iterations=rounds).derive(passphrase.encode("utf-8"))
+
+
+def aes_run(key, iv, mode_name, data, encrypt, aad):
+    if mode_name.endswith("GCM"):
+        box = AESGCM(key)
+        return box.encrypt(iv, data, aad) if encrypt else box.decrypt(iv, data, aad)
+    if mode_name.endswith("CBC"):
+        if encrypt:
+            padder = sym_padding.PKCS7(128).padder()
+            data = padder.update(data) + padder.finalize()
+    cipher = Cipher(algorithms.AES(key),
+                    modes.CBC(iv) if mode_name.endswith("CBC") else modes.CTR(iv))
+    engine = cipher.encryptor() if encrypt else cipher.decryptor()
+    out = engine.update(data) + engine.finalize()
+    if mode_name.endswith("CBC") and not encrypt:
+        unpadder = sym_padding.PKCS7(128).unpadder()
+        out = unpadder.update(out) + unpadder.finalize()
+    return out
+
+
+def aes_encrypt(data, mode_name, passphrase=None, raw_key=None):
+    """TBX1 | 模式 | 密钥来源 | salt | IV | 密文；头部当作 GCM 的附加认证数据。"""
+    idx = AES_MODES.index(mode_name)
+    size = AES_KEY_BYTES[mode_name]
+    iv = os.urandom(AES_IV_BYTES[mode_name])
+    if passphrase is None:
+        salt, key, flag = b"", raw_key, 1
+    else:
+        salt = os.urandom(AES_SALT_BYTES)
+        key = pbkdf2_key(passphrase, salt, size)
+        flag = 0
+    head = AES_MAGIC + bytes([idx, flag]) + salt + iv
+    return head + aes_run(key, iv, mode_name, data, True, head)
+
+
+def aes_decrypt(blob, passphrase=None, raw_key=None):
+    if not blob.startswith(AES_MAGIC):
+        raise ValueError("密文没有 TBX1 头，不是本工具加密的；确认一下输出编码选对了吗")
+    idx, flag = blob[4], blob[5]
+    if idx >= len(AES_MODES) or flag > 1:
+        raise ValueError("密文头部编号不认识")
+    mode_name = AES_MODES[idx]
+    size = AES_KEY_BYTES[mode_name]
+    pos = len(AES_MAGIC) + 2
+    salt = b""
+    if flag == 0:
+        salt = blob[pos:pos + AES_SALT_BYTES]
+        pos += AES_SALT_BYTES
+    iv = blob[pos:pos + AES_IV_BYTES[mode_name]]
+    pos += AES_IV_BYTES[mode_name]
+    key = pbkdf2_key(passphrase, salt, size) if passphrase is not None else raw_key
+    return aes_run(key, iv, mode_name, blob[pos:], False, blob[:pos])
+
+
+class _RsaKeygenWorker(QThread):
+    done = pyqtSignal(str, str, str)
+
+    def __init__(self, bits):
+        super().__init__()
+        self.bits = bits
+
+    def run(self):
+        try:
+            key = rsa.generate_private_key(public_exponent=65537, key_size=self.bits)
+            priv = key.private_bytes(serialization.Encoding.PEM,
+                                    serialization.PrivateFormat.PKCS8,
+                                    serialization.NoEncryption()).decode()
+            pub = key.public_key().public_bytes(
+                serialization.Encoding.PEM,
+                serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+            self.done.emit(priv, pub, "")
+        except Exception as e:
+            self.done.emit("", "", "生成失败：%s" % e)
+
+
+class _RsaPage(_CryptoPage):
+    """RSA 用来加密小东西（AES 密钥、签名）；大段内容请回到 AES 页。"""
+
+    def __init__(self):
+        super().__init__()
+        row = self.row()
+        row.addWidget(QLabel("位数"))
+        self.bits_combo = self.combo(("2048", "3072", "4096"), 90)
+        row.addWidget(self.bits_combo)
+        self.gen_btn = self.button("生成密钥对", self.do_keygen, True, 100)
+        row.addWidget(self.gen_btn)
+        row.addWidget(self.button("清空密钥", self.clear_keys, width=88))
+        row.addStretch()
+        self.box.addWidget(self.label("私钥（PKCS#8 PEM）"))
+        self.priv_edit = self.area(96, "-----BEGIN PRIVATE KEY-----")
+        self.box.addWidget(self.priv_edit)
+        self.box.addWidget(self.label("公钥（SPKI PEM）"))
+        self.pub_edit = self.area(64, "-----BEGIN PUBLIC KEY-----")
+        self.box.addWidget(self.pub_edit)
+        row = self.row()
+        row.addWidget(self.button("复制私钥", lambda: self.copy_text(self.priv_edit.toPlainText())))
+        row.addWidget(self.button("复制公钥", lambda: self.copy_text(self.pub_edit.toPlainText())))
+        row.addStretch()
+        self.box.addWidget(self.label("内容 / 密文"))
+        self.input_edit = self.area(64, "加密放明文；解密粘 base64 密文；签名/验签放原文")
+        self.box.addWidget(self.input_edit)
+        self.sig_line = self.line("验签时把 base64 签名粘到这里")
+        self.box.addWidget(self.sig_line)
+        row = self.row()
+        row.addWidget(self.button("加密", self.do_encrypt, True, 72))
+        row.addWidget(self.button("解密", self.do_decrypt, True, 72))
+        row.addWidget(self.button("签名", self.do_sign, True, 72))
+        row.addWidget(self.button("验签", self.do_verify, True, 72))
+        row.addWidget(self.button("复制结果", self.copy_result))
+        row.addStretch()
+        self.result_text = self.output()
+        self.box.addWidget(self.result_text, 1)
+        self.add_status()
+        self._worker = None
+        self._set_status("2048 位 OAEP-SHA256 单次最多加密 %d 字节，更大的内容用 AES。" % rsa_plain_limit(2048))
+
+    def _fail(self, text):
+        self._set_status(text, ok=False)
+
+    def do_keygen(self):
+        if self._worker is not None and self._worker.isRunning():
+            return
+        bits = int(self.bits_combo.currentText())
+        self.gen_btn.setText("生成中…")
+        self.gen_btn.setEnabled(False)
+        self._worker = _RsaKeygenWorker(bits)
+        self._worker.done.connect(self._keygen_done)
+        self._worker.start()
+
+    def _keygen_done(self, priv, pub, error):
+        self.gen_btn.setText("生成密钥对")
+        self.gen_btn.setEnabled(True)
+        if error or not priv:
+            self._fail(error or "生成失败：没有取到私钥")
+            return
+        self.priv_edit.setPlainText(priv)
+        self.pub_edit.setPlainText(pub)
+        self._set_status("已生成 %d 位密钥对，OAEP-SHA256 单次最多加密 %d 字节。"
+                         % (self._worker.bits, rsa_plain_limit(self._worker.bits)))
+
+    def clear_keys(self):
+        self.priv_edit.clear()
+        self.pub_edit.clear()
+        self.result_text.setPlainText("")
+        self._set_status("")
+
+    def _key(self, which):
+        text = (self.priv_edit if which == "priv" else self.pub_edit).toPlainText()
+        if not text.strip():
+            raise ValueError("先生成或粘贴%s" % ("私钥" if which == "priv" else "公钥"))
+        key = load_pem_key(text)
+        return key if which == "priv" else as_public(key)
+
+    def do_encrypt(self):
+        try:
+            key = self._key("pub")
+            data = self.input_edit.toPlainText().encode("utf-8")
+            if not data:
+                raise ValueError("先输入要加密的明文")
+            limit = rsa_plain_limit(key.key_size)
+            if len(data) > limit:
+                raise ValueError("明文 %d 字节，超过这个密钥的上限 %d 字节；大段数据请用 AES"
+                                % (len(data), limit))
+            blob = key.encrypt(data, rsa_oaep())
+        except (ValueError, TypeError) as e:
+            self._fail("加密失败：%s" % e)
+            return
+        except Exception as e:
+            self._fail("加密失败：公钥读不出来（%s）" % e)
+            return
+        self.result_text.setPlainText(base64.b64encode(blob).decode())
+        self._set_status("已加密：%d 字节明文 → %d 字节密文（base64）。" % (len(data), len(blob)))
+
+    def do_decrypt(self):
+        try:
+            key = self._key("priv")
+            blob = base64.b64decode(self.input_edit.toPlainText().strip(), validate=True)
+            plain = key.decrypt(blob, rsa_oaep())
+        except ValueError as e:
+            self._fail("解密失败：密文不是合法 base64 或密钥不对（%s）" % e)
+            return
+        except Exception as e:
+            self._fail("解密失败：%s" % e)
+            return
+        self.result_text.setPlainText(decode_maybe_text(plain))
+        self._set_status("解密完成。")
+
+    def do_sign(self):
+        try:
+            key = self._key("priv")
+            data = self.input_edit.toPlainText().encode("utf-8")
+            if not data:
+                raise ValueError("先输入要签名的内容")
+            sig = key.sign(data, asym_padding.PKCS1v15(), hashes.SHA256())
+        except (ValueError, TypeError) as e:
+            self._fail("签名失败：%s" % e)
+            return
+        except Exception as e:
+            self._fail("签名失败：私钥读不出来（%s）" % e)
+            return
+        text = base64.b64encode(sig).decode()
+        self.result_text.setPlainText(text)
+        self.sig_line.setText(text)
+        self._set_status("已用 PKCS1v15 + SHA-256 签名，签名值同时填到了验签框。")
+
+    def do_verify(self):
+        try:
+            key = self._key("pub")
+            data = self.input_edit.toPlainText().encode("utf-8")
+            sig = base64.b64decode(self.sig_line.text().strip(), validate=True)
+            key.verify(sig, data, asym_padding.PKCS1v15(), hashes.SHA256())
+        except InvalidSignature:
+            self._fail("验签失败：签名与内容/公钥不匹配")
+            return
+        except ValueError as e:
+            self._fail("验签失败：签名不是合法 base64（%s）" % e)
+            return
+        except Exception as e:
+            self._fail("验签失败：%s" % e)
+            return
+        self._set_status("验签通过：内容确实由配对的私钥签名。")
+
+    def copy_result(self):
+        self.copy_text(self.result_text.toPlainText(), "还没有结果。")
+
+
+def rsa_oaep():
+    return asym_padding.OAEP(mgf=asym_padding.MGF1(algorithm=hashes.SHA256()),
+                            algorithm=hashes.SHA256(), label=None)
+
+
+def rsa_plain_limit(bits):
+    """OAEP-SHA256 的明文上限：key_size - 2*digest - 2。"""
+    return bits // 8 - 2 * 32 - 2
+
+
+def decode_maybe_text(data):
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return base64.b64encode(data).decode()
+
+
+class _HmacPage(_CryptoPage):
+    """给一段内容 + 密钥算消息认证码，结果随输入实时刷新。"""
+
+    def __init__(self):
+        super().__init__()
+        self.box.addWidget(self.label("内容"))
+        self.msg_edit = self.area(100, "要签名的消息")
+        self.box.addWidget(self.msg_edit)
+        row = self.row()
+        row.addWidget(QLabel("密钥"))
+        self.key_line = self.line("共享密钥")
+        row.addWidget(self.key_line, 1)
+        row.addWidget(QLabel("算法"))
+        self.alg_combo = self.combo(HMAC_ALGS, 120)
+        row.addWidget(self.alg_combo)
+        row.addWidget(QLabel("输出"))
+        self.out_combo = self.combo(("Hex", "Base64"), 90)
+        row.addWidget(self.out_combo)
+        row2 = self.row()
+        row2.addWidget(self.button("复制结果", self.copy_result))
+        row2.addWidget(self.button("清空", self.do_clear, width=64))
+        row2.addStretch()
+        self.result_text = self.output()
+        self.box.addWidget(self.result_text, 1)
+        self.add_status()
+        for widget in (self.msg_edit, self.key_line):
+            widget.textChanged.connect(self.do_compute)
+        self.alg_combo.currentIndexChanged.connect(self.do_compute)
+        self.out_combo.currentIndexChanged.connect(self.do_compute)
+
+    def do_compute(self):
+        key = self.key_line.text().encode("utf-8")
+        if not self.msg_edit.toPlainText():
+            self.result_text.setPlainText("")
+            self._set_status("输入内容后自动计算。")
+            return
+        name = self.alg_combo.currentText()
+        digest = hmac.new(key, self.msg_edit.toPlainText().encode("utf-8"),
+                          HMAC_ALGS[name]).digest()
+        text = encode_blob(digest, self.out_combo.currentText())
+        self.result_text.setPlainText(text)
+        self._set_status("%s · %d 字节认证码。" % (name, len(digest)))
+
+    def copy_result(self):
+        self.copy_text(self.result_text.toPlainText(), "还没有结果。")
+
+    def do_clear(self):
+        self.msg_edit.clear()
+        self.key_line.clear()
+        self.result_text.setPlainText("")
+        self._set_status("")
+
+
+HMAC_ALGS = {"SHA-1": hashlib.sha1, "SHA-256": hashlib.sha256,
+             "SHA-384": hashlib.sha384, "SHA-512": hashlib.sha512}
+
+
+PASS_ALGS = ("PBKDF2-SHA256", "scrypt")
+PASS_ROUNDS = 210000
+PASS_SCRYPT_N = 16384
+PASS_SCRYPT_R = 8
+PASS_SCRYPT_P = 1
+PASS_HASH_BYTES = 32
+PASS_SALT_BYTES = 16
+
+
+def passhash_derive(tag, passphrase, salt, params=None):
+    """不带 params 用默认值；PBKDF2 传次数，scrypt 传 (N, r, p)。"""
+    if tag == "pbkdf2-sha256":
+        return pbkdf2_key(passphrase, salt, PASS_HASH_BYTES,
+                          int(params) if params else PASS_ROUNDS)
+    n, r, p = params or (PASS_SCRYPT_N, PASS_SCRYPT_R, PASS_SCRYPT_P)
+    n, r, p = int(n), int(r), int(p)
+    if n < 2 or n & (n - 1):
+        raise ValueError("scrypt 的 N 必须是 2 的整数次幂，串里写的是 %d" % n)
+    return hashlib.scrypt(passphrase.encode("utf-8"), salt=salt, n=n, r=r, p=p,
+                          dklen=PASS_HASH_BYTES, maxmem=128 * n * r * p + (1 << 20))
+
+
+def passhash_make(alg, passphrase):
+    """自带盐和参数的字符串，回头可以直接校验，不用记参数。"""
+    if not passphrase:
+        raise ValueError("口令不能为空")
+    salt = os.urandom(PASS_SALT_BYTES)
+    digest = passhash_derive(alg_tag(alg), passphrase, salt)
+    if alg_tag(alg) == "pbkdf2-sha256":
+        return "$pbkdf2-sha256$%d$%s$%s" % (PASS_ROUNDS, base64.b64encode(salt).decode(),
+                                           base64.b64encode(digest).decode())
+    return "$scrypt$%d$%d$%d$%s$%s" % (PASS_SCRYPT_N, PASS_SCRYPT_R, PASS_SCRYPT_P,
+                                      base64.b64encode(salt).decode(),
+                                      base64.b64encode(digest).decode())
+
+
+def alg_tag(name):
+    return "pbkdf2-sha256" if name == "PBKDF2-SHA256" else "scrypt"
+
+
+def passhash_parse(text):
+    """解析成 (算法, 参数, salt, 哈希)，格式不对就报错。"""
+    parts = text.strip().split("$")
+    if parts and not parts[0]:
+        parts = parts[1:]
+    if not parts or not parts[0]:
+        raise ValueError("应是 $pbkdf2-sha256$次数$salt$hash 或 $scrypt$N$r$p$salt$hash")
+    tag = parts[0]
+    if tag == "pbkdf2-sha256":
+        if len(parts) != 4:
+            raise ValueError("PBKDF2 串应是 $pbkdf2-sha256$次数$salt$hash")
+        return tag, int(parts[1]), base64.b64decode(parts[2]), base64.b64decode(parts[3])
+    if tag == "scrypt":
+        if len(parts) != 6:
+            raise ValueError("scrypt 串应是 $scrypt$N$r$p$salt$hash")
+        return (tag, (int(parts[1]), int(parts[2]), int(parts[3])),
+                base64.b64decode(parts[4]), base64.b64decode(parts[5]))
+    raise ValueError("不认识的算法：%s" % tag)
+
+
+def passhash_verify(stored, passphrase):
+    tag, params, salt, digest = passhash_parse(stored)
+    if passphrase == "":
+        raise ValueError("先输入口令")
+    mine = passhash_derive(tag, passphrase, salt, params)
+    return hmac.compare_digest(mine, digest)
+
+
+class _PassHashPage(_CryptoPage):
+    """存口令用：加盐的 PBKDF2/scrypt，外加一把校验。"""
+
+    def __init__(self):
+        super().__init__()
+        row = self.row()
+        row.addWidget(QLabel("口令"))
+        self.pass_line = self.line("要哈希的口令")
+        row.addWidget(self.pass_line, 1)
+        row.addWidget(QLabel("算法"))
+        self.alg_combo = self.combo(PASS_ALGS, 150)
+        row.addWidget(self.alg_combo)
+        row = self.row()
+        row.addWidget(self.button("生成哈希", self.do_hash, True, 92))
+        row.addWidget(self.button("复制哈希", self.copy_result))
+        row.addWidget(self.button("清空", self.do_clear, width=64))
+        row.addStretch()
+        self.result_text = self.output()
+        self.result_text.setFixedHeight(72)
+        self.box.addWidget(self.result_text)
+        self.box.addWidget(self.label("校验已有哈希"))
+        self.stored_edit = self.area(56, "$pbkdf2-sha256$210000$...$... 或 $scrypt$...")
+        self.box.addWidget(self.stored_edit)
+        row = self.row()
+        row.addWidget(self.button("校验", self.do_verify, True, 72))
+        row.addWidget(self.button("取上方结果", self.use_result, width=110))
+        row.addStretch()
+        self.add_status()
+        self._set_status("PBKDF2 用 SHA-256 %d 次；scrypt 用 N=%d, r=%d, p=%d。"
+                        % (PASS_ROUNDS, PASS_SCRYPT_N, PASS_SCRYPT_R, PASS_SCRYPT_P))
+
+    def do_hash(self):
+        try:
+            stored = passhash_make(self.alg_combo.currentText(), self.pass_line.text())
+        except ValueError as e:
+            self._set_status("生成失败：%s" % e, ok=False)
+            return
+        self.result_text.setPlainText(stored)
+        self._set_status("已生成（salt 随机，每次结果都不同是正常的）。")
+
+    def use_result(self):
+        text = self.result_text.toPlainText().strip()
+        if not text:
+            self._set_status("先生成一个哈希。", ok=False)
+            return
+        self.stored_edit.setPlainText(text)
+        self._set_status("已填入待校验框。")
+
+    def do_verify(self):
+        stored = self.stored_edit.toPlainText().strip()
+        if not stored:
+            self._set_status("先粘贴待校验的哈希。", ok=False)
+            return
+        try:
+            ok = passhash_verify(stored, self.pass_line.text())
+        except (ValueError, TypeError) as e:
+            self._set_status("校验失败：%s" % e, ok=False)
+            return
+        self._set_status("口令匹配。" if ok else "口令不匹配。", ok=ok)
+
+    def copy_result(self):
+        self.copy_text(self.result_text.toPlainText(), "还没有结果。")
+
+    def do_clear(self):
+        self.pass_line.clear()
+        self.stored_edit.clear()
+        self.result_text.setPlainText("")
+        self._set_status("")
+
+
+class _SecretPage(_CryptoPage):
+    """用 secrets 取系统熵，生成密钥、令牌和口令。"""
+
+    TYPES = ("Hex", "Base64", "URL 令牌", "可读密码")
+    CONFUSING = "0O1lI|"
+
+    def __init__(self):
+        super().__init__()
+        row = self.row()
+        row.addWidget(QLabel("类型"))
+        self.type_combo = self.combo(self.TYPES, 120)
+        row.addWidget(self.type_combo)
+        row.addWidget(QLabel("长度"))
+        self.size_spin = QSpinBox()
+        self.size_spin.setRange(8, 256)
+        self.size_spin.setValue(32)
+        self.size_spin.setStyleSheet(_combo_style())
+        row.addWidget(self.size_spin)
+        row.addWidget(QLabel("条数"))
+        self.count_spin = QSpinBox()
+        self.count_spin.setRange(1, 50)
+        self.count_spin.setValue(5)
+        self.count_spin.setStyleSheet(_combo_style())
+        row.addWidget(self.count_spin)
+        row.addStretch()
+        self.avoid_check = QCheckBox("排除易混字符 0 O 1 l I |")
+        self.avoid_check.setStyleSheet("QCheckBox { font-family: 'PingFang SC'; font-size: 12px; }")
+        self.avoid_check.setChecked(True)
+        self.box.addWidget(self.avoid_check)
+        row = self.row()
+        row.addWidget(self.button("生成", self.do_generate, True, 72))
+        row.addWidget(self.button("复制全部", self.copy_all))
+        row.addWidget(self.button("清空", self.do_clear, width=64))
+        row.addStretch()
+        self.result_text = self.output()
+        self.box.addWidget(self.result_text, 1)
+        self.add_status()
+        self.type_combo.currentIndexChanged.connect(self._hint)
+        self._hint()
+
+    def _hint(self):
+        password = self.type_combo.currentText() == "可读密码"
+        self.size_spin.setSuffix(" 字符" if password else " 字节")
+        self._set_status("「可读密码」保证大小写、数字和符号都有；其他类型按字节取随机。"
+                        if password else "Hex/Base64/URL 令牌都是系统随机字节，可直接当密钥用。")
+
+    def _one(self):
+        kind = self.type_combo.currentText()
+        size = self.size_spin.value()
+        if kind == "Hex":
+            return os.urandom(size).hex()
+        if kind == "Base64":
+            return base64.b64encode(os.urandom(size)).decode().rstrip("=")
+        if kind == "URL 令牌":
+            return b64url_encode(os.urandom(size))
+        alphabet = "".join(c for c in (string.ascii_letters + string.digits + "!@#$%^&*-_=+")
+                          if not (self.avoid_check.isChecked() and c in self.CONFUSING))
+        while True:
+            text = "".join(secrets.choice(alphabet) for _ in range(size))
+            if (any(c.islower() for c in text) and any(c.isupper() for c in text)
+                    and any(c.isdigit() for c in text)
+                    and any(c in "!@#$%^&*-_=+" for c in text)):
+                return text
+
+    def do_generate(self):
+        if self.type_combo.currentText() == "可读密码" and self.size_spin.value() < 10:
+            self._set_status("可读密码至少要 10 个字符才凑得齐四类字符。", ok=False)
+            return
+        lines = [self._one() for _ in range(self.count_spin.value())]
+        self.result_text.setPlainText("\n".join(lines))
+        self._set_status("已生成 %d 条 %s。" % (len(lines), self.type_combo.currentText()))
+
+    def copy_all(self):
+        self.copy_text(self.result_text.toPlainText(), "先点生成。")
+
+    def do_clear(self):
+        self.result_text.setPlainText("")
+        self._set_status("")
+
+
+class CryptoWindow(QMainWindow):
+    """加解密工具箱。页面本身是 widget，所以不走 TabbedToolWindow 的窗口转换。"""
+
+    PAGES = ((_JwtPage, "JWT"), (_AesPage, "AES"), (_RsaPage, "RSA"),
+             (_HmacPage, "HMAC"), (_PassHashPage, "口令哈希"), (_SecretPage, "随机密钥"))
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("加解密")
+        self.setGeometry(*tool_win_geometry())
+        self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
+        tabs = QTabWidget()
+        tabs.setStyleSheet(_tab_style())
+        for cls, name in self.PAGES:
+            tabs.addTab(cls(), name)
+        self.setCentralWidget(tabs)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+
+
 class UuidWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -4649,15 +5944,7 @@ def _win_remove_env(name):
 
 def _win_broadcast_env():
     """Tell running shells/Explorer to reload the environment; best effort."""
-    try:
-        import ctypes
-        HWND_BROADCAST = 0xFFFF
-        WM_SETTINGCHANGE = 0x1A
-        SMTO_ABORTIFHUNG = 0x0002
-        ctypes.windll.user32.SendMessageTimeoutW(
-            HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment", SMTO_ABORTIFHUNG, 5000, None)
-    except Exception:
-        pass
+    _win_broadcast_setting("Environment")
 
 
 def _posix_load_env():
@@ -4710,24 +5997,12 @@ def _posix_ensure_rc():
             continue
 
 
-class EnvVarWindow(QMainWindow):
+class _ProcessEnvPage(QWidget):
+    """当前进程看到的环境变量快照，只读。"""
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("环境变量")
-        self.setGeometry(*tool_win_geometry())
-        self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
-        self.init_ui()
-
-    def init_ui(self):
-        tabs = QTabWidget()
-        tabs.setStyleSheet(_tab_style())
-        tabs.addTab(self._build_process_tab(), "当前进程")
-        tabs.addTab(_UserEnvPage(), "用户级 (永久)")
-        self.setCentralWidget(tabs)
-
-    def _build_process_tab(self):
-        page = QWidget()
-        layout = QVBoxLayout(page)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 15, 15, 10)
         layout.setSpacing(10)
 
@@ -4744,7 +6019,6 @@ class EnvVarWindow(QMainWindow):
 
         self._all_vars = dict(os.environ)
         self.filter_vars()
-        return page
 
     def filter_vars(self):
         keyword = self.search_input.text().strip().lower()
@@ -4754,10 +6028,6 @@ class EnvVarWindow(QMainWindow):
             if not keyword or keyword in k.lower() or keyword in v.lower():
                 lines.append(f"{k} = {v}")
         self.result_text.setPlainText('\n'.join(lines) if lines else "无匹配变量")
-
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
-            self.close()
 
 
 class _UserEnvPage(QWidget):
@@ -4985,13 +6255,262 @@ class _UserEnvPage(QWidget):
         QMessageBox.warning(self, title, str(error), QMessageBox.Ok)
 
 
+def git_global_path():
+    override = os.environ.get("GIT_CONFIG_GLOBAL")
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"), ".gitconfig")
+
+
+def _run_git(args):
+    try:
+        return subprocess.run(["git", "config"] + args, capture_output=True,
+                              encoding="utf-8", errors="replace", **win_no_console())
+    except OSError:
+        raise RuntimeError("未找到 git 命令，请确认已安装 Git 并在 PATH 中")
+
+
+def _git_error(result):
+    return (result.stderr or "").strip() or "git config 执行失败"
+
+
+def git_global_list():
+    if shutil.which("git") is None:
+        raise RuntimeError("未找到 git 命令，请确认已安装 Git 并在 PATH 中")
+    # git exits 128 on a missing file and 1 on an empty one; neither is an error here.
+    if not os.path.exists(git_global_path()):
+        return []
+    result = _run_git(["--global", "--list"])
+    if result.returncode not in (0, 1):
+        raise RuntimeError(_git_error(result))
+    pairs = []
+    for line in (result.stdout or "").splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            pairs.append((key, value))
+    return pairs
+
+
+def git_global_set(key, value):
+    result = _run_git(["--global", key, value])
+    if result.returncode != 0:
+        raise RuntimeError(_git_error(result))
+
+
+def git_global_unset(key):
+    # rc 1 = no entries left in the file, rc 5 = that key was not set. Both are no-ops.
+    result = _run_git(["--global", "--unset-all", key])
+    if result.returncode not in (0, 1, 5):
+        raise RuntimeError(_git_error(result))
+
+
+GIT_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]*(\.[A-Za-z0-9._-]+)*$")
+
+
+class _GitConfigPage(QWidget):
+    """全局 Git 配置：查看、设置、删除写进 ~/.gitconfig 的键值。"""
+
+    def __init__(self):
+        super().__init__()
+        self.init_ui()
+        self.refresh()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(15, 15, 15, 10)
+        layout.setSpacing(10)
+
+        row = QHBoxLayout()
+        for text, slot, primary in (
+                ("设置用户名", lambda: self.set_key("user.name"), True),
+                ("设置邮箱", lambda: self.set_key("user.email"), True),
+                ("添加配置项", self.do_add, False),
+                ("删除选中", self.do_delete, False),
+                ("刷新", self.refresh, False)):
+            btn = QPushButton(text)
+            btn.setFixedHeight(30)
+            btn.setCursor(QCursor(Qt.PointingHandCursor))
+            btn.setStyleSheet(_primary_btn() if primary else _secondary_btn())
+            btn.clicked.connect(slot)
+            row.addWidget(btn)
+        row.addStretch()
+        location = QLabel("保存位置: " + git_global_path())
+        location.setStyleSheet("color: #999999; font-family: 'PingFang SC'; font-size: 11px;")
+        row.addWidget(location)
+        layout.addLayout(row)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("搜索配置项或值...")
+        self.search_input.setStyleSheet(_lineedit_style())
+        self.search_input.textChanged.connect(self.refresh)
+        layout.addWidget(self.search_input)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setStyleSheet("""
+            QListWidget { border: 1px solid #D0D0D0; border-radius: 6px; background: #FAFAFA;
+                font-family: "Menlo", "Consolas", monospace; font-size: 12px; color: #333333; }
+            QListWidget::item { padding: 4px 8px; }
+            QListWidget::item:selected { background: #E8F0FE; color: #1A73E8; }
+        """)
+        layout.addWidget(self.list_widget)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #999999; font-family: 'PingFang SC'; font-size: 12px;")
+        layout.addWidget(self.status_label)
+
+        self.list_widget.itemDoubleClicked.connect(lambda _i: self.do_edit())
+
+    def _set_status(self, text, color):
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet("color: %s; font-family: 'PingFang SC'; font-size: 12px;" % color)
+
+    def refresh(self):
+        try:
+            entries = git_global_list()
+        except RuntimeError as e:
+            self._entries = []
+            self.list_widget.clear()
+            self.list_widget.addItem(QListWidgetItem(str(e)))
+            self._set_status(str(e), "#D93025")
+            return
+        self._entries = entries
+        keyword = self.search_input.text().strip().lower()
+        self.list_widget.clear()
+        for key, value in entries:
+            if keyword and keyword not in key.lower() and keyword not in value.lower():
+                continue
+            item = QListWidgetItem("%s = %s" % (key, value))
+            item.setData(Qt.UserRole, key)
+            self.list_widget.addItem(item)
+        if not self.list_widget.count():
+            self.list_widget.addItem(QListWidgetItem("全局配置中没有匹配项"))
+        self._set_status("共 %d 项配置。双击条目可直接修改。" % len(entries), "#999999")
+
+    def _current_of(self, key):
+        value = ""
+        for name, raw in self._entries:
+            if name == key:
+                value = raw
+        return value
+
+    def _selected_key(self):
+        item = self.list_widget.currentItem()
+        return None if item is None else item.data(Qt.UserRole)
+
+    def set_key(self, key):
+        current = self._current_of(key)
+        value, ok = QInputDialog.getText(self, "设置 %s" % key, "%s 的值:" % key,
+                                        QLineEdit.Normal, current)
+        if not ok:
+            return
+        if not value.strip():
+            self._set_status("%s 不能为空。" % key, "#D93025")
+            return
+        if key == "user.email" and "@" not in value:
+            answer = QMessageBox.question(
+                self, "确认邮箱", "%s 不含 @，看起来不像邮箱地址。\n仍要保存吗？" % value,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+        self._write(key, value)
+
+    def do_add(self):
+        key, ok = QInputDialog.getText(self, "添加配置项", "配置项 (如 core.editor):")
+        key = key.strip()
+        if not ok or not key:
+            return
+        if not GIT_KEY_RE.match(key):
+            self._set_status("配置项格式不对，应形如 core.editor 或 url.<base>.insteadOf。", "#D93025")
+            return
+        self.set_key(key)
+
+    def do_edit(self):
+        key = self._selected_key()
+        if not key:
+            self._set_status("请先选中一个配置项。", "#D93025")
+            return
+        self.set_key(key)
+
+    def do_delete(self):
+        key = self._selected_key()
+        if not key:
+            self._set_status("请先选中要删除的配置项。", "#D93025")
+            return
+        answer = QMessageBox.question(
+            self, "删除确认", "从全局配置中删除 %s？\n该文件里所有同名条目都会被移除。" % key,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            git_global_unset(key)
+        except RuntimeError as e:
+            self._fail("删除失败", e)
+            return
+        self.refresh()
+        self._set_status("已删除 %s。" % key, "#188038")
+
+    def _write(self, key, value):
+        if "\n" in value:
+            self._set_status("配置值不能包含换行。", "#D93025")
+            return
+        try:
+            git_global_set(key, value)
+        except RuntimeError as e:
+            self._fail("保存失败", e)
+            return
+        self.refresh()
+        self._set_status("已保存 %s = %s（%s）" % (key, value, git_global_path()), "#188038")
+
+    def _fail(self, title, error):
+        self._set_status("%s: %s" % (title, error), "#D93025")
+        QMessageBox.warning(self, title, str(error), QMessageBox.Ok)
+
+
+# 每类：标签、单位列表、折算到基准单位的因子、默认选中的单位
+UNIT_CATEGORIES = (
+    ("字节", ("B", "KB", "MB", "GB", "TB", "PB"),
+     tuple(1024 ** i for i in range(6)), "B"),
+    ("时间", ("纳秒", "微秒", "毫秒", "秒", "分钟", "小时", "天"),
+     (1, 1000, 1000000, 1000000000, 60000000000, 3600000000000, 86400000000000), "秒"),
+    ("长度", ("微米", "毫米", "厘米", "米", "千米", "英寸", "英尺", "码", "英里"),
+     (1e-6, 0.001, 0.01, 1, 1000, 0.0254, 0.3048, 0.9144, 1609.344), "米"),
+    ("重量", ("毫克", "克", "千克", "吨", "斤", "盎司", "磅"),
+     (1e-6, 0.001, 1, 1000, 0.5, 0.028349523125, 0.45359237), "克"),
+    ("面积", ("平方厘米", "平方米", "平方千米", "亩", "公顷", "平方英寸", "平方英尺", "英亩"),
+     (0.0001, 1, 1000000, 2000.0 / 3.0, 10000, 0.00064516, 0.09290304, 4046.8564224), "平方米"),
+    ("体积", ("毫升", "升", "立方米", "立方英寸", "立方英尺", "加仑(美)", "液量盎司(美)"),
+     (0.001, 1, 1000, 0.016387064, 28.316846592, 3.785411784, 0.0295735295625), "升"),
+    ("速度", ("米/秒", "千米/时", "英里/时", "节", "英尺/秒"),
+     (1, 1000.0 / 3600.0, 0.44704, 1852.0 / 3600.0, 0.3048), "千米/时"),
+)
+
+TEMP_UNITS = ("℃", "℉", "K")
+
+
+def _ratio_converters(factors):
+    """乘数类单位：先折算到该类的基准单位，再从基准单位摊回每个目标单位。"""
+    return ([lambda v, f=f: v * f for f in factors],
+            [lambda t, f=f: t / f for f in factors])
+
+
+def _temp_converters():
+    """温度有偏移量，套不进乘数：℉ 和 K 都先折回 ℃（℃ 就是这类的基准）。"""
+    return ([lambda v: v,
+             lambda v: (v - 32) * 5.0 / 9.0,
+             lambda v: v - 273.15],
+            [lambda c: c,
+             lambda c: c * 9.0 / 5.0 + 32,
+             lambda c: c + 273.15])
+
+
 class _UnitConvertPage(QWidget):
     """一个换算类别：输入数值和源单位，一次列出该类别下所有单位的结果。"""
 
-    def __init__(self, units, factors):
+    def __init__(self, units, to_base, from_base, default_unit=None):
         super().__init__()
         self._units = units
-        self._factors = factors
+        self._to_base = to_base
+        self._from_base = from_base
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 15, 15, 10)
@@ -5006,6 +6525,8 @@ class _UnitConvertPage(QWidget):
         row.addWidget(self.value_input, 1)
         self.src_combo = QComboBox()
         self.src_combo.addItems(units)
+        if default_unit in units:
+            self.src_combo.setCurrentIndex(units.index(default_unit))
         self.src_combo.setStyleSheet(_combo_style())
         self.src_combo.currentIndexChanged.connect(self.do_convert)
         row.addWidget(self.src_combo)
@@ -5038,9 +6559,9 @@ class _UnitConvertPage(QWidget):
         except ValueError:
             self.result_text.setPlainText("请输入有效数字")
             return
-        total = val * self._factors[self.src_combo.currentIndex()]
-        lines = ["%s %s" % (self._fmt(total / factor), unit)
-                 for unit, factor in zip(self._units, self._factors)]
+        total = self._to_base[self.src_combo.currentIndex()](val)
+        lines = ["%s %s" % (self._fmt(self._from_base[i](total)), unit)
+                 for i, unit in enumerate(self._units)]
         self.result_text.setPlainText("\n".join(lines))
 
     def do_clear(self):
@@ -5049,16 +6570,12 @@ class _UnitConvertPage(QWidget):
 
     @staticmethod
     def _fmt(v):
-        if v == int(v) and abs(v) < 1e15:
+        if abs(v) < 1e15 and v == int(v):
             return str(int(v))
         return "%.6g" % v
 
 
 class UnitConvertWindow(QMainWindow):
-    BYTE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"]
-    TIME_UNITS = ["纳秒", "微秒", "毫秒", "秒", "分钟", "小时", "天"]
-    NS_PER_UNIT = [1, 1000, 1000000, 1000000000, 60000000000, 3600000000000, 86400000000000]
-
     def __init__(self):
         super().__init__()
         self.setWindowTitle("单位转换")
@@ -5069,9 +6586,9 @@ class UnitConvertWindow(QMainWindow):
     def init_ui(self):
         tabs = QTabWidget()
         tabs.setStyleSheet(_tab_style())
-        byte_factors = [1024 ** i for i in range(len(self.BYTE_UNITS))]
-        tabs.addTab(_UnitConvertPage(self.BYTE_UNITS, byte_factors), "字节")
-        tabs.addTab(_UnitConvertPage(self.TIME_UNITS, self.NS_PER_UNIT), "时间")
+        for name, units, factors, default_unit in UNIT_CATEGORIES:
+            tabs.addTab(_UnitConvertPage(units, *_ratio_converters(factors), default_unit), name)
+        tabs.addTab(_UnitConvertPage(TEMP_UNITS, *_temp_converters()), "温度")
         self.setCentralWidget(tabs)
 
     def keyPressEvent(self, event):
@@ -5769,30 +7286,21 @@ def win_no_console():
     return {}
 
 
-class SshPubkeyWindow(QMainWindow):
+class _SshPubkeyPage(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SSH 公钥")
-        self.setGeometry(*tool_win_geometry())
-        self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
         self.pub_path = None
         self.pub_text = None
         self.init_ui()
         self.refresh()
 
     def init_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 15, 15, 10)
         layout.setSpacing(10)
 
         header = QHBoxLayout()
-        title = QLabel("SSH 公钥")
-        title.setFont(QFont("PingFang SC", 12, QFont.Bold))
-        title.setStyleSheet("color: #333333;")
-        header.addWidget(title)
-        header.addStretch()
+        header.setSpacing(8)
 
         gen_btn = QPushButton("生成密钥")
         gen_btn.setFixedSize(70, 28)
@@ -5869,21 +7377,12 @@ class SshPubkeyWindow(QMainWindow):
         self.set_status("已复制到剪贴板", ok=True)
 
     def open_ssh_dir(self):
-        ssh_dir = os.path.join(os.path.expanduser("~"), ".ssh")
-        if not os.path.isdir(ssh_dir):
-            self.set_status("目录不存在：%s（先生成密钥）" % ssh_dir, ok=False)
-            return
-        system = platform.system()
         try:
-            if system == "Windows":
-                os.startfile(ssh_dir)
-            elif system == "Darwin":
-                subprocess.Popen(["open", ssh_dir])
-            else:
-                subprocess.Popen(["xdg-open", ssh_dir])
-            self.set_status("已打开目录：%s" % ssh_dir, ok=True)
-        except Exception as e:
-            self.set_status("打开目录失败: %s" % e, ok=False)
+            reveal_in_folder(user_path(".ssh"))
+        except (RuntimeError, OSError) as e:
+            self.set_status(str(e), ok=False)
+            return
+        self.set_status("已打开目录：%s" % user_path(".ssh"), ok=True)
 
     def do_generate(self):
         existing_path, existing_text = find_ssh_pubkey()
@@ -5908,6 +7407,971 @@ class SshPubkeyWindow(QMainWindow):
             return
         self.result_text.setPlainText(self.pub_text)
         self.set_status("已生成密钥：%s" % pub, ok=True)
+
+
+def user_path(*parts):
+    return os.path.join(os.path.expanduser("~"), *parts)
+
+
+def _read_text(path):
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def _write_text(path, text, key_file=False):
+    if os.path.exists(path):
+        shutil.copy2(path, path + ".bak")
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + ".toolbox-tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text if text.endswith("\n") else text + "\n")
+    if key_file and os.name != "nt":
+        os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def _read_lines(path):
+    text = _read_text(path)
+    return text.splitlines() if text else []
+
+
+def reveal_in_folder(path):
+    """Reveal a config file by opening the folder that should already hold it."""
+    target = path if os.path.isdir(path) else os.path.dirname(path)
+    if not os.path.isdir(target):
+        raise RuntimeError("目录不存在：%s（先生成或手动创建）" % target)
+    system = platform.system()
+    if system == "Windows":
+        os.startfile(target)
+    elif system == "Darwin":
+        subprocess.Popen(["open", target])
+    else:
+        subprocess.Popen(["xdg-open", target])
+
+
+def _ini_get(path, section, key):
+    want = section.lower() if section else None
+    current = None
+    for line in _read_lines(path):
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            current = s[1:-1].strip().lower()
+            continue
+        if not s or s[0] in "#;":
+            continue
+        name, sep, value = s.partition("=")
+        if sep and current == want and name.strip().lower() == key.lower():
+            return value.strip()
+    return None
+
+
+def _ini_set(path, section, key, value, tight=False):
+    """Add, change or (value=None) drop one key; comments and siblings stay put."""
+    want = section.lower() if section else None
+    out, hit, current = [], False, None
+    joined = None
+    if value is not None:
+        joined = "%s=%s" % (key, value) if tight else "%s = %s" % (key, value)
+    for line in _read_lines(path):
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            current = s[1:-1].strip().lower()
+            out.append(line)
+            continue
+        name, sep, _rest = s.partition("=")
+        if sep and current == want and name.strip().lower() == key.lower():
+            hit = True
+            if joined:
+                out.append(joined)
+            continue
+        out.append(line)
+    if value is None:
+        if hit:
+            _write_text(path, "\n".join(out))
+        return
+    if not hit:
+        if want is None:
+            out.append(joined)
+        else:
+            for idx, line in enumerate(out):
+                s = line.strip()
+                if s.startswith("[") and s.endswith("]") and s[1:-1].strip().lower() == want:
+                    out.insert(idx + 1, joined)
+                    break
+            else:
+                out.extend(["[%s]" % section, joined])
+    _write_text(path, "\n".join(out))
+
+
+XDG_BASE = "Library/Application Support"
+
+
+def _app_config_dir(*parts):
+    """Where the tool itself keeps its config, per OS conventions."""
+    system = platform.system()
+    if system == "Windows":
+        base = os.environ.get("APPDATA") or user_path("AppData", "Roaming")
+    elif system == "Darwin":
+        base = user_path(*XDG_BASE.split("/"))
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or user_path(".config")
+    return os.path.join(base, *parts)
+
+
+def npm_config_path():
+    return user_path(".npmrc")
+
+
+def pip_config_path():
+    return _app_config_dir("pip", "pip.ini" if platform.system() == "Windows" else "pip.conf")
+
+
+def go_env_path():
+    return _app_config_dir("go", "env")
+
+
+def docker_daemon_path():
+    return user_path(".docker", "daemon.json")
+
+
+def maven_settings_path():
+    return user_path(".m2", "settings.xml")
+
+
+MAVEN_NOTE = "<!-- 这一段由 系统工具箱 的「镜像源」标签维护 -->"
+MAVEN_OUR_ID = "toolbox-mirror"
+MAVEN_MIRROR_RE = re.compile(r"<mirror\b[^>]*>.*?</mirror>", re.S | re.I)
+MAVEN_OURS_RE = re.compile(
+    r"<mirror\b[^>]*>(?:(?!</mirror>).)*?<id>\s*" + MAVEN_OUR_ID + r"\s*</id>(?:(?!</mirror>).)*?</mirror>",
+    re.S | re.I)
+MAVEN_MIRROR_OF_RE = re.compile(r"<mirrorOf\b[^>]*>([^<]*)</mirrorOf>", re.I)
+MAVEN_URL_RE = re.compile(r"<url\b[^>]*>([^<]*)</url>", re.I)
+
+
+def _xml_escape(text):
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def maven_central_url():
+    text = _read_text(maven_settings_path())
+    if not text:
+        return None
+    for block in MAVEN_MIRROR_RE.finditer(text):
+        of = MAVEN_MIRROR_OF_RE.search(block.group(0))
+        if of and "central" in [p.strip().lower() for p in of.group(1).split(",")]:
+            url = MAVEN_URL_RE.search(block.group(0))
+            if url:
+                return url.group(1).strip()
+    return None
+
+
+def _maven_mirror_block(url, label):
+    return ('<mirror>\n      <id>%s</id>\n      <mirrorOf>central</mirrorOf>\n'
+            '      <name>%s</name>\n      <url>%s</url>\n    </mirror>'
+            % (MAVEN_OUR_ID, _xml_escape(label), _xml_escape(url)))
+
+
+def _maven_document(mirror):
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n%s\n<settings>\n  <mirrors>\n    %s\n'
+            '  </mirrors>\n</settings>\n' % (MAVEN_NOTE, mirror))
+
+
+def maven_set_central(url, label):
+    """Only ever touch the mirror block we own, so a hand-written settings.xml survives."""
+    path = maven_settings_path()
+    text = _read_text(path)
+    mirror = _maven_mirror_block(url, label) if url else None
+    if text is None:
+        if url is None:
+            return
+        _write_text(path, _maven_document(mirror))
+        return
+    ours = MAVEN_OURS_RE.search(text)
+    if ours:
+        if url:
+            _write_text(path, text[:ours.start()] + mirror + text[ours.end():])
+            return
+        start = text.rfind("\n", 0, ours.start()) + 1
+        end = text.find("\n", ours.end())
+        end = len(text) if end < 0 else end + 1
+        _write_text(path, text[:start] + text[end:])
+        return
+    if MAVEN_MIRROR_RE.search(text):
+        raise RuntimeError("settings.xml 里已有别人写的 mirrors，工具不覆盖，请手动编辑：\n%s" % path)
+    if url is None:
+        return
+    lowered = text.lower()
+    if "<mirrors" in lowered:
+        close = lowered.find("</mirrors>", lowered.index("<mirrors"))
+        if close < 0:
+            raise RuntimeError("settings.xml 的 <mirrors> 没有闭合，请手动修正：%s" % path)
+        _write_text(path, text[:close].rstrip() + "\n    " + mirror + "\n  " + text[close:].lstrip())
+        return
+    if "<settings" not in lowered:
+        raise RuntimeError("settings.xml 缺少 <settings> 根节点，请手动修正：%s" % path)
+    close = lowered.rindex("</settings>")
+    _write_text(path, text[:close] + "  <mirrors>\n    %s\n  </mirrors>\n" % mirror + text[close:])
+
+
+def docker_read_mirror():
+    text = _read_text(docker_daemon_path())
+    if not text:
+        return None
+    data = json.loads(text)
+    mirrors = data.get("registry-mirrors") if isinstance(data, dict) else None
+    return mirrors[0] if isinstance(mirrors, list) and mirrors else None
+
+
+def docker_write_mirror(url):
+    path = docker_daemon_path()
+    text = _read_text(path)
+    data = {}
+    if text:
+        try:
+            data = json.loads(text)
+        except ValueError:
+            raise RuntimeError("daemon.json 不是合法 JSON，请手动修正：\n%s" % path)
+        if not isinstance(data, dict):
+            raise RuntimeError("daemon.json 顶层应为对象，请手动修正：\n%s" % path)
+        if url is None:
+            if "registry-mirrors" not in data:
+                return
+            data.pop("registry-mirrors")
+        else:
+            data["registry-mirrors"] = [url]
+        _write_text(path, json.dumps(data, indent=4, ensure_ascii=False))
+        return
+    if url is None:
+        return
+    _write_text(path, json.dumps({"registry-mirrors": [url]}, indent=4, ensure_ascii=False))
+
+
+class _MirrorTarget:
+    def __init__(self, name, read, write, path_of, options, note=""):
+        self.name, self.read, self.write, self.path_of = name, read, write, path_of
+        self.options, self.note = options, note
+
+
+CUSTOM_MIRROR = "__custom__"
+
+
+def mirror_targets():
+    npm = [
+        ("官方", "https://registry.npmjs.org/"),
+        ("淘宝 npmmirror", "https://registry.npmmirror.com"),
+        ("腾讯云", "https://mirrors.cloud.tencent.com/npm/"),
+    ]
+    pip = [
+        ("官方默认", None),
+        ("清华", "https://pypi.tuna.tsinghua.edu.cn/simple"),
+        ("阿里云", "https://mirrors.aliyun.com/pypi/simple/"),
+        ("腾讯云", "https://mirrors.cloud.tencent.com/pypi/simple"),
+    ]
+    go = [
+        ("官方", "https://proxy.golang.org,direct"),
+        ("goproxy.cn", "https://goproxy.cn,direct"),
+        ("阿里云", "https://mirrors.aliyun.com/goproxy/,direct"),
+    ]
+    maven = [
+        ("官方（不设镜像）", None),
+        ("阿里云", "https://maven.aliyun.com/repository/public"),
+        ("华为云", "https://repo.huaweicloud.com/repository/maven/"),
+    ]
+    docker = [
+        ("官方（不设镜像）", None),
+        ("DaoCloud 公共加速", "https://docker.m.daocloud.io"),
+        ("清华", "https://docker.mirrors.tuna.tsinghua.edu.cn"),
+    ]
+    return [
+        _MirrorTarget("npm / yarn",
+                      lambda: _ini_get(npm_config_path(), None, "registry"),
+                      lambda url: _ini_set(npm_config_path(), None, "registry", url, tight=True),
+                      npm_config_path, npm,
+                      "yarn 也读这个 .npmrc"),
+        _MirrorTarget("pip",
+                      lambda: _ini_get(pip_config_path(), "global", "index-url"),
+                      lambda url: _ini_set(pip_config_path(), "global", "index-url", url),
+                      pip_config_path, pip,
+                      "等价于 pip config set global.index-url"),
+        _MirrorTarget("Go modules",
+                      lambda: _ini_get(go_env_path(), None, "GOPROXY"),
+                      lambda url: _ini_set(go_env_path(), None, "GOPROXY", url, tight=True),
+                      go_env_path, go,
+                      "等价于 go env -w GOPROXY，新开的终端立刻生效"),
+        _MirrorTarget("Maven central",
+                      maven_central_url,
+                      lambda url: maven_set_central(url, "personal_toolbox mirror"),
+                      maven_settings_path, maven,
+                      "只改 central 的镜像；已有自定义 mirrors 时不覆盖"),
+        _MirrorTarget("Docker Hub",
+                      docker_read_mirror,
+                      docker_write_mirror,
+                      docker_daemon_path, docker,
+                      "改完需要重启 Docker 才生效"),
+    ]
+
+
+class _MirrorPage(QWidget):
+    """一键切换各包管理器的国内镜像；写入前把原文件备份成 .bak。"""
+
+    def __init__(self):
+        super().__init__()
+        self._targets = mirror_targets()
+        self._combos = []
+        self._values = []
+        self.init_ui()
+        self.refresh()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(15, 15, 15, 10)
+        layout.setSpacing(10)
+
+        top = QHBoxLayout()
+        refresh_btn = QPushButton("刷新")
+        refresh_btn.setFixedSize(64, 28)
+        refresh_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        refresh_btn.setStyleSheet(_secondary_btn())
+        refresh_btn.clicked.connect(self.refresh)
+        top.addWidget(refresh_btn)
+        hint = QLabel("选择即写入对应配置文件，原文件备份为同名 .bak")
+        hint.setStyleSheet("color: #999999; font-size: 11px;")
+        top.addWidget(hint)
+        top.addStretch()
+        layout.addLayout(top)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+        for row, target in enumerate(self._targets):
+            name = QLabel(target.name)
+            name.setFont(QFont("PingFang SC", 12, QFont.Bold))
+            name.setFixedWidth(96)
+            grid.addWidget(name, row, 0)
+
+            combo = QComboBox()
+            combo.setFixedWidth(230)
+            combo.setStyleSheet(_combo_style())
+            for label, url in target.options:
+                combo.addItem(label, url)
+            combo.addItem("自定义…", CUSTOM_MIRROR)
+            combo.activated.connect(lambda index, t=target: self.apply_choice(t, index))
+            grid.addWidget(combo, row, 1)
+            self._combos.append(combo)
+
+            value = QLabel("")
+            value.setStyleSheet("color: #666666; font-family: 'Menlo', 'Consolas', monospace; font-size: 11px;")
+            value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            grid.addWidget(value, row, 2)
+            self._values.append(value)
+
+            open_btn = QPushButton("打开")
+            open_btn.setFixedSize(52, 26)
+            open_btn.setCursor(QCursor(Qt.PointingHandCursor))
+            open_btn.setStyleSheet(_secondary_btn())
+            open_btn.clicked.connect(lambda _c, t=target: self.reveal(t))
+            grid.addWidget(open_btn, row, 3)
+
+            note = QLabel(target.note)
+            note.setStyleSheet("color: #AAAAAA; font-size: 10px;")
+            grid.addWidget(note, row, 4)
+        grid.setColumnStretch(2, 1)
+        grid.setColumnStretch(4, 1)
+        layout.addLayout(grid)
+
+        layout.addStretch()
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #999999; font-size: 12px; font-family: 'PingFang SC';")
+        layout.addWidget(self.status_label)
+
+    def _set_status(self, text, color="#999999"):
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet("color: %s; font-size: 12px; font-family: 'PingFang SC';" % color)
+
+    def refresh(self):
+        for target, combo, value in zip(self._targets, self._combos, self._values):
+            path = target.path_of()
+            try:
+                current = target.read()
+            except (ValueError, RuntimeError, OSError) as e:
+                current = None
+                value.setText("读取失败：%s" % e)
+                value.setStyleSheet("color: #D93025; font-size: 11px;")
+            else:
+                shown = current if current else "未设置（用官方默认）"
+                value.setText("%s  ·  %s" % (shown, path))
+                value.setStyleSheet("color: #666666; font-family: 'Menlo', 'Consolas', monospace; font-size: 11px;")
+            index = combo.findData(current)
+            if index < 0:
+                index = combo.findData(CUSTOM_MIRROR) if current else 0
+            combo.setCurrentIndex(index)
+
+    def apply_choice(self, target, index):
+        combo = self._combos[self._targets.index(target)]
+        choice = combo.itemData(index)
+        if choice == CUSTOM_MIRROR:
+            try:
+                current = target.read() or ""
+            except (ValueError, RuntimeError, OSError):
+                current = ""
+            text, ok = QInputDialog.getText(self, "自定义镜像地址",
+                                           "%s 的镜像 URL（留空＝去掉覆盖）:" % target.name,
+                                           QLineEdit.Normal, current)
+            if not ok:
+                self.refresh()
+                return
+            choice = text.strip() or None
+        try:
+            target.write(choice)
+        except (RuntimeError, OSError, ValueError) as e:
+            self._set_status("%s: %s" % (target.name, e), "#D93025")
+            QMessageBox.warning(self, "写入失败", "%s\n\n%s" % (target.name, e), QMessageBox.Ok)
+            self.refresh()
+            return
+        self.refresh()
+        if choice:
+            self._set_status("已切换 %s → %s" % (target.name, choice), "#188038")
+        else:
+            self._set_status("已清除 %s 的镜像覆盖，恢复官方默认" % target.name, "#188038")
+
+    def reveal(self, target):
+        path = target.path_of()
+        try:
+            reveal_in_folder(path)
+        except (RuntimeError, OSError) as e:
+            self._set_status("%s（%s）" % (e, path), "#D93025")
+            return
+        self._set_status("已打开 %s" % os.path.dirname(path), "#188038")
+
+
+SSH_CONFIG_KEYS = ("HostName", "User", "Port", "IdentityFile", "ProxyJump")
+SSH_ALIAS_RE = re.compile(r"^[A-Za-z0-9._*:/\[\]-]+$")
+
+
+def ssh_config_path():
+    return user_path(".ssh", "config")
+
+
+def _ssh_canonical(key):
+    for name in SSH_CONFIG_KEYS:
+        if name.lower() == key.lower():
+            return name
+    return key
+
+
+def ssh_parse_config(text):
+    """Split into Host blocks; option order and comments are kept so untouched blocks
+    survive a rewrite byte-for-byte."""
+    preamble, blocks, has_match = [], [], False
+    current = None
+    for line in (text or "").splitlines():
+        s = line.strip()
+        low = s.lower()
+        if low.startswith("host ") and len(s.split()) > 1:
+            current = {"host": s.split()[1:], "opts": []}
+            blocks.append(current)
+            continue
+        if low.startswith("match"):
+            has_match = True
+        if current is None:
+            preamble.append(("#", line))
+        elif not s or s.startswith("#"):
+            current["opts"].append(("#", line))
+        else:
+            match = re.match(r"^(\S+?)\s*=\s*(.*)$", s) or re.match(r"^(\S+)\s+(.*)$", s)
+            if match:
+                current["opts"].append((match.group(1), match.group(2).strip()))
+            else:
+                current["opts"].append(("#", line))
+    return preamble, blocks, has_match
+
+
+def ssh_dump(preamble, blocks):
+    lines = [raw for _k, raw in preamble]
+    for block in blocks:
+        lines.append("Host " + " ".join(block["host"]))
+        for key, value in block["opts"]:
+            lines.append(value if key == "#" else "    %s %s" % (key, value))
+        lines.append("")
+    return "\n".join(lines).rstrip("\n") + "\n" if lines else ""
+
+
+def ssh_summary(block):
+    opts = {k.lower(): v for k, v in block["opts"] if k != "#"}
+    target = opts.get("hostname") or (block["host"][0] if block["host"] else "?")
+    bits = []
+    if opts.get("user"):
+        bits.append(opts["user"] + "@")
+    bits.append(target)
+    if opts.get("port"):
+        bits.append(":%s" % opts["port"])
+    if opts.get("proxyjump"):
+        bits.append(" 经 %s" % opts["proxyjump"])
+    return "".join(bits)
+
+
+class _SshConfigPage(QWidget):
+    """~/.ssh/config 的图形化编辑：别名、跳转、密钥路径，不用再手抠缩进。"""
+
+    def __init__(self):
+        super().__init__()
+        self._preamble = []
+        self._blocks = []
+        self._locked = False
+        self._index = None
+        self.init_ui()
+        self.refresh()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(15, 15, 15, 10)
+        layout.setSpacing(8)
+
+        top = QHBoxLayout()
+        for text, slot, primary in (("添加主机", self.new_entry, True), ("保存", self.save, True),
+                                    ("删除", self.delete_entry, False), ("复制 ssh 命令", self.copy_command, False),
+                                    ("打开目录", self.reveal, False), ("刷新", self.refresh, False)):
+            btn = QPushButton(text)
+            btn.setFixedHeight(28)
+            btn.setCursor(QCursor(Qt.PointingHandCursor))
+            btn.setStyleSheet(_primary_btn() if primary else _secondary_btn())
+            btn.clicked.connect(slot)
+            top.addWidget(btn)
+        top.addStretch()
+        layout.addLayout(top)
+
+        self.path_label = QLabel(ssh_config_path())
+        self.path_label.setStyleSheet("color: #999999; font-size: 11px; font-family: 'Menlo', 'Consolas', monospace;")
+        layout.addWidget(self.path_label)
+
+        body = QHBoxLayout()
+        self.list_widget = QListWidget()
+        self.list_widget.setFixedWidth(210)
+        self.list_widget.setStyleSheet("""
+            QListWidget { border: 1px solid #D0D0D0; border-radius: 6px; background: #FAFAFA;
+                font-family: "Menlo", "Consolas", monospace; font-size: 12px; }
+            QListWidget::item { padding: 6px 8px; }
+            QListWidget::item:selected { background: #E8F0FE; color: #1A73E8; }
+        """)
+        self.list_widget.currentRowChanged.connect(self.load_form)
+        body.addWidget(self.list_widget)
+
+        form = QGridLayout()
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(8)
+        self.field_edits = {}
+        fields = (("别名", "Host", "prod，可空格写多个别名"),
+                  ("主机地址", "HostName", "10.0.0.8 或 example.com"),
+                  ("用户名", "User", "deploy"),
+                  ("端口", "Port", "22"),
+                  ("密钥文件", "IdentityFile", "~/.ssh/id_ed25519"),
+                  ("跳转主机", "ProxyJump", "prod"))
+        for row, (label, key, placeholder) in enumerate(fields):
+            name = QLabel(label + ":")
+            name.setStyleSheet("font-family: 'PingFang SC'; font-size: 12px; color: #333333;")
+            form.addWidget(name, row, 0)
+            edit = QLineEdit()
+            edit.setPlaceholderText(placeholder)
+            edit.setStyleSheet(_lineedit_style())
+            form.addWidget(edit, row, 1)
+            self.field_edits[key] = edit
+            if key == "IdentityFile":
+                browse = QPushButton("浏览…")
+                browse.setFixedWidth(56)
+                browse.setCursor(QCursor(Qt.PointingHandCursor))
+                browse.setStyleSheet(_secondary_btn())
+                browse.clicked.connect(self.browse_key)
+                form.addWidget(browse, row, 2)
+        extras = QLabel("其他选项:")
+        extras.setStyleSheet("font-family: 'PingFang SC'; font-size: 12px; color: #333333;")
+        form.addWidget(extras, len(fields), 0)
+        self.extras_edit = QPlainTextEdit()
+        self.extras_edit.setPlaceholderText("每行一条，如 ForwardAgent yes")
+        self.extras_edit.setStyleSheet(_plain_style())
+        self.extras_edit.setFixedHeight(70)
+        form.addWidget(self.extras_edit, len(fields), 1, 2, 2)
+        form.setColumnStretch(1, 1)
+        body.addLayout(form, 2)
+        layout.addLayout(body, 1)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #999999; font-size: 12px; font-family: 'PingFang SC';")
+        layout.addWidget(self.status_label)
+
+    def _set_status(self, text, color="#999999"):
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet("color: %s; font-size: 12px; font-family: 'PingFang SC';" % color)
+
+    def refresh(self):
+        text = _read_text(ssh_config_path())
+        try:
+            self._preamble, self._blocks, self._locked = ssh_parse_config(text)
+        except Exception as e:
+            self._set_status("读取失败: %s" % e, "#D93025")
+            return
+        self.list_widget.blockSignals(True)
+        self.list_widget.clear()
+        for block in self._blocks:
+            self.list_widget.addItem("%s\n%s" % (" ".join(block["host"]), ssh_summary(block)))
+        self.list_widget.blockSignals(False)
+        if self._locked:
+            self._set_status("文件里有 Match 配置，本工具只按 Host 分组，请手动编辑：%s" % ssh_config_path(), "#D93025")
+        elif text is None:
+            self._set_status("还没有 %s，点「添加主机」创建。" % ssh_config_path(), "#999999")
+        else:
+            self._set_status("共 %d 个 Host 条目。" % len(self._blocks), "#999999")
+        if self._blocks:
+            self.list_widget.setCurrentRow(0)
+        else:
+            self.new_entry()
+
+    def current_block(self):
+        row = self.list_widget.currentRow()
+        if row < 0 or row >= len(self._blocks):
+            return None
+        return self._blocks[row]
+
+    def load_form(self, row):
+        block = self._blocks[row] if 0 <= row < len(self._blocks) else None
+        if block is None:
+            return
+        self._index = row
+        opts = {}
+        extras = []
+        for key, value in block["opts"]:
+            if key == "#":
+                if value.strip():
+                    extras.append(value.strip())
+                continue
+            canonical = _ssh_canonical(key)
+            if canonical in SSH_CONFIG_KEYS:
+                opts[canonical] = value
+            else:
+                extras.append("%s %s" % (key, value))
+        for key, edit in self.field_edits.items():
+            edit.setText(" ".join(block["host"]) if key == "Host" else opts.get(key, ""))
+        self.extras_edit.setPlainText("\n".join(extras))
+
+    def new_entry(self):
+        self._index = None
+        self.list_widget.clearSelection()
+        for edit in self.field_edits.values():
+            edit.setText("")
+        self.extras_edit.setPlainText("")
+        self.field_edits["Host"].setFocus()
+        self._set_status("填写别名和地址后点「保存」。", "#1A73E8")
+
+    def _form_values(self):
+        return {key: edit.text().strip() for key, edit in self.field_edits.items()}
+
+    def save(self):
+        if self._locked:
+            self._set_status("检测到 Match 配置，已停止自动写入，请手动编辑。", "#D93025")
+            return
+        values = self._form_values()
+        aliases = values["Host"].split()
+        if not aliases:
+            self._set_status("别名不能为空，例如 prod。", "#D93025")
+            return
+        bad = [a for a in aliases if not SSH_ALIAS_RE.match(a)]
+        if bad:
+            self._set_status("别名含有非法字符：%s" % " ".join(bad), "#D93025")
+            return
+        if not values["HostName"] and not any("." in a or "*" in a for a in aliases):
+            self._set_status("别名不是域名或通配符时必须填 HostName。", "#D93025")
+            return
+        clash = [b for i, b in enumerate(self._blocks)
+                 if i != self._index and set(b["host"]) & set(aliases)]
+        if clash:
+            self._set_status("别名 %s 已存在，ssh 只会用第一条，请换个名字。"
+                             % " ".join(clash[0]["host"]), "#D93025")
+            return
+        if values["Port"] and not values["Port"].isdigit():
+            self._set_status("端口只能是数字。", "#D93025")
+            return
+        extras = self._parse_extras(self.extras_edit.toPlainText())
+        if isinstance(extras, tuple):
+            self._set_status(extras[0], "#D93025")
+            return
+        managed = {k: v for k, v in values.items() if k != "Host"}
+        if self._index is None:
+            block = {"host": aliases,
+                     "opts": [(k, v) for k, v in managed.items() if v] + extras}
+            self._blocks.append(block)
+        else:
+            block = self._blocks[self._index]
+            block["host"] = aliases
+            block["opts"] = _ssh_merge_opts(block["opts"], managed, extras)
+        self._write()
+
+    @staticmethod
+    def _parse_extras(text):
+        extras = []
+        for line in text.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                if s:
+                    extras.append(("#", s))
+                continue
+            match = re.match(r"^(\S+?)\s*=\s*(.*)$", s) or re.match(r"^(\S+)\s+(.*)$", s)
+            if not match:
+                return "其他选项每行应是「键 值」或「键=值」：%s" % s
+            extras.append((match.group(1), match.group(2).strip()))
+        return extras
+
+    def _write(self):
+        path = ssh_config_path()
+        try:
+            _write_text(path, ssh_dump(self._preamble, self._blocks), key_file=True)
+        except OSError as e:
+            self._set_status("写入失败: %s" % e, "#D93025")
+            return
+        self.refresh()
+        self._set_status("已写入 %d 个 Host 条目到 %s" % (len(self._blocks), path), "#188038")
+
+    def delete_entry(self):
+        if self._locked:
+            self._set_status("检测到 Match 配置，已停止自动写入，请手动编辑。", "#D93025")
+            return
+        block = self.current_block()
+        if block is None:
+            self._set_status("请先选中要删除的主机。", "#D93025")
+            return
+        answer = QMessageBox.question(
+            self, "删除确认", "从 %s 中删除 Host %s？" % (ssh_config_path(), " ".join(block["host"])),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        self._blocks.remove(block)
+        self._write()
+
+    def copy_command(self):
+        block = self.current_block()
+        if block is None:
+            self._set_status("请先选中一个主机。", "#D93025")
+            return
+        QApplication.clipboard().setText("ssh %s" % block["host"][0])
+        self._set_status("已复制：ssh %s" % block["host"][0], "#188038")
+
+    def browse_key(self):
+        path, _selected = QFileDialog.getOpenFileName(self, "选择私钥/公钥文件",
+                                                     user_path(".ssh"), "All files (*)")
+        if path:
+            self.field_edits["IdentityFile"].setText(path)
+
+    def reveal(self):
+        try:
+            reveal_in_folder(ssh_config_path())
+        except (RuntimeError, OSError) as e:
+            self._set_status(str(e), "#D93025")
+
+
+def _ssh_merge_opts(old_opts, managed, extras):
+    """Replace only the keys the form manages; comments and unknown options stay in place."""
+    out, placed = [], set()
+    for key, value in old_opts:
+        if key == "#":
+            out.append((key, value))
+            continue
+        canonical = _ssh_canonical(key)
+        if canonical in managed:
+            placed.add(canonical)
+            if managed[canonical]:
+                out.append((canonical, managed[canonical]))
+        else:
+            out.append((key, value))
+    for key, value in managed.items():
+        if value and key not in placed:
+            out.append((key, value))
+    out.extend(extras)
+    return out
+
+
+WIN_ADVANCED_SUBKEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+
+VISIBILITY_ROWS = (
+    {"id": "hidden", "label": "显示隐藏文件",
+     "win": ("Hidden", 1, 2), "mac": ("com.apple.finder", "AppleShowAllFiles"),
+     "note": "Windows 存注册表 HKCU\\%s\\Hidden；macOS 是 Finder 的 AppleShowAllFiles" % WIN_ADVANCED_SUBKEY},
+    {"id": "ext", "label": "显示文件扩展名",
+     "win": ("HideFileExt", 0, 1), "mac": ("NSGlobalDomain", "AppleShowAllExtensions"),
+     "note": "扩展名打开后一眼看出 report.pdf.exe"},
+    {"id": "super", "label": "显示受保护的系统文件",
+     "win": ("ShowSuperHidden", 1, 0), "mac": None,
+     "note": "仅 Windows：bootmgr、pagefile.sys 这类"},
+)
+
+
+def _win_dword_get(name):
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WIN_ADVANCED_SUBKEY) as key:
+            return int(winreg.QueryValueEx(key, name)[0])
+    except OSError:
+        return None
+
+
+def _win_dword_set(name, value):
+    import winreg
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, WIN_ADVANCED_SUBKEY) as key:
+        winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, int(value))
+
+
+def _win_broadcast_setting(message):
+    """WM_SETTINGCHANGE so open Explorer windows and shells can reload."""
+    try:
+        import ctypes
+        HWND_BROADCAST, WM_SETTINGCHANGE, SMTO_ABORTIFHUNG = 0xFFFF, 0x1A, 0x0002
+        ctypes.windll.user32.SendMessageTimeoutW(
+            HWND_BROADCAST, WM_SETTINGCHANGE, 0, message, SMTO_ABORTIFHUNG, 5000, None)
+    except Exception:
+        pass
+
+
+def _macos_default_read(domain, key):
+    result = subprocess.run(["defaults", "read", domain, key], capture_output=True,
+                            encoding="utf-8", errors="replace", **win_no_console())
+    if result.returncode != 0:
+        return None
+    return (result.stdout or "").strip()
+
+
+def _macos_default_write(domain, key, on):
+    subprocess.run(["defaults", "write", domain, key, "-bool", "true" if on else "false"],
+                   capture_output=True, **win_no_console())
+
+
+def _macos_restart_finder():
+    subprocess.run(["killall", "Finder"], capture_output=True, **win_no_console())
+
+
+def visibility_read(row):
+    """True/False for the current state, or None when the value was never written."""
+    if platform.system() == "Windows":
+        name, on, _off = row["win"]
+        value = _win_dword_get(name)
+        return None if value is None else value == on
+    if platform.system() == "Darwin" and row["mac"]:
+        raw = _macos_default_read(*row["mac"])
+        if raw is None:
+            return None
+        return raw in ("1", "true", "YES")
+    return None
+
+
+def visibility_write(row, on):
+    if platform.system() == "Windows":
+        name, win_on, win_off = row["win"]
+        _win_dword_set(name, win_on if on else win_off)
+        _win_broadcast_setting("Probe")
+        return "已写入注册表，资源管理器若没立刻变化，重开一个窗口即可。"
+    if platform.system() == "Darwin" and row["mac"]:
+        _macos_default_write(row["mac"][0], row["mac"][1], on)
+        _macos_restart_finder()
+        return "已写入 defaults，访达已重启。"
+    raise RuntimeError("当前系统没有对应的开关。")
+
+
+class _VisibilityPage(QWidget):
+    """文件夹显示开关：隐藏文件、扩展名、受保护的系统文件。"""
+
+    def __init__(self):
+        super().__init__()
+        self._rows = []
+        self._loading = False
+        self.init_ui()
+        self.refresh()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(15, 15, 15, 10)
+        layout.setSpacing(10)
+
+        if platform.system() not in ("Windows", "Darwin"):
+            hint = QLabel("Linux 的显示开关在各文件管理器的首选项里，本工具只提供 Windows 和 macOS。")
+            hint.setFont(QFont("PingFang SC", 12))
+            hint.setStyleSheet("color: #999999;")
+            layout.addWidget(hint)
+            layout.addStretch()
+            return
+
+        for row in VISIBILITY_ROWS:
+            if platform.system() == "Darwin" and not row["mac"]:
+                continue
+            box = QCheckBox(row["label"])
+            box.setFont(QFont("PingFang SC", 12))
+            box.setStyleSheet("QCheckBox { color: #333333; }")
+            box.toggled.connect(lambda checked, r=row, b=box: self.apply(r, b, checked))
+            layout.addWidget(box)
+            detail = QLabel("")
+            detail.setStyleSheet("color: #AAAAAA; font-size: 11px; font-family: 'PingFang SC';")
+            layout.addWidget(detail)
+            self._rows.append((row, box, detail))
+        layout.addStretch()
+
+        self.status_label = QLabel("勾选即生效，写入的都是当前用户的设置，不需要管理员权限。")
+        self.status_label.setStyleSheet("color: #999999; font-size: 12px; font-family: 'PingFang SC';")
+        layout.addWidget(self.status_label)
+
+    def _set_status(self, text, color="#999999"):
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet("color: %s; font-size: 12px; font-family: 'PingFang SC';" % color)
+
+    def refresh(self):
+        self._loading = True
+        for row, box, detail in self._rows:
+            state = visibility_read(row)
+            box.setChecked(bool(state))
+            stored = "未设置（用系统默认）" if state is None else ("已显示" if state else "已隐藏")
+            detail.setText("%s · %s" % (stored, row["note"]))
+        self._loading = False
+
+    def apply(self, row, box, checked):
+        if self._loading:
+            return
+        if platform.system() == "Darwin" and checked:
+            answer = QMessageBox.question(
+                self, "重启访达", "macOS 需要重启访达（Finder）才能看到变化，现在重启？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if answer != QMessageBox.Yes:
+                self._loading = True
+                box.setChecked(False)
+                self._loading = False
+                self._set_status("已取消，未改动设置。", "#999999")
+                return
+        try:
+            message = visibility_write(row, checked)
+        except (RuntimeError, OSError) as e:
+            self._set_status("%s" % e, "#D93025")
+            self.refresh()
+            return
+        self.refresh()
+        self._set_status("%s：%s（%s）" % (row["label"], "显示" if checked else "隐藏", message), "#188038")
+
+
+class ConfigWindow(QMainWindow):
+    """环境变量、Git、镜像源、SSH、显示开关合成一个入口，每类配置一个标签。"""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("配置")
+        x, y, w, h = tool_win_geometry()
+        self.setGeometry(x, y, min(w + 180, 1000), min(h + 40, 700))
+        self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
+        tabs = QTabWidget()
+        tabs.setStyleSheet(_tab_style())
+        tabs.addTab(_UserEnvPage(), "环境变量")
+        tabs.addTab(_ProcessEnvPage(), "进程内变量")
+        tabs.addTab(_GitConfigPage(), "Git 配置")
+        tabs.addTab(_MirrorPage(), "镜像源")
+        tabs.addTab(_SshPubkeyPage(), "SSH 密钥")
+        tabs.addTab(_SshConfigPage(), "SSH 主机")
+        tabs.addTab(_VisibilityPage(), "显示开关")
+        self.setCentralWidget(tabs)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
@@ -6053,19 +8517,18 @@ class ToolboxWindow(QMainWindow):
         self.markup_window = None
         self.codec_window = None
         self.hash_window = None
+        self.crypto_window = None
         self.regex_window = None
-        self.uuid_window = None
-        self.qrcode_window = None
+        self.diff_window = None
+        self.generator_window = None
         self.baseconvert_window = None
         self.divmod_window = None
-        self.jsonyaml_window = None
-        self.timestamp_window = None
-        self.envvar_window = None
+        self.convert_window = None
+        self.config_window = None
         self.unit_window = None
         self.random_window = None
         self.textstat_window = None
         self.cron_window = None
-        self.color_window = None
         self.image_window = None
         self.rmb_window = None
         self.roman_window = None
@@ -6075,7 +8538,6 @@ class ToolboxWindow(QMainWindow):
         self.portscan_window = None
         self.speedtest_window = None
         self.cmdref_window = None
-        self.ssh_window = None
         self.mortgage_window = None
         self.init_ui()
 
@@ -6097,7 +8559,7 @@ class ToolboxWindow(QMainWindow):
 
         section1 = self.create_section("系统工具", [
             "进程管理", "端口扫描", "Ping 测试", "DNS 查询", "路由追踪",
-            "网络测速", "环境变量", "SSH 公钥"
+            "网络测速", "配置"
         ], {
             "进程管理": self.show_process_search,
             "端口扫描": self.show_portscan,
@@ -6105,27 +8567,25 @@ class ToolboxWindow(QMainWindow):
             "DNS 查询": self.show_dns,
             "路由追踪": self.show_traceroute,
             "网络测速": self.show_speedtest,
-            "环境变量": self.show_env_vars,
-            "SSH 公钥": self.show_ssh_pubkey
+            "配置": self.show_config
         })
         content_layout.addWidget(section1)
 
         section3 = self.create_section("文本处理", [
-            "JSON/XML", "编解码", "哈希计算",
-            "正则测试", "UUID 生成", "二维码生成",
-            "JSON-YAML", "时间戳", "文本统计", "Cron 表达式", "颜色转换"
+            "JSON/XML", "编解码", "哈希计算", "加解密",
+            "正则测试", "文本对比", "UUID/二维码",
+            "格式转换", "文本统计", "Cron 表达式"
         ], {
             "JSON/XML": self.show_markup,
             "编解码": self.show_codec,
             "哈希计算": self.show_hash,
+            "加解密": self.show_crypto,
             "正则测试": self.show_regex,
-            "UUID 生成": self.show_uuid,
-            "二维码生成": self.show_qrcode,
-            "JSON-YAML": self.show_json_yaml,
-            "时间戳": self.show_timestamp,
+            "文本对比": self.show_diff,
+            "UUID/二维码": self.show_generator,
+            "格式转换": self.show_convert,
             "文本统计": self.show_textstat,
-            "Cron 表达式": self.show_cron,
-            "颜色转换": self.show_color
+            "Cron 表达式": self.show_cron
         })
         content_layout.addWidget(section3)
 
@@ -6359,23 +8819,29 @@ class ToolboxWindow(QMainWindow):
         self.hash_window.show()
         self.hash_window.activateWindow()
 
+    def show_crypto(self):
+        if self.crypto_window is None:
+            self.crypto_window = CryptoWindow()
+        self.crypto_window.show()
+        self.crypto_window.activateWindow()
+
     def show_regex(self):
         if self.regex_window is None:
             self.regex_window = RegexWindow()
         self.regex_window.show()
         self.regex_window.activateWindow()
 
-    def show_uuid(self):
-        if self.uuid_window is None:
-            self.uuid_window = UuidWindow()
-        self.uuid_window.show()
-        self.uuid_window.activateWindow()
+    def show_diff(self):
+        if self.diff_window is None:
+            self.diff_window = DiffWindow()
+        self.diff_window.show()
+        self.diff_window.activateWindow()
 
-    def show_qrcode(self):
-        if self.qrcode_window is None:
-            self.qrcode_window = QrCodeWindow()
-        self.qrcode_window.show()
-        self.qrcode_window.activateWindow()
+    def show_generator(self):
+        if self.generator_window is None:
+            self.generator_window = GeneratorWindow()
+        self.generator_window.show()
+        self.generator_window.activateWindow()
 
     def show_base_convert(self):
         if self.baseconvert_window is None:
@@ -6389,35 +8855,23 @@ class ToolboxWindow(QMainWindow):
         self.divmod_window.show()
         self.divmod_window.activateWindow()
 
-    def show_json_yaml(self):
-        if self.jsonyaml_window is None:
-            self.jsonyaml_window = JsonYamlWindow()
-        self.jsonyaml_window.show()
-        self.jsonyaml_window.activateWindow()
+    def show_convert(self):
+        if self.convert_window is None:
+            self.convert_window = ConvertWindow()
+        self.convert_window.show()
+        self.convert_window.activateWindow()
 
-    def show_timestamp(self):
-        if self.timestamp_window is None:
-            self.timestamp_window = TimestampWindow()
-        self.timestamp_window.show()
-        self.timestamp_window.activateWindow()
-
-    def show_env_vars(self):
-        if self.envvar_window is None:
-            self.envvar_window = EnvVarWindow()
-        self.envvar_window.show()
-        self.envvar_window.activateWindow()
+    def show_config(self):
+        if self.config_window is None:
+            self.config_window = ConfigWindow()
+        self.config_window.show()
+        self.config_window.activateWindow()
 
     def show_command_reference(self):
         if self.cmdref_window is None:
             self.cmdref_window = CommandReferenceWindow()
         self.cmdref_window.show()
         self.cmdref_window.activateWindow()
-
-    def show_ssh_pubkey(self):
-        if self.ssh_window is None:
-            self.ssh_window = SshPubkeyWindow()
-        self.ssh_window.show()
-        self.ssh_window.activateWindow()
 
     def show_mortgage(self):
         if self.mortgage_window is None:
@@ -6448,12 +8902,6 @@ class ToolboxWindow(QMainWindow):
             self.cron_window = CronWindow()
         self.cron_window.show()
         self.cron_window.activateWindow()
-
-    def show_color(self):
-        if self.color_window is None:
-            self.color_window = ColorWindow()
-        self.color_window.show()
-        self.color_window.activateWindow()
 
     def show_image_tool(self):
         if self.image_window is None:

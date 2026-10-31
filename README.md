@@ -57,8 +57,6 @@
 - **Windows**：未签名的 exe 可能被 SmartScreen 拦截，点「更多信息 → 仍要运行」。
 - **macOS**：应用目前是 ad-hoc 签名，首次打开需在图标上右键 →「打开」。
 
-Windows 发行版使用 [SignPath Foundation](https://signpath.org/) 提供的免费开源代码签名（Windows releases are code-signed by the SignPath Foundation）。
-
 ## 从源码运行
 
 需要 Python 3.9+（CI 使用 3.11）。

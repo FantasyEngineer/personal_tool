@@ -230,6 +230,14 @@ def get_system_stats():
     return None, None, None, None
 
 
+def short_process_name(name):
+    """macOS 的 ps comm 给的是完整路径，显示时只保留可执行文件名。"""
+    name = (name or "").strip()
+    if "/" in name:
+        name = name.rsplit("/", 1)[-1]
+    return name
+
+
 def list_processes():
     """全量进程快照：名称 / PID / 内存KB / 窗口标题。命令固定，不拼接任何用户输入。"""
     rows = []
@@ -261,7 +269,8 @@ def list_processes():
                     pid, mem = int(parts[0]), int(parts[1])
                 except ValueError:
                     continue
-                rows.append({"pid": pid, "name": parts[2].strip(), "mem_kb": mem, "title": ""})
+                rows.append({"pid": pid, "name": short_process_name(parts[2]),
+                             "mem_kb": mem, "title": ""})
     except Exception:
         pass
     return rows
@@ -1873,6 +1882,7 @@ class ImageToolWindow(QMainWindow):
 
         tabs = QTabWidget()
         tabs.setStyleSheet("""
+            QTabWidget::tab-bar { alignment: left; }
             QTabBar::tab { font-family: "PingFang SC"; font-size: 12px; padding: 6px 14px;
                 color: #333333; background: #F0F0F0; border: 1px solid #D0D0D0; border-bottom: none;
                 border-top-left-radius: 4px; border-top-right-radius: 4px; }
@@ -3055,6 +3065,7 @@ class CronWindow(QMainWindow):
 
         tabs = QTabWidget()
         tabs.setStyleSheet("""
+            QTabWidget::tab-bar { alignment: left; }
             QTabBar::tab { font-family: "PingFang SC"; font-size: 12px; padding: 6px 14px;
                 color: #333333; background: #F0F0F0; border: 1px solid #D0D0D0; border-bottom: none;
                 border-top-left-radius: 4px; border-top-right-radius: 4px; }
@@ -6746,6 +6757,7 @@ def _output_style():
 
 def _tab_style():
     return """
+        QTabWidget::tab-bar { alignment: left; }
         QTabWidget::pane { background: #FFFFFF; border: 1px solid #D0D0D0; border-radius: 4px; }
         QTabBar::tab { background: #F0F0F0; color: #333333; border: 1px solid #D0D0D0;
             border-bottom: none; border-top-left-radius: 4px; border-top-right-radius: 4px;
@@ -8618,6 +8630,39 @@ class MortgageWindow(QMainWindow):
             self.close()
 
 
+# 首页按钮的悬停说明：直接列出工具内部的页签或主要功能，省得一个个点开找。
+TOOL_TIPS = {
+    "进程管理": "功能：进程列表 · 按名称/PID/窗口标题搜索 · 按端口过滤 · 结束进程",
+    "端口扫描": "功能：指定目标与端口范围 · 并发扫描开放端口",
+    "Ping 测试": "功能：测试主机连通性与往返延迟",
+    "DNS 查询": "功能：查询域名的解析记录",
+    "路由追踪": "功能：逐跳查看数据包到达目标的路径",
+    "网络测速": "功能：下载速度测试",
+    "配置": "页签：环境变量 / 进程内变量 / Git 配置 / 镜像源 / SSH 密钥 / SSH 主机 / 显示开关",
+    "JSON/XML": "页签：JSON / XML",
+    "编解码": "页签：Base64 / URL / Unicode 转义",
+    "加解密": "页签：JWT / AES / RSA / HMAC / 口令哈希 / 随机密钥",
+    "正则测试": "功能：常用正则预设 · 实时匹配与高亮",
+    "UUID/二维码": "页签：UUID / 二维码",
+    "格式转换": "页签：颜色 / 时间戳 / JSON-YAML",
+    "文本统计": "功能：字符数 / 行数 / 词数 / 字节数 / 中文字数",
+    "文本对比": "功能：逐行 diff · 忽略空白 / 大小写 · 只看差异 · 复制 diff",
+    "Cron 表达式": "页签：执行计划 / 书写规范",
+    "哈希计算": "页签：文本哈希 / 文件哈希（MD5 / SHA1 / SHA256 / SHA512）",
+    "命令速查": "分类：全部 / Docker / Linux / SSH / Vim / Windows / Git",
+    "房贷计算器": "功能：等额本息 / 等额本金",
+    "图片处理": "页签：转 Base64 / 格式转换 / 缩放压缩",
+    "文字雨": "功能：桌面字符雨特效（开关）",
+    "防黑屏": "功能：阻止系统休眠与屏幕关闭（开关）",
+    "进制转换": "格式：十进制 / 二进制 / 八进制 / 十六进制",
+    "商余计算": "功能：求整除的商和余数",
+    "单位转换": "页签：字节 / 时间 / 长度 / 重量 / 面积 / 体积 / 速度 / 温度",
+    "随机数": "功能：范围内批量生成随机整数 · 可重复",
+    "金额大写": "功能：数字金额转人民币中文大写",
+    "罗马数字": "功能：阿拉伯数字 ↔ 罗马数字",
+}
+
+
 class ToolboxWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -8686,12 +8731,11 @@ class ToolboxWindow(QMainWindow):
             "网络测速": self.show_speedtest,
             "配置": self.show_config
         })
-        content_layout.addWidget(section1)
 
         section3 = self.create_section("文本处理", [
-            "JSON/XML", "编解码", "哈希计算", "加解密",
-            "正则测试", "文本对比", "UUID/二维码",
-            "格式转换", "文本统计", "Cron 表达式"
+            "JSON/XML", "编解码", "加解密",
+            "正则测试", "UUID/二维码",
+            "格式转换", "文本统计", "文本对比", "Cron 表达式", "哈希计算"
         ], {
             "JSON/XML": self.show_markup,
             "编解码": self.show_codec,
@@ -8729,6 +8773,7 @@ class ToolboxWindow(QMainWindow):
             "罗马数字": self.show_roman
         })
         content_layout.addWidget(section4)
+        content_layout.addWidget(section1)
 
         content_layout.addStretch()
         scroll = QScrollArea()
@@ -8815,6 +8860,9 @@ class ToolboxWindow(QMainWindow):
             btn = QPushButton(btn_text)
             btn.setFixedHeight(32)
             btn.setCursor(QCursor(Qt.PointingHandCursor))
+            tip = TOOL_TIPS.get(btn_text)
+            if tip:
+                btn.setToolTip(tip)
             btn.setStyleSheet("""
                 QPushButton {
                     color: #333333;

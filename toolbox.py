@@ -20,6 +20,7 @@ import colorsys
 import decimal
 import shutil
 import shlex
+import csv
 import yaml
 from PIL import Image
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -28,7 +29,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QGraphicsDropShadowEffect, QTextEdit, QSplitter,
                               QPlainTextEdit, QComboBox, QCheckBox, QStackedWidget,
                               QGridLayout, QSpinBox, QTabWidget, QColorDialog,
-                              QFileDialog, QInputDialog, QListWidget, QListWidgetItem)
+                              QFileDialog, QInputDialog, QListWidget, QListWidgetItem,
+                              QTreeWidget, QTreeWidgetItem, QHeaderView)
 from PyQt5.QtCore import Qt, QPoint, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QCursor, QColor, QPixmap, QPainter, QIcon
 
@@ -212,75 +214,93 @@ def get_system_stats():
     return None, None, None, None
 
 
-def search_processes(port="", keyword=""):
-    results = []
-    system = platform.system()
+def list_processes():
+    """全量进程快照：名称 / PID / 内存KB / 窗口标题。命令固定，不拼接任何用户输入。"""
+    rows = []
     try:
-        if system == "Windows":
-            if port:
-                output = subprocess.check_output(f"netstat -ano | findstr :{port}", shell=True, text=True, encoding="gbk", errors="ignore")
-                pids = set()
-                for line in output.splitlines():
-                    parts = line.split()
-                    if len(parts) >= 4:
-                        pids.add(parts[4])
-                for pid in pids:
-                    try:
-                        cmd = subprocess.check_output(f'tasklist /FI "PID eq {pid}" /FO CSV /NH', shell=True, text=True, encoding="gbk", errors="ignore")
-                        app_name = cmd.split(",")[0].strip('"')
-                        results.append({"pid": pid, "app": app_name, "port": port})
-                    except Exception:
-                        results.append({"pid": pid, "app": "Unknown", "port": port})
-            if keyword:
-                output = subprocess.check_output(f'tasklist /FI "IMAGENAME eq {keyword}*" /FO CSV /NH', shell=True, text=True, encoding="gbk", errors="ignore")
-                for line in output.strip().splitlines():
-                    parts = line.split(",")
-                    if len(parts) >= 2:
-                        app_name = parts[0].strip('"')
-                        pid = parts[1].strip('"')
-                        if not any(r["pid"] == pid for r in results):
-                            results.append({"pid": pid, "app": app_name, "port": "-"})
+        if platform.system() == "Windows":
+            script = ("[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+                      "Get-Process | Select-Object Name,Id,WorkingSet,MainWindowTitle"
+                      "| ConvertTo-Csv -NoTypeInformation")
+            raw = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                                 capture_output=True, timeout=25, **win_no_console()).stdout
+            for rec in csv.DictReader(io.StringIO(raw.decode("utf-8", "ignore"))):
+                try:
+                    pid = int(rec.get("Id", ""))
+                    mem = int(rec.get("WorkingSet", "0") or 0)
+                except ValueError:
+                    continue
+                rows.append({"pid": pid,
+                             "name": rec.get("Name") or "",
+                             "mem_kb": mem // 1024,
+                             "title": (rec.get("MainWindowTitle") or "").strip()})
         else:
-            lsof_output = ""
-            try:
-                lsof_output = subprocess.check_output(["lsof", "-i", "-P", "-n"], text=True, errors="ignore")
-            except Exception:
-                pass
-
-            if port:
-                for line in lsof_output.splitlines()[1:]:
-                    parts = line.split()
-                    if len(parts) >= 9:
-                        name = parts[0]
-                        pid = parts[1]
-                        port_col = parts[8]
-                        if f":{port}" in port_col and not any(r["pid"] == pid for r in results):
-                            results.append({"pid": pid, "app": name, "port": port})
-
-            if keyword:
-                ps_output = subprocess.check_output(["ps", "aux"], text=True, errors="ignore")
-                for line in ps_output.splitlines():
-                    if keyword.lower() in line.lower():
-                        parts = line.split()
-                        if len(parts) >= 11:
-                            pid = parts[1]
-                            full_cmd = " ".join(parts[10:])
-                            app_name = full_cmd.split("/")[-1].split(" ")[0]
-                            port = "-"
-                            for pline in lsof_output.splitlines()[1:]:
-                                pparts = pline.split()
-                                if len(pparts) >= 9 and pparts[1] == pid:
-                                    port_col = pparts[8]
-                                    if ":" in port_col:
-                                        port = port_col.split(":")[-1]
-                                        if "(" in port:
-                                            port = port.split("(")[0]
-                                        break
-                            if not any(r["pid"] == pid for r in results):
-                                results.append({"pid": pid, "app": app_name, "port": port})
+            output = subprocess.check_output(["ps", "-axo", "pid=,rss=,comm="],
+                                             text=True, errors="ignore")
+            for line in output.splitlines():
+                parts = line.split(None, 2)
+                if len(parts) < 3:
+                    continue
+                try:
+                    pid, mem = int(parts[0]), int(parts[1])
+                except ValueError:
+                    continue
+                rows.append({"pid": pid, "name": parts[2].strip(), "mem_kb": mem, "title": ""})
     except Exception:
         pass
-    return results
+    return rows
+
+
+def process_port_map():
+    """PID -> 该进程持有的本地端口集合（按端口号排序）。"""
+    owned = {}
+    try:
+        if platform.system() == "Windows":
+            output = subprocess.check_output("netstat -ano", shell=True, text=True,
+                                             encoding="gbk", errors="ignore")
+            for line in output.splitlines():
+                parts = line.split()
+                if (len(parts) >= 5 and parts[0].upper().startswith("TCP")) or \
+                        (len(parts) >= 4 and parts[0].upper().startswith("UDP")):
+                    local, pid = parts[1], parts[-1]
+                    _split_endpoint(local, owned, pid)
+        else:
+            output = subprocess.check_output(["lsof", "-i", "-P", "-n"], text=True, errors="ignore")
+            for line in output.splitlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 9:
+                    _split_endpoint(parts[8], owned, parts[1])
+    except Exception:
+        pass
+    return {pid: sorted(ports, key=int) for pid, ports in owned.items()}
+
+
+def _split_endpoint(endpoint, owned, pid):
+    try:
+        port = int(endpoint.rsplit(":", 1)[-1])
+        pid = int(pid)
+    except ValueError:
+        return
+    owned.setdefault(pid, set()).add(port)
+
+
+def human_mem(kb):
+    mb = kb / 1024.0
+    return "%.1f GB" % (mb / 1024.0) if mb >= 1024 else "%.1f MB" % mb
+
+
+class ProcessListWorker(QThread):
+    rows_ready = pyqtSignal(list, str)
+
+    def run(self):
+        rows = list_processes()
+        port_map = process_port_map()
+        for row in rows:
+            ports = port_map.get(row["pid"], [])
+            row["ports"] = ", ".join(str(p) for p in ports[:8])
+            if len(ports) > 8:
+                row["ports"] += " …"
+        self.rows_ready.emit(rows, "共 %d 个进程" % len(rows))
 
 
 def kill_process(pid):
@@ -352,198 +372,177 @@ def append_history(path, entry):
     return items
 
 
-class ProcessSearchPopup(QMainWindow):
+class _ProcessItem(QTreeWidgetItem):
+    """排序钩子要写在 item 上：Qt 只调用 QTreeWidgetItem 的比较函数，PyQt 里即 __lt__。"""
+
+    def __init__(self, strings, pid, mem_kb):
+        super().__init__(strings)
+        self.pid = pid
+        self.mem_kb = mem_kb
+
+    def __lt__(self, other):
+        col = self.treeWidget().sortColumn() if self.treeWidget() else -1
+        if col == 1:
+            return self.pid < other.pid
+        if col == 2:
+            return self.mem_kb < other.mem_kb
+        return self.text(col).lower() < other.text(col).lower()
+
+
+class ProcessManagerWindow(QMainWindow):
+    """本机进程管理器：全量列表、按名称/PID/窗口标题即时过滤、端口过滤、结束进程。"""
+
+    COLUMNS = ["名称", "PID", "内存", "端口", "窗口标题"]
+
     def __init__(self, parent):
         super().__init__(parent)
-        self.setWindowTitle("进程查询")
+        self.setWindowTitle("进程管理")
         self.setGeometry(*tool_win_geometry())
-        self.setStyleSheet("""
-            QMainWindow { background: #FFFFFF; }
-        """)
+        self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
+        self.worker = None
+        self.init_ui()
+        self.refresh()
 
+    def init_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
         layout.setContentsMargins(15, 15, 15, 10)
         layout.setSpacing(10)
 
-        input_layout = QHBoxLayout()
-        input_layout.setSpacing(8)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(QLabel("搜索:"))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("进程名 / PID / 窗口标题，可输入中文")
+        self.search_input.setStyleSheet(_lineedit_style())
+        self.search_input.textChanged.connect(self.refilter)
+        row.addWidget(self.search_input, 1)
 
-        input_layout.addWidget(QLabel("端口:"))
+        row.addWidget(QLabel("端口:"))
         self.port_input = QLineEdit()
-        self.port_input.setPlaceholderText("如: 8080")
-        self.port_input.setFixedWidth(100)
-        self.port_input.setStyleSheet("""
-            QLineEdit {
-                border: 1px solid #D0D0D0;
-                border-radius: 4px;
-                padding: 4px 8px;
-                font-size: 12px;
-            }
-            QLineEdit:focus { border-color: #1A73E8; }
+        self.port_input.setPlaceholderText("如 8080")
+        self.port_input.setFixedWidth(80)
+        self.port_input.setStyleSheet(_lineedit_style())
+        self.port_input.textChanged.connect(self.refilter)
+        row.addWidget(self.port_input)
+
+        refresh_btn = QPushButton("刷新")
+        refresh_btn.setFixedSize(64, 28)
+        refresh_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        refresh_btn.setStyleSheet(_secondary_btn())
+        refresh_btn.clicked.connect(self.refresh)
+        row.addWidget(refresh_btn)
+
+        self.kill_btn = QPushButton("结束进程")
+        self.kill_btn.setFixedSize(80, 28)
+        self.kill_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.kill_btn.setStyleSheet("""
+            QPushButton { color: #FFFFFF; background: #FF5F57; border: none;
+                border-radius: 4px; font-size: 12px; }
+            QPushButton:hover { background: #E0443E; }
+            QPushButton:pressed { background: #C73834; }
+            QPushButton:disabled { background: #CCCCCC; }
         """)
-        input_layout.addWidget(self.port_input)
+        self.kill_btn.clicked.connect(self.kill_selected)
+        row.addWidget(self.kill_btn)
+        layout.addLayout(row)
 
-        input_layout.addWidget(QLabel("应用:"))
-        self.keyword_input = QLineEdit()
-        self.keyword_input.setPlaceholderText("如: python")
-        self.keyword_input.setStyleSheet("""
-            QLineEdit {
-                border: 1px solid #D0D0D0;
-                border-radius: 4px;
-                padding: 4px 8px;
-                font-size: 12px;
-            }
-            QLineEdit:focus { border-color: #1A73E8; }
-        """)
-        input_layout.addWidget(self.keyword_input)
-
-        search_btn = QPushButton("查询")
-        search_btn.setFixedSize(60, 28)
-        search_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        search_btn.setStyleSheet("""
-            QPushButton {
-                color: #FFFFFF;
-                background: #1A73E8;
-                border: none;
-                border-radius: 4px;
-                font-size: 12px;
-            }
-            QPushButton:hover { background: #1557B0; }
-        """)
-        search_btn.clicked.connect(self.do_search)
-        input_layout.addWidget(search_btn)
-
-        self.port_input.returnPressed.connect(self.do_search)
-        self.keyword_input.returnPressed.connect(self.do_search)
-
-        layout.addLayout(input_layout)
-
-        self.status_label = QLabel("")
+        self.status_label = QLabel("正在枚举进程…")
         self.status_label.setFont(QFont("PingFang SC", 10))
         self.status_label.setStyleSheet("color: #999999;")
         layout.addWidget(self.status_label)
 
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setStyleSheet("""
-            QScrollArea { border: none; background: transparent; }
-            QScrollBar:vertical {
-                border: none;
-                background: #F5F5F5;
-                width: 8px;
-                border-radius: 4px;
-            }
-            QScrollBar::handle:vertical {
-                background: #CCCCCC;
-                border-radius: 4px;
-                min-height: 20px;
-            }
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(self.COLUMNS)
+        self.tree.setSortingEnabled(True)
+        self.tree.sortByColumn(2, Qt.DescendingOrder)
+        self.tree.setSelectionMode(QTreeWidget.ExtendedSelection)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setRootIsDecorated(False)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.tree.header().setSectionResizeMode(4, QHeaderView.Stretch)
+        for col in (1, 2, 3):
+            self.tree.header().setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        self.tree.setStyleSheet("""
+            QTreeWidget { border: 1px solid #D0D0D0; border-radius: 6px; background: #FFFFFF;
+                alternate-background-color: #FAFAFA; font-size: 12px;
+                font-family: "Menlo", "Consolas", monospace; }
+            QTreeWidget::item { height: 24px; }
+            QTreeWidget::item:selected { background: #E8F0FE; color: #1A73E8; }
+            QHeaderView::section { background: #F0F0F0; border: none;
+                border-bottom: 1px solid #D0D0D0; padding: 5px;
+                font-family: "PingFang SC"; font-size: 12px; color: #333333; }
         """)
+        layout.addWidget(self.tree)
 
-        self.content = QWidget()
-        self.content_layout = QVBoxLayout(self.content)
-        self.content_layout.setContentsMargins(0, 10, 0, 10)
-        self.content_layout.setSpacing(8)
-        self.content_layout.setAlignment(Qt.AlignTop)
+    def refresh(self):
+        if self.worker is not None and self.worker.isRunning():
+            return
+        self.status_label.setText("正在枚举进程…")
+        self.kill_btn.setEnabled(False)
+        self.worker = ProcessListWorker()
+        self.worker.rows_ready.connect(self.on_rows)
+        self.worker.start()
 
-        self.scroll.setWidget(self.content)
-        layout.addWidget(self.scroll)
+    def on_rows(self, rows, summary):
+        self.tree.setSortingEnabled(False)
+        self.tree.clear()
+        for proc in rows:
+            self.tree.addTopLevelItem(_ProcessItem(
+                [proc["name"], str(proc["pid"]), human_mem(proc["mem_kb"]),
+                 proc.get("ports", ""), proc["title"]], proc["pid"], proc["mem_kb"]))
+        self.tree.setSortingEnabled(True)
+        self.tree.sortByColumn(2, Qt.DescendingOrder)
+        self.kill_btn.setEnabled(True)
+        self.status_label.setText(summary)
+        self.refilter()
 
-        self.show_empty()
-
-    def show_empty(self):
-        while self.content_layout.count():
-            item = self.content_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        no_data = QLabel("请输入端口或应用名称进行查询")
-        no_data.setFont(QFont("PingFang SC", 12))
-        no_data.setStyleSheet("color: #999999; padding: 30px;")
-        no_data.setAlignment(Qt.AlignCenter)
-        self.content_layout.addWidget(no_data)
-
-    def do_search(self):
+    def refilter(self):
+        keyword = self.search_input.text().strip().lower()
         port = self.port_input.text().strip()
-        keyword = self.keyword_input.text().strip()
-        if not port and not keyword:
-            QMessageBox.warning(self, "提示", "请输入端口或应用名称", QMessageBox.Ok)
+        total = self.tree.topLevelItemCount()
+        shown = 0
+        for i in range(total):
+            item = self.tree.topLevelItem(i)
+            hit = (not keyword or keyword in item.text(0).lower()
+                   or keyword in item.text(1) or keyword in item.text(4).lower())
+            if hit and port:
+                hit = port in item.text(3)
+            item.setHidden(not hit)
+            if hit:
+                shown += 1
+        if keyword or port:
+            self.status_label.setText("共 %d 个进程，匹配 %d 个" % (total, shown))
+
+    def kill_selected(self):
+        items = [item for item in self.tree.selectedItems() if not item.isHidden()]
+        if not items:
+            self.status_label.setText("请先选中要结束的进程（可按住 Ctrl/Shift 多选）。")
             return
-
-        cmds = []
-        if platform.system() == "Windows":
-            if port:
-                cmds.append(f"netstat -ano | findstr :{port}")
-            if keyword:
-                cmds.append(f'tasklist /FI "IMAGENAME eq {keyword}*"')
-        else:
-            if port:
-                cmds.append(f"lsof -i :{port}")
-            if keyword:
-                cmds.append(f"ps aux | grep {keyword}")
-        self.status_label.setText("执行: " + " && ".join(cmds))
-
-        processes = search_processes(port, keyword)
-
-        while self.content_layout.count():
-            item = self.content_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        if not processes:
-            no_data = QLabel("未找到匹配的进程")
-            no_data.setFont(QFont("PingFang SC", 12))
-            no_data.setStyleSheet("color: #999999; padding: 30px;")
-            no_data.setAlignment(Qt.AlignCenter)
-            self.content_layout.addWidget(no_data)
+        preview = ["%s (PID %s)" % (item.text(0), item.text(1)) for item in items[:6]]
+        if len(items) > 6:
+            preview.append("…")
+        answer = QMessageBox.question(
+            self, "结束进程确认",
+            "确定结束 %d 个进程？\n%s\n\n未保存的数据会丢失。" % (len(items), "\n".join(preview)),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
             return
+        for item in items:
+            kill_process(item.pid)
+        self.status_label.setText("已结束 %d 个进程，正在刷新…" % len(items))
+        self.refresh()
 
-        for proc in processes:
-            row = QWidget()
-            row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(8, 6, 8, 6)
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
 
-            app_label = QLabel(proc["app"])
-            app_label.setFont(QFont("PingFang SC", 11))
-            app_label.setStyleSheet("color: #333333;")
-            row_layout.addWidget(app_label, 1)
-
-            port_label = QLabel(f"端口: {proc['port']}")
-            port_label.setFont(QFont("PingFang SC", 11))
-            port_label.setStyleSheet("color: #666666;")
-            port_label.setFixedWidth(100)
-            row_layout.addWidget(port_label)
-
-            pid_label = QLabel(f"PID: {proc['pid']}")
-            pid_label.setFont(QFont("PingFang SC", 11))
-            pid_label.setStyleSheet("color: #999999;")
-            row_layout.addWidget(pid_label)
-
-            row_layout.addStretch()
-
-            kill_btn = QPushButton("Kill")
-            kill_btn.setFixedSize(60, 24)
-            kill_btn.setCursor(QCursor(Qt.PointingHandCursor))
-            kill_btn.setStyleSheet("""
-                QPushButton {
-                    color: #FFFFFF;
-                    background: #FF5F57;
-                    border: none;
-                    border-radius: 3px;
-                    font-size: 11px;
-                }
-                QPushButton:hover { background: #E0443E; }
-                QPushButton:pressed { background: #C73834; }
-            """)
-            kill_btn.clicked.connect(lambda checked, p=proc["pid"]: self.kill_and_refresh(p))
-            row_layout.addWidget(kill_btn)
-
-            self.content_layout.addWidget(row)
-
-    def kill_and_refresh(self, pid):
-        kill_process(pid)
-        self.do_search()
+    def closeEvent(self, event):
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.wait(3000)
+        super().closeEvent(event)
 
 
 class JsonFormatterWindow(QMainWindow):
@@ -4772,7 +4771,8 @@ class _UserEnvPage(QWidget):
 
         row = QHBoxLayout()
         for text, slot, primary in (("添加", self.do_add, True), ("修改", self.do_edit, False),
-                                    ("删除", self.do_delete, False), ("刷新", self.refresh, False)):
+                                    ("删除", self.do_delete, False), ("终端查看", self.open_terminal, False),
+                                    ("刷新", self.refresh, False)):
             btn = QPushButton(text)
             btn.setFixedSize(72, 30)
             btn.setCursor(QCursor(Qt.PointingHandCursor))
@@ -4876,6 +4876,55 @@ class _UserEnvPage(QWidget):
             return
         self.refresh()
         self._set_status("已删除 %s。" % name, "#188038")
+
+    def open_terminal(self):
+        name, ok = QInputDialog.getText(
+            self, "在终端中查看", "变量名:", QLineEdit.Normal, self._selected_name() or "")
+        name = name.strip()
+        if not ok or not name:
+            return
+        if not ENV_NAME_RE.match(name):
+            self._set_status("变量名不合法，无法传给终端。", "#D93025")
+            return
+        try:
+            self._launch_terminal(name)
+        except OSError as e:
+            self._set_status("打开终端失败: %s" % e, "#D93025")
+            QMessageBox.warning(self, "打开终端失败", str(e), QMessageBox.Ok)
+        else:
+            self._set_status("已在新终端中展示 %s。" % name, "#188038")
+
+    def _launch_terminal(self, name):
+        if os.name == "nt":
+            # The new console inherits this process's snapshot, so pull the
+            # persistent values in first; otherwise vars set elsewhere look unset.
+            os.environ.update(load_user_env())
+            return subprocess.Popen(["cmd.exe", "/k", self._cmd_show(name)],
+                                    creationflags=subprocess.CREATE_NEW_CONSOLE)
+        command = '%s; exec "${SHELL:-bash}" -i' % self._shell_show(name)
+        if sys.platform == "darwin":
+            script = command.replace("\\", "\\\\").replace('"', '\\"')
+            return subprocess.Popen(["osascript", "-e",
+                                     'tell application "Terminal" to do script "%s"' % script,
+                                     "-e", 'tell application "Terminal" to activate'])
+        for term in ("x-terminal-emulator", "gnome-terminal", "konsole", "xterm"):
+            if shutil.which(term):
+                flag = "--" if term == "gnome-terminal" else "-e"
+                return subprocess.Popen([term, flag, "sh", "-c", command])
+        raise OSError("未找到可用的终端程序，请手动执行: %s" % command)
+
+    @staticmethod
+    def _cmd_show(name):
+        # "if %NAME%==""" cannot detect an undefined variable here: on cmd's command
+        # line an undefined %NAME% stays literal instead of expanding to empty.
+        return ('@echo off & title 环境变量 %s & '
+                'if defined %s (echo %s = %%%s%%) else (echo %s 未在此终端的环境中)'
+                % (name, name, name, name, name))
+
+    @staticmethod
+    def _shell_show(name):
+        return ('. %s 2>/dev/null; echo "%s = $%s"'
+                % (shlex.quote(POSIX_ENV_FILE), name, name))
 
     def _path_mode(self):
         box = QMessageBox(self)
@@ -5470,6 +5519,10 @@ COMMAND_ITEMS = [
     ("powercfg /batteryreport", "生成电池健康报告", "Windows"),
     ("net user", "查看本机用户列表", "Windows"),
     # ---------- Git ----------
+    ("git config --global user.name \"你的名字\"", "设置全局提交名字", "Git"),
+    ("git config --global user.email \"you@example.com\"", "设置全局提交邮箱", "Git"),
+    ("git config --global --list", "查看全部全局配置", "Git"),
+    ("git config --global user.name", "只看全局提交名字", "Git"),
     ("git init", "初始化仓库", "Git"),
     ("git clone <url>", "克隆远程仓库", "Git"),
     ("git status", "查看工作区状态", "Git"),
@@ -6043,10 +6096,10 @@ class ToolboxWindow(QMainWindow):
         self._rain_overlay = None
 
         section1 = self.create_section("系统工具", [
-            "获取进程", "端口扫描", "Ping 测试", "DNS 查询", "路由追踪",
+            "进程管理", "端口扫描", "Ping 测试", "DNS 查询", "路由追踪",
             "网络测速", "环境变量", "SSH 公钥"
         ], {
-            "获取进程": self.show_process_search,
+            "进程管理": self.show_process_search,
             "端口扫描": self.show_portscan,
             "Ping 测试": self.show_ping,
             "DNS 查询": self.show_dns,
@@ -6285,7 +6338,7 @@ class ToolboxWindow(QMainWindow):
         if self.popup and self.popup.isVisible():
             self.popup.activateWindow()
             return
-        self.popup = ProcessSearchPopup(self)
+        self.popup = ProcessManagerWindow(self)
         self.popup.show()
 
     def show_markup(self):

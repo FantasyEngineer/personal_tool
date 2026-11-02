@@ -51,6 +51,10 @@ from PyQt5.QtCore import Qt, QPoint, QPointF, QRectF, QThread, pyqtSignal, QTime
 from PyQt5.QtGui import QFont, QCursor, QColor, QPen, QPixmap, QPainter, QIcon
 
 
+APP_VERSION = "1.0.9"
+UPDATE_CHECK_URL = "https://your-host.com/version.json"  # TODO: 替换为实际的 version.json 地址
+
+
 def get_effective_ip():
     system = platform.system()
     try:
@@ -7297,8 +7301,9 @@ class CommandReferenceWindow(QMainWindow):
             btn.setCursor(QCursor(Qt.PointingHandCursor))
             btn.setChecked(cat == "全部")
             btn.setStyleSheet("""
-                QPushButton { color: #333; background: #FFFFFF; border: 1px solid #D0D0D0;
-                    border-radius: 4px; padding: 5px 14px; font-size: 12px; }
+                QPushButton { color: #222; background: #FFFFFF; border: 1px solid #CFCFCF;
+                    border-radius: 4px; padding: 6px 16px; font-size: 14px; font-weight: 500;
+                    font-family: "PingFang SC", "Microsoft YaHei", sans-serif; }
                 QPushButton:hover { border-color: #1A73E8; color: #1A73E8; }
                 QPushButton:checked { color: #FFFFFF; background: #1A73E8; border-color: #1A73E8; }
             """)
@@ -8802,6 +8807,24 @@ class ToolboxWindow(QMainWindow):
 
         bottom_layout.addStretch()
 
+        update_btn = QPushButton("检查更新")
+        update_btn.setFont(QFont("PingFang SC", 10))
+        update_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        update_btn.setStyleSheet("""
+            QPushButton {
+                color: #1A73E8;
+                background: transparent;
+                border: 1px solid #1A73E8;
+                border-radius: 4px;
+                padding: 4px 12px;
+            }
+            QPushButton:hover {
+                background: #E8F0FE;
+            }
+        """)
+        update_btn.clicked.connect(self.check_for_updates)
+        bottom_layout.addWidget(update_btn)
+
         repo_label = QLabel('<a href="https://github.com/FantasyEngineer/personal_tool">仓库</a>')
         repo_label.setFont(QFont("PingFang SC", 10))
         repo_label.setCursor(QCursor(Qt.PointingHandCursor))
@@ -8848,8 +8871,8 @@ class ToolboxWindow(QMainWindow):
         layout.setSpacing(10)
 
         title_label = QLabel(title)
-        title_label.setFont(QFont("PingFang SC", 12, QFont.Bold))
-        title_label.setStyleSheet("color: #333333;")
+        title_label.setFont(QFont("PingFang SC", 14, QFont.Bold))
+        title_label.setStyleSheet("color: #222222;")
         layout.addWidget(title_label)
 
         from PyQt5.QtWidgets import QGridLayout
@@ -8858,22 +8881,24 @@ class ToolboxWindow(QMainWindow):
 
         for i, btn_text in enumerate(buttons):
             btn = QPushButton(btn_text)
-            btn.setFixedHeight(32)
+            btn.setFixedHeight(36)
             btn.setCursor(QCursor(Qt.PointingHandCursor))
             tip = TOOL_TIPS.get(btn_text)
             if tip:
                 btn.setToolTip(tip)
             btn.setStyleSheet("""
                 QPushButton {
-                    color: #333333;
+                    color: #222222;
                     background: #FFFFFF;
-                    border: 1px solid #D0D0D0;
+                    border: 1px solid #CFCFCF;
                     border-radius: 4px;
-                    font-size: 11px;
-                    padding: 0 12px;
+                    font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+                    font-size: 13px;
+                    font-weight: 500;
+                    padding: 0 14px;
                 }
                 QPushButton:hover {
-                    background: #F0F0F0;
+                    background: #F0F6FF;
                     border-color: #1A73E8;
                     color: #1A73E8;
                 }
@@ -9120,6 +9145,79 @@ class ToolboxWindow(QMainWindow):
         clipboard = QApplication.clipboard()
         clipboard.setText(text)
         QMessageBox.information(self, "已复制", f"已复制到剪贴板:\n{text}", QMessageBox.Ok)
+
+    def check_for_updates(self):
+        """检查更新：请求远程 version.json，对比版本号，提示用户下载"""
+        try:
+            # 请求 version.json
+            req = urllib.request.Request(UPDATE_CHECK_URL, headers={'User-Agent': f'Toolbox/{APP_VERSION}'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode('utf-8'))
+            
+            remote_version = data.get('version', '')
+            changelog = data.get('changelog', '')
+            
+            # 比较版本
+            if not self._is_newer_version(APP_VERSION, remote_version):
+                QMessageBox.information(self, "检查更新", f"当前已是最新版本 v{APP_VERSION}", QMessageBox.Ok)
+                return
+            
+            # 有新版本，提示下载
+            msg = f"发现新版本 v{remote_version}\n\n更新内容：\n{changelog}\n\n是否下载？"
+            reply = QMessageBox.question(self, "检查更新", msg, QMessageBox.Yes | QMessageBox.No)
+            
+            if reply == QMessageBox.Yes:
+                self._download_update(data)
+        
+        except urllib.error.URLError as e:
+            QMessageBox.warning(self, "检查更新", f"无法连接到更新服务器：\n{e}", QMessageBox.Ok)
+        except Exception as e:
+            QMessageBox.warning(self, "检查更新", f"检查更新时出错：\n{e}", QMessageBox.Ok)
+
+    def _is_newer_version(self, current, remote):
+        """比较版本号，remote > current 返回 True"""
+        try:
+            cur_parts = [int(x) for x in current.split('.')]
+            rem_parts = [int(x) for x in remote.split('.')]
+            return rem_parts > cur_parts
+        except:
+            return False
+
+    def _download_update(self, data):
+        """下载更新包到 ~/Downloads/"""
+        system = platform.system()
+        if system == "Darwin":
+            url = data.get('mac_url', '')
+            filename = f"Toolbox-v{data['version']}-mac.zip"
+        elif system == "Windows":
+            url = data.get('win_url', '')
+            filename = f"Toolbox-v{data['version']}-win.zip"
+        else:
+            QMessageBox.warning(self, "下载更新", "不支持的平台", QMessageBox.Ok)
+            return
+        
+        if not url:
+            QMessageBox.warning(self, "下载更新", "未找到对应平台的下载链接", QMessageBox.Ok)
+            return
+        
+        try:
+            # 下载到 ~/Downloads/
+            download_dir = os.path.expanduser("~/Downloads")
+            os.makedirs(download_dir, exist_ok=True)
+            filepath = os.path.join(download_dir, filename)
+            
+            # 显示下载中提示
+            QMessageBox.information(self, "下载更新", f"正在下载...\n\n文件将保存到：\n{filepath}", QMessageBox.Ok)
+            
+            # 下载文件
+            urllib.request.urlretrieve(url, filepath)
+            
+            # 下载完成
+            msg = f"下载完成！\n\n文件保存在：\n{filepath}\n\n请退出应用后手动解压并替换旧版本。"
+            QMessageBox.information(self, "下载完成", msg, QMessageBox.Ok)
+        
+        except Exception as e:
+            QMessageBox.warning(self, "下载更新", f"下载失败：\n{e}", QMessageBox.Ok)
 
 
 def startup_log_path():

@@ -52,7 +52,7 @@ from PyQt5.QtGui import QFont, QCursor, QColor, QPen, QPixmap, QPainter, QIcon
 
 
 APP_VERSION = "1.0.9"
-UPDATE_CHECK_URL = "https://your-host.com/version.json"  # TODO: 替换为实际的 version.json 地址
+UPDATE_CHECK_URL = "https://gitee.com/jimmy_hou/personal_tool/raw/main/version.json"
 
 
 def get_effective_ip():

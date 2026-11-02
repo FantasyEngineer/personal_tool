@@ -1,0 +1,6 @@
+{
+  "version": "1.0.10",
+  "mac_url": "https://gitee.com/jimmy_hou/personal_tool/releases/download/v1.0.10/Toolbox-v1.0.10-mac.zip",
+  "win_url": "https://gitee.com/jimmy_hou/personal_tool/releases/download/v1.0.10/Toolbox-v1.0.10-win.zip",
+  "changelog": "测试版本：新增在线更新功能，修复若干问题。"
+}

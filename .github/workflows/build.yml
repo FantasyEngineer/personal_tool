@@ -169,13 +169,16 @@ jobs:
             RESPONSE=$(curl -s -X POST -H "Authorization: token $GITEE_TOKEN" \
               -H "Content-Type: application/json" \
               "https://gitee.com/api/v5/repos/$GITEE_OWNER/$GITEE_REPO/releases" \
-              -d "{
-                \"tag_name\": \"$TAG\",
-                \"name\": \"$TAG\",
-                \"body\": \"Automatically synced from GitHub Actions\",
-                \"target_commitish\": \"main\",
-                \"prerelease\": false
-              }")
+              -d @- <<EOF
+{
+  "tag_name": "$TAG",
+  "name": "$TAG",
+  "body": "Automatically synced from GitHub Actions",
+  "target_commitish": "main",
+  "prerelease": false
+}
+EOF
+)
             RELEASE_ID=$(echo "$RESPONSE" | jq -r '.id')
             if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" = "null" ]; then
               echo "Failed to create release: $RESPONSE"

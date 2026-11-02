@@ -45,14 +45,15 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QPlainTextEdit, QComboBox, QCheckBox, QStackedWidget,
                               QGridLayout, QSpinBox, QTabWidget, QColorDialog,
                               QFileDialog, QInputDialog, QListWidget, QListWidgetItem,
-                              QProgressDialog,
+                              QProgressDialog, QSystemTrayIcon, QMenu, QAction,
                               QTreeWidget, QTreeWidgetItem, QHeaderView,
-                              QStyledItemDelegate, QStyle)
+                              QStyledItemDelegate, QStyle, QGraphicsOpacityEffect)
 from PyQt5.QtCore import Qt, QPoint, QPointF, QRectF, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QFont, QCursor, QColor, QPen, QPixmap, QPainter, QIcon
+from PyQt5.QtGui import (QFont, QCursor, QColor, QPen, QPixmap, QPainter, QIcon,
+                         QImage, QLinearGradient, QBrush)
 
 
-APP_VERSION = "1.0.10"
+APP_VERSION = "1.0.14"
 UPDATE_CHECK_URL = "https://gitee.com/jimmy_hou/personal_tool/raw/main/version.json"
 
 
@@ -8658,7 +8659,7 @@ TOOL_TIPS = {
     "命令速查": "分类：全部 / Docker / Linux / SSH / Vim / Windows / Git",
     "房贷计算器": "功能：等额本息 / 等额本金",
     "图片处理": "页签：转 Base64 / 格式转换 / 缩放压缩",
-    "文字雨": "功能：桌面字符雨特效（开关）",
+    "文字雨": "功能：桌面字符雨特效，开启时自动防黑屏（开关）",
     "防黑屏": "功能：阻止系统休眠与屏幕关闭（开关）",
     "进制转换": "格式：十进制 / 二进制 / 八进制 / 十六进制",
     "商余计算": "功能：求整除的商和余数",
@@ -8707,14 +8708,16 @@ class ToolboxWindow(QMainWindow):
         self.speedtest_window = None
         self.cmdref_window = None
         self.mortgage_window = None
+        self.tray_icon = None
         self.init_ui()
+        self.init_tray()
 
     def init_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(20, 20, 20, 5)
-        main_layout.setSpacing(15)
+        main_layout.setContentsMargins(15, 15, 15, 4)
+        main_layout.setSpacing(4)
 
         content_area = QWidget()
         content_layout = QVBoxLayout(content_area)
@@ -8724,6 +8727,7 @@ class ToolboxWindow(QMainWindow):
         self.toggle_buttons = {}
         self._caffeinate = None
         self._rain_overlay = None
+        self._rain_saved_awake = None
 
         section1 = self.create_section("系统工具", [
             "进程管理", "端口扫描", "Ping 测试", "DNS 查询", "路由追踪",
@@ -8789,6 +8793,22 @@ class ToolboxWindow(QMainWindow):
         scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         scroll.viewport().setStyleSheet("background: #FFFFFF;")
         scroll.setWidget(content_area)
+        # 顶部渐隐：仅当内容真正向上滚动时才淡出顶端，静止时标题完全可见
+        self._top_fade = QGraphicsOpacityEffect(scroll.viewport())
+        scroll.viewport().setGraphicsEffect(self._top_fade)
+
+        def update_top_fade(value):
+            grad = QLinearGradient(0, 0, 0, 28)
+            if value <= 0:
+                grad.setColorAt(0.0, QColor(255, 255, 255, 255))
+                grad.setColorAt(1.0, QColor(255, 255, 255, 255))
+            else:
+                grad.setColorAt(0.0, QColor(255, 255, 255, 0))
+                grad.setColorAt(1.0, QColor(255, 255, 255, 255))
+            self._top_fade.setOpacityMask(QBrush(grad))
+
+        scroll.verticalScrollBar().valueChanged.connect(update_top_fade)
+        update_top_fade(0)
         main_layout.addWidget(scroll, 1)
 
         bottom_bar = QFrame()
@@ -8808,24 +8828,6 @@ class ToolboxWindow(QMainWindow):
 
         bottom_layout.addStretch()
 
-        self.update_btn = QPushButton("检查更新")
-        self.update_btn.setFont(QFont("PingFang SC", 10))
-        self.update_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self.update_btn.setStyleSheet("""
-            QPushButton {
-                color: #1A73E8;
-                background: transparent;
-                border: 1px solid #1A73E8;
-                border-radius: 4px;
-                padding: 4px 12px;
-            }
-            QPushButton:hover {
-                background: #E8F0FE;
-            }
-        """)
-        self.update_btn.clicked.connect(self.check_for_updates)
-        bottom_layout.addWidget(self.update_btn)
-
         repo_label = QLabel('<a href="https://github.com/FantasyEngineer/personal_tool">仓库</a>')
         repo_label.setFont(QFont("PingFang SC", 10))
         repo_label.setCursor(QCursor(Qt.PointingHandCursor))
@@ -8844,6 +8846,23 @@ class ToolboxWindow(QMainWindow):
         info_label.setToolTip("点击复制 IP")
         info_label.mousePressEvent = lambda e: self.copy_to_clipboard(self.ip)
         bottom_layout.addWidget(info_label)
+
+        self.update_btn = QPushButton("检查更新")
+        self.update_btn.setFont(QFont("PingFang SC", 10))
+        self.update_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.update_btn.setStyleSheet("""
+            QPushButton {
+                color: #1A73E8;
+                background: transparent;
+                border: none;
+                padding: 4px 6px;
+            }
+            QPushButton:hover {
+                color: #1666CE;
+            }
+        """)
+        self.update_btn.clicked.connect(self.check_for_updates)
+        bottom_layout.addWidget(self.update_btn)
 
         main_layout.addWidget(bottom_bar)
 
@@ -8963,17 +8982,90 @@ class ToolboxWindow(QMainWindow):
             QMessageBox.warning(self, "防黑屏", f"无法启动防休眠: {e}")
 
     def set_matrix_rain(self, active):
+        awake_btn = self.toggle_buttons.get("防黑屏")
         if active:
             if self._rain_overlay is None:
                 self._rain_overlay = MatrixRainOverlay(
                     on_close=lambda: self.toggle_buttons["文字雨"].setChecked(False)
                 )
             self._rain_overlay.start()
+            # 文字雨自带防黑屏：记录开启前的状态，便于关闭时还原
+            if awake_btn is not None and not awake_btn.isChecked():
+                self._rain_saved_awake = False
+                awake_btn.setChecked(True)
+            else:
+                self._rain_saved_awake = True
         else:
             if self._rain_overlay is not None:
                 self._rain_overlay.stop()
+            # 仅当防黑屏是文字雨带起来的（用户没主动开），才关回去
+            if self._rain_saved_awake is False and awake_btn is not None:
+                awake_btn.setChecked(False)
+            self._rain_saved_awake = None
+
+    def _tray_icon(self):
+        """托盘图标：Mac 菜单栏用单色模板图（黑色+透明，自动适配深浅色栏）。"""
+        base = app_icon()
+        if platform.system() != "Darwin":
+            return base
+        src = base.pixmap(44, 44)
+        if src.isNull():
+            return base
+        # 保留 alpha 形状、RGB 全设为黑，作为 macOS 模板图（SourceIn 一次性合成）
+        img = QImage(src.size(), QImage.Format_ARGB32_Premultiplied)
+        img.fill(QColor(0, 0, 0, 0))
+        painter = QPainter(img)
+        painter.drawPixmap(0, 0, src)
+        painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
+        painter.fillRect(img.rect(), QColor(0, 0, 0, 255))
+        painter.end()
+        pm = QPixmap.fromImage(img)
+        pm.setDevicePixelRatio(2.0)  # 约 22pt 逻辑尺寸
+        icon = QIcon(pm)
+        icon.setIsMask(True)  # 通知 Qt 作为模板渲染
+        return icon
+
+    def init_tray(self):
+        """系统托盘：点 X 隐藏到托盘而非退出，双击托盘图标恢复窗口。"""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray_icon = QSystemTrayIcon(self._tray_icon(), self)
+        self.tray_icon.setToolTip("系统工具箱")
+        menu = QMenu()
+        show_action = QAction("显示主窗口", self)
+        show_action.triggered.connect(self.show_from_tray)
+        quit_action = QAction("退出", self)
+        quit_action.triggered.connect(self.quit_app)
+        menu.addAction(show_action)
+        menu.addAction(quit_action)
+        self.tray_icon.setContextMenu(menu)
+        self.tray_icon.activated.connect(self.on_tray_activated)
+        self.tray_icon.show()
+
+    def show_from_tray(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def on_tray_activated(self, reason):
+        # 双击（Mac 上单击）恢复窗口
+        if reason in (QSystemTrayIcon.DoubleClick, QSystemTrayIcon.Trigger):
+            if self.isVisible():
+                self.raise_()
+                self.activateWindow()
+            else:
+                self.show_from_tray()
+
+    def quit_app(self):
+        """真正退出：清理托盘并结束进程。"""
+        self._force_quit = True
+        if self.tray_icon:
+            self.tray_icon.hide()
+        self.close()
+        QApplication.quit()
 
     def closeEvent(self, event):
+        # 无论哪种退出路径，都做资源清理
         try:
             self.set_awake(False)
         except Exception:
@@ -8983,6 +9075,16 @@ class ToolboxWindow(QMainWindow):
                 self._rain_overlay.stop()
         except Exception:
             pass
+
+        # 托盘可用且非强制退出：隐藏到托盘，保持进程存活
+        if self.tray_icon and not getattr(self, "_force_quit", False):
+            event.ignore()
+            self.hide()
+            self.tray_icon.showMessage(
+                "系统工具箱", "已最小化到托盘，双击图标恢复。",
+                QSystemTrayIcon.Information, 2000)
+            return
+
         super().closeEvent(event)
 
     def show_process_search(self):
@@ -9148,32 +9250,33 @@ class ToolboxWindow(QMainWindow):
         QMessageBox.information(self, "已复制", f"已复制到剪贴板:\n{text}", QMessageBox.Ok)
 
     def check_for_updates(self):
-        """检查更新：请求远程 version.json，对比版本号，提示用户下载"""
-        try:
-            # 请求 version.json
-            req = urllib.request.Request(UPDATE_CHECK_URL, headers={'User-Agent': f'Toolbox/{APP_VERSION}'})
-            with urllib.request.urlopen(req, timeout=10) as response:
-                data = json.loads(response.read().decode('utf-8'))
-            
-            remote_version = data.get('version', '')
-            changelog = data.get('changelog', '')
-            
-            # 比较版本
-            if not self._is_newer_version(APP_VERSION, remote_version):
-                QMessageBox.information(self, "检查更新", f"当前已是最新版本 v{APP_VERSION}", QMessageBox.Ok)
-                return
-            
-            # 有新版本，提示下载
-            msg = f"发现新版本 v{remote_version}\n\n更新内容：\n{changelog}\n\n是否下载？"
-            reply = QMessageBox.question(self, "检查更新", msg, QMessageBox.Yes | QMessageBox.No)
-            
-            if reply == QMessageBox.Yes:
-                self._download_update(data)
+        """检查更新：后台线程请求 version.json"""
+        self.update_btn.setEnabled(False)
+        self.update_btn.setText("检查中...")
+        self.check_thread = CheckUpdateThread()
+        self.check_thread.result.connect(self._on_check_update_result)
+        self.check_thread.start()
+    
+    def _on_check_update_result(self, success, data, error):
+        self.update_btn.setEnabled(True)
+        self.update_btn.setText("检查更新")
         
-        except urllib.error.URLError as e:
-            QMessageBox.warning(self, "检查更新", f"无法连接到更新服务器：\n{e}", QMessageBox.Ok)
-        except Exception as e:
-            QMessageBox.warning(self, "检查更新", f"检查更新时出错：\n{e}", QMessageBox.Ok)
+        if not success:
+            QMessageBox.warning(self, "检查更新", error, QMessageBox.Ok)
+            return
+        
+        remote_version = data.get('version', '')
+        changelog = data.get('changelog', '')
+        
+        if not self._is_newer_version(APP_VERSION, remote_version):
+            QMessageBox.information(self, "检查更新", f"当前已是最新版本 v{APP_VERSION}", QMessageBox.Ok)
+            return
+        
+        msg = f"发现新版本 v{remote_version}\n\n更新内容：\n{changelog}\n\n是否下载？"
+        reply = QMessageBox.question(self, "检查更新", msg, QMessageBox.Yes | QMessageBox.No)
+        
+        if reply == QMessageBox.Yes:
+            self._download_update(data)
 
     def _is_newer_version(self, current, remote):
         """比较版本号，remote > current 返回 True"""
@@ -9227,6 +9330,26 @@ class ToolboxWindow(QMainWindow):
         else:
             if error != "用户取消":
                 QMessageBox.warning(self, "下载更新", f"下载失败：\n{error}", QMessageBox.Ok)
+
+
+class CheckUpdateThread(QThread):
+    """后台检查更新线程"""
+    result = pyqtSignal(bool, dict, str)
+    
+    def run(self):
+        try:
+            req = urllib.request.Request(UPDATE_CHECK_URL, headers={'User-Agent': f'Toolbox/{APP_VERSION}'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode('utf-8'))
+            self.result.emit(True, data, "")
+        except urllib.error.URLError as e:
+            print(f"[Update] URLError: {e}")
+            self.result.emit(False, {}, f"无法连接到更新服务器：\n{e}")
+        except Exception as e:
+            import traceback
+            print(f"[Update] Error: {type(e).__name__}: {e}")
+            traceback.print_exc()
+            self.result.emit(False, {}, f"检查更新时出错：\n{e}")
 
 
 class DownloadThread(QThread):
@@ -9323,6 +9446,8 @@ if __name__ == "__main__":
     try:
         app = QApplication(sys.argv)
         app.setWindowIcon(app_icon())
+        # 有托盘时隐藏主窗口不应退出程序（由托盘"退出"显式结束）
+        app.setQuitOnLastWindowClosed(not QSystemTrayIcon.isSystemTrayAvailable())
         window = ToolboxWindow()
         window.show()
         write_startup_log("界面已显示")

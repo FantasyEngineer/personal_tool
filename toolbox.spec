@@ -9,6 +9,9 @@ import sys
 
 APP_NAME = "Toolbox"
 
+# 版本号由 CI 从 git tag 注入（如 BUILD_VERSION=1.0.11）；本地构建用默认值。
+BUILD_VERSION = os.environ.get("BUILD_VERSION", "1.0.0")
+
 # Windows ships a single exe: no _internal folder to lose when copying or
 # extracting, which is the most common "double-click does nothing" cause.
 ONEFILE = sys.platform == "win32"
@@ -81,8 +84,8 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName": APP_NAME,
             "CFBundleDisplayName": "系统工具箱",
-            "CFBundleShortVersionString": "1.0.0",
-            "CFBundleVersion": "1.0.0",
+            "CFBundleShortVersionString": BUILD_VERSION,
+            "CFBundleVersion": BUILD_VERSION,
             "NSHighResolutionCapable": True,
             "NSPrincipalClass": "NSApplication",
         },

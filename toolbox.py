@@ -45,13 +45,14 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QPlainTextEdit, QComboBox, QCheckBox, QStackedWidget,
                               QGridLayout, QSpinBox, QTabWidget, QColorDialog,
                               QFileDialog, QInputDialog, QListWidget, QListWidgetItem,
+                              QProgressDialog,
                               QTreeWidget, QTreeWidgetItem, QHeaderView,
                               QStyledItemDelegate, QStyle)
 from PyQt5.QtCore import Qt, QPoint, QPointF, QRectF, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QCursor, QColor, QPen, QPixmap, QPainter, QIcon
 
 
-APP_VERSION = "1.0.9"
+APP_VERSION = "1.0.10"
 UPDATE_CHECK_URL = "https://gitee.com/jimmy_hou/personal_tool/raw/main/version.json"
 
 
@@ -8807,10 +8808,10 @@ class ToolboxWindow(QMainWindow):
 
         bottom_layout.addStretch()
 
-        update_btn = QPushButton("检查更新")
-        update_btn.setFont(QFont("PingFang SC", 10))
-        update_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        update_btn.setStyleSheet("""
+        self.update_btn = QPushButton("检查更新")
+        self.update_btn.setFont(QFont("PingFang SC", 10))
+        self.update_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.update_btn.setStyleSheet("""
             QPushButton {
                 color: #1A73E8;
                 background: transparent;
@@ -8822,8 +8823,8 @@ class ToolboxWindow(QMainWindow):
                 background: #E8F0FE;
             }
         """)
-        update_btn.clicked.connect(self.check_for_updates)
-        bottom_layout.addWidget(update_btn)
+        self.update_btn.clicked.connect(self.check_for_updates)
+        bottom_layout.addWidget(self.update_btn)
 
         repo_label = QLabel('<a href="https://github.com/FantasyEngineer/personal_tool">仓库</a>')
         repo_label.setFont(QFont("PingFang SC", 10))
@@ -8893,8 +8894,8 @@ class ToolboxWindow(QMainWindow):
                     border: 1px solid #CFCFCF;
                     border-radius: 4px;
                     font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
-                    font-size: 13px;
-                    font-weight: 500;
+                    font-size: 12px;
+                    font-weight: normal;
                     padding: 0 14px;
                 }
                 QPushButton:hover {
@@ -9200,24 +9201,62 @@ class ToolboxWindow(QMainWindow):
             QMessageBox.warning(self, "下载更新", "未找到对应平台的下载链接", QMessageBox.Ok)
             return
         
-        try:
-            # 下载到 ~/Downloads/
-            download_dir = os.path.expanduser("~/Downloads")
-            os.makedirs(download_dir, exist_ok=True)
-            filepath = os.path.join(download_dir, filename)
-            
-            # 显示下载中提示
-            QMessageBox.information(self, "下载更新", f"正在下载...\n\n文件将保存到：\n{filepath}", QMessageBox.Ok)
-            
-            # 下载文件
-            urllib.request.urlretrieve(url, filepath)
-            
-            # 下载完成
+        download_dir = os.path.expanduser("~/Downloads")
+        os.makedirs(download_dir, exist_ok=True)
+        filepath = os.path.join(download_dir, filename)
+        
+        # 禁用按钮，显示下载中
+        self.update_btn.setEnabled(False)
+        self.update_btn.setText("下载中...")
+        
+        # 启动后台下载线程
+        self.download_thread = DownloadThread(url, filepath)
+        self.download_thread.progress.connect(self._on_download_progress)
+        self.download_thread.finished.connect(self._on_download_finished)
+        self.download_thread.start()
+    
+    def _on_download_progress(self, percent):
+        self.update_btn.setText(f"下载中 {percent}%")
+    
+    def _on_download_finished(self, success, filepath, error):
+        self.update_btn.setEnabled(True)
+        self.update_btn.setText("检查更新")
+        if success:
             msg = f"下载完成！\n\n文件保存在：\n{filepath}\n\n请退出应用后手动解压并替换旧版本。"
             QMessageBox.information(self, "下载完成", msg, QMessageBox.Ok)
-        
+        else:
+            if error != "用户取消":
+                QMessageBox.warning(self, "下载更新", f"下载失败：\n{error}", QMessageBox.Ok)
+
+
+class DownloadThread(QThread):
+    """后台下载线程"""
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(bool, str, str)
+    
+    def __init__(self, url, filepath):
+        super().__init__()
+        self.url = url
+        self.filepath = filepath
+        self.cancelled = False
+    
+    def cancel(self):
+        self.cancelled = True
+    
+    def run(self):
+        try:
+            def report_hook(block_num, block_size, total_size):
+                if self.cancelled:
+                    raise Exception("用户取消")
+                if total_size > 0:
+                    percent = min(100, int(block_num * block_size * 100 / total_size))
+                    self.progress.emit(percent)
+            
+            urllib.request.urlretrieve(self.url, self.filepath, reporthook=report_hook)
+            self.progress.emit(100)
+            self.finished.emit(True, self.filepath, "")
         except Exception as e:
-            QMessageBox.warning(self, "下载更新", f"下载失败：\n{e}", QMessageBox.Ok)
+            self.finished.emit(False, self.filepath, str(e))
 
 
 def startup_log_path():

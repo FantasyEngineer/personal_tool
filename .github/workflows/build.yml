@@ -2,9 +2,14 @@ name: build
 
 # Builds a macOS .app and a Windows .exe with PyInstaller on native runners.
 # - Push to `main` (or manual run): produces downloadable artifacts.
-# - Push a tag like `v1.0.0`: additionally publishes a GitHub Release.
+# - Push a tag like `v1.0.0`: additionally publishes a GitHub Release, mirrors
+#   the installers to a Gitee Release and rewrites version.json, so the running
+#   app can detect the update with no manual download/upload step.
 # - Windows releases are code-signed through SignPath when the credentials
 #   below are configured (see "Signing setup" at the end of this file).
+#
+# Release flow: bump nothing by hand, just tag and push.
+#   git tag v1.0.11 && git push origin v1.0.11
 
 on:
   push:
@@ -16,6 +21,10 @@ permissions:
   contents: write
   # The SignPath action downloads the unsigned artifact through the API.
   actions: read
+
+env:
+  GITEE_OWNER: jimmy_hou
+  GITEE_REPO: personal_tool
 
 jobs:
   build:
@@ -50,6 +59,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
+
+      # 版本号以 git tag 为唯一来源：把 v1.0.11 写进 APP_VERSION，并通过
+      # GITHUB_ENV 传给打包步骤（spec 里的 CFBundle 版本号）。非 tag 构建不改动源码。
+      - name: Inject version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Build version: $VERSION"
+          sed -i.bak -E "s/^APP_VERSION = \".*\"/APP_VERSION = \"$VERSION\"/" toolbox.py
+          rm -f toolbox.py.bak
+          grep -m1 '^APP_VERSION' toolbox.py
+          echo "BUILD_VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Build with PyInstaller
         run: pyinstaller --noconfirm toolbox.spec
@@ -137,96 +159,187 @@ jobs:
           generate_release_notes: true
 
   sync-to-gitee:
-    name: Sync to Gitee Release
+    name: Publish to Gitee and update version.json
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.ref_name }}
+      GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
     steps:
+      # fetch-depth 0 才能读到 tag 与历史提交，用于自动生成 changelog。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Create Gitee Release and Upload Assets
-        env:
-          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-          GITEE_OWNER: jimmy_hou
-          GITEE_REPO: personal_tool
-          TAG: ${{ github.ref_name }}
+      # 由 tag 自动生成 version.json：版本号取自 tag，下载地址指向该 tag 的
+      # Gitee Release 资源，changelog 优先用附注 tag 的说明，其次用提交记录。
+      - name: Generate version.json
         run: |
-          set -e
-          echo "Creating/updating Gitee Release for tag: $TAG"
-          
-          # Check if release already exists
-          EXISTING=$(curl -s -H "Authorization: token $GITEE_TOKEN" \
-            "https://gitee.com/api/v5/repos/$GITEE_OWNER/$GITEE_REPO/releases/tags/$TAG" | jq -r '.id // empty')
-          
-          if [ -n "$EXISTING" ]; then
-            RELEASE_ID="$EXISTING"
-            echo "Release already exists (ID: $RELEASE_ID), updating..."
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          BASE="https://gitee.com/$GITEE_OWNER/$GITEE_REPO/releases/download/$TAG"
+
+          TAG_TYPE="$(git for-each-ref "refs/tags/$TAG" --format='%(objecttype)')"
+          if [ "$TAG_TYPE" = "tag" ]; then
+            CHANGELOG="$(git for-each-ref "refs/tags/$TAG" --format='%(contents)' | sed '/^[[:space:]]*$/d')"
           else
-            # Create new release
-            JSON_DATA=$(printf '{"tag_name":"%s","name":"%s","body":"Automatically synced from GitHub Actions","target_commitish":"main","prerelease":false}' "$TAG" "$TAG")
-            RESPONSE=$(curl -s -X POST -H "Authorization: token $GITEE_TOKEN" \
-              -H "Content-Type: application/json" \
-              "https://gitee.com/api/v5/repos/$GITEE_OWNER/$GITEE_REPO/releases" \
-              -d "$JSON_DATA")
-            RELEASE_ID=$(echo "$RESPONSE" | jq -r '.id')
-            if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" = "null" ]; then
-              echo "Failed to create release: $RESPONSE"
+            PREV="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+            if [ -n "$PREV" ]; then
+              CHANGELOG="$(git log --no-merges --pretty=format:'- %s' "$PREV..$TAG")"
+            else
+              CHANGELOG="$(git log --no-merges --pretty=format:'- %s' -n 10 "$TAG")"
+            fi
+          fi
+          [ -n "$CHANGELOG" ] || CHANGELOG="版本更新"
+
+          python3 - "$VERSION" "$CHANGELOG" "$BASE" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          version, changelog, base = sys.argv[1], sys.argv[2], sys.argv[3]
+          data = {
+              "version": version,
+              "mac_url": f"{base}/Toolbox-macos.zip",
+              "win_url": f"{base}/Toolbox-windows.zip",
+              "changelog": changelog,
+          }
+          text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+          pathlib.Path("version.json").write_text(text, encoding="utf-8")
+          sys.stdout.write(text)
+          PY
+
+      - name: Create Gitee Release and upload assets
+        run: |
+          set -euo pipefail
+          API="https://gitee.com/api/v5/repos/$GITEE_OWNER/$GITEE_REPO"
+          AUTH_HEADER="Authorization: token $GITEE_TOKEN"
+
+          # 1. 复用或创建 Release
+          RELEASE_ID="$(curl -fsS -H "$AUTH_HEADER" "$API/releases/tags/$TAG" | jq -r '.id // empty' || true)"
+          if [ -z "$RELEASE_ID" ]; then
+            echo "Release $TAG not found, creating..."
+            PAYLOAD="$(jq -n --arg t "$TAG" '{
+              tag_name: $t, name: $t,
+              body: "Automatically synced from GitHub Actions",
+              target_commitish: "main", prerelease: false }')"
+            RESPONSE="$(curl -sS -X POST -H "$AUTH_HEADER" -H "Content-Type: application/json" \
+              -d "$PAYLOAD" "$API/releases")" || true
+            RELEASE_ID="$(echo "$RESPONSE" | jq -r '.id // empty' || true)"
+            if [ -z "$RELEASE_ID" ]; then
+              echo "::error::failed to create Gitee release: $RESPONSE"
               exit 1
             fi
-            echo "Created release ID: $RELEASE_ID"
           fi
-          
-          # Upload macOS artifact with retry
-          MACOS_FILE="artifacts/Toolbox-macos/Toolbox-macos.zip"
-          if [ -f "$MACOS_FILE" ]; then
-            echo "Uploading Toolbox-macos.zip..."
+          echo "Release id: $RELEASE_ID"
+
+          # 2. 逐个上传；失败会显式报错并让 job 失败，不再静默跳过。
+          upload_asset() {
+            local name="$1"
+            local path="artifacts/${name%.zip}/$name"
+            if [ ! -f "$path" ]; then
+              echo "::error::artifact not found: $path"
+              ls -R artifacts
+              return 1
+            fi
+            echo "::group::Upload $name ($(du -h "$path" | cut -f1))"
+
+            # 重跑同一 tag 时，先删掉同名旧附件，否则 Gitee 会报"文件已存在"。
+            local old_ids
+            old_ids="$(curl -fsS -H "$AUTH_HEADER" \
+              "$API/releases/$RELEASE_ID/attach_files?per_page=100" \
+              | jq -r --arg n "$name" '.. | objects | select(.name? == $n) | .id' 2>/dev/null || true)"
+            for id in $old_ids; do
+              echo "Deleting existing attachment $id ($name)"
+              curl -sS -X DELETE -H "$AUTH_HEADER" \
+                "$API/releases/$RELEASE_ID/attach_files/$id" >/dev/null || true
+            done
+
+            local i code body response
             for i in 1 2 3; do
               echo "Attempt $i..."
-              HTTP_CODE=$(curl -s -w "%{http_code}" -X POST -H "Authorization: token $GITEE_TOKEN" \
-                -F "file=@$MACOS_FILE" \
-                --max-time 600 \
-                "https://gitee.com/api/v5/repos/$GITEE_OWNER/$GITEE_REPO/releases/$RELEASE_ID/attach_files")
-              echo "HTTP code: $HTTP_CODE"
-              if [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "200" ]; then
-                echo "Success!"
-                break
+              response="$(curl -sS -w '\n%{http_code}' -X POST \
+                -H "$AUTH_HEADER" \
+                -F "file=@$path" \
+                --connect-timeout 30 --max-time 1800 \
+                "$API/releases/$RELEASE_ID/attach_files")" || true
+              code="$(printf '%s' "$response" | tail -n1)"
+              body="$(printf '%s' "$response" | sed '$d')"
+              echo "HTTP $code: $body"
+              if [ "$code" = "201" ] || [ "$code" = "200" ]; then
+                echo "Uploaded $name"
+                echo "::endgroup::"
+                return 0
               fi
-              echo "Retrying in 10 seconds..."
-              sleep 10
+              echo "Retrying in 15s..."
+              sleep 15
             done
+            echo "::endgroup::"
+            echo "::error::failed to upload $name after retries (Gitee 单附件上限 100MB)"
+            return 1
+          }
+
+          status=0
+          upload_asset Toolbox-macos.zip || status=1
+          upload_asset Toolbox-windows.zip || status=1
+          exit $status
+
+      # 把 version.json 提交到 Gitee 仓库 main 分支 —— 应用正是从这里读取更新信息。
+      - name: Publish version.json to Gitee
+        run: |
+          set -euo pipefail
+          API="https://gitee.com/api/v5/repos/$GITEE_OWNER/$GITEE_REPO"
+          AUTH_HEADER="Authorization: token $GITEE_TOKEN"
+          CONTENT="$(base64 -w0 version.json)"
+          SHA="$(curl -fsS -H "$AUTH_HEADER" "$API/contents/version.json?ref=main" \
+            | jq -r '.sha // empty' || true)"
+          MESSAGE="chore: update version.json for $TAG"
+
+          if [ -n "$SHA" ]; then
+            PAYLOAD="$(jq -n --arg c "$CONTENT" --arg s "$SHA" --arg m "$MESSAGE" \
+              '{content: $c, sha: $s, message: $m, branch: "main"}')"
+            METHOD="PUT"
           else
-            echo "Warning: $MACOS_FILE not found"
+            PAYLOAD="$(jq -n --arg c "$CONTENT" --arg m "$MESSAGE" \
+              '{content: $c, message: $m, branch: "main"}')"
+            METHOD="POST"
           fi
-          
-          # Upload Windows artifact with retry
-          WIN_FILE="artifacts/Toolbox-windows/Toolbox-windows.zip"
-          if [ -f "$WIN_FILE" ]; then
-            echo "Uploading Toolbox-windows.zip..."
-            for i in 1 2 3; do
-              echo "Attempt $i..."
-              HTTP_CODE=$(curl -s -w "%{http_code}" -X POST -H "Authorization: token $GITEE_TOKEN" \
-                -F "file=@$WIN_FILE" \
-                --max-time 600 \
-                "https://gitee.com/api/v5/repos/$GITEE_OWNER/$GITEE_REPO/releases/$RELEASE_ID/attach_files")
-              echo "HTTP code: $HTTP_CODE"
-              if [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "200" ]; then
-                echo "Success!"
-                break
-              fi
-              echo "Retrying in 10 seconds..."
-              sleep 10
-            done
-          else
-            echo "Warning: $WIN_FILE not found"
-          fi
-          
-          echo "Gitee Release sync complete!"
+
+          curl -fsS -X "$METHOD" -H "$AUTH_HEADER" -H "Content-Type: application/json" \
+            -d "$PAYLOAD" "$API/contents/version.json" >/dev/null
+          echo "version.json published to Gitee ($TAG)"
+
+      # 顺手把仓库里的 version.json 也同步一份，避免两边对不上。
+      # 加 [skip ci] 防止这次提交再触发一轮构建。
+      - name: Publish version.json to GitHub
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          API="https://api.github.com/repos/${{ github.repository }}/contents/version.json"
+          CONTENT="$(base64 -w0 version.json)"
+          SHA="$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "$API?ref=main" | jq -r '.sha // empty' || true)"
+
+          PAYLOAD="$(jq -n --arg c "$CONTENT" --arg s "$SHA" \
+            --arg m "chore: update version.json for $TAG [skip ci]" \
+            '{message: $m, content: $c, sha: $s, branch: "main"}')"
+
+          curl -fsS -X PUT -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" -H "Content-Type: application/json" \
+            -d "$PAYLOAD" "$API" >/dev/null
+          echo "version.json published to GitHub ($TAG)"
 
 # Signing setup (one-time, done in the GitHub UI):
 #   Secret   SIGNPATH_API_TOKEN            API token created in SignPath
+#   Secret   GITEE_TOKEN                   Gitee 私人令牌（勾选 projects 权限）
 #   Variable SIGNPATH_ORGANIZATION_ID      SignPath organization id
 #   Variable SIGNPATH_PROJECT_SLUG         e.g. personal-tool
 #   Variable SIGNPATH_SIGNING_POLICY_SLUG  e.g. release-signing

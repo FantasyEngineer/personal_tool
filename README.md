@@ -89,13 +89,23 @@ pyinstaller --noconfirm toolbox.spec
 
 也可以直接运行 `./build_local.sh`，它会创建虚拟环境、安装依赖并打包当前平台。
 
-## 持续集成
+## 发版
+
+版本号以 git tag 为唯一来源，只需打标签推送，无需手动下载/上传安装包：
+
+```bash
+git tag v1.0.11 && git push origin v1.0.11
+```
 
 [`.github/workflows/build.yml`](.github/workflows/build.yml) 在 macOS 和 Windows 原生 runner 上分别构建：
 
-- 推送到 `main`：构建并上传构建产物（artifact）
-- 推送 `v*` 标签：额外发布 GitHub Release
+- 推送到 `main`：只构建并上传构建产物（artifact），不发版
+- 推送 `v*` 标签：把 tag 版本号注入应用 → 构建 → 发布 GitHub Release → 上传安装包到 Gitee Release → 自动生成 `version.json` 并提交到 Gitee 仓库 `main` 分支，应用随即能检测到更新
+- `version.json` 的 `changelog` 优先取附注 tag 的说明（`git tag -a`），否则自动汇总上一个 tag 到本次的提交记录
 - Windows 发布物通过 [SignPath](https://signpath.org/) 签名（需在仓库 Secrets 中配置 `SIGNPATH_API_TOKEN`，Variables 中配置组织/项目/策略；未配置时自动跳过）
+- Gitee 同步需要仓库 Secret `GITEE_TOKEN`（Gitee 私人令牌，勾选 `projects` 权限）
+
+注意：Gitee 单个附件上限 100MB，打包产物超过时需先精简依赖再发版。
 
 ## 项目结构
 

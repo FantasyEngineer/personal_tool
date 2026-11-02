@@ -173,6 +173,7 @@ jobs:
                 \"tag_name\": \"$TAG\",
                 \"name\": \"$TAG\",
                 \"body\": \"Automatically synced from GitHub Actions\",
+                \"target_commitish\": \"main\",
                 \"prerelease\": false
               }")
             RELEASE_ID=$(echo "$RESPONSE" | jq -r '.id')

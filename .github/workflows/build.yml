@@ -179,33 +179,35 @@ jobs:
             echo "Created release ID: $RELEASE_ID"
           fi
           
-          # Upload each artifact separately with error handling
-          echo "Listing files to upload:"
-          find artifacts -type f -ls
+          # List downloaded files for debugging
+          echo "Downloaded artifacts:"
+          find artifacts -type f -exec ls -lh {} \;
           
-          for file in artifacts/*/*; do
-            if [ -f "$file" ]; then
-              FILENAME=$(basename "$file")
-              FILESIZE=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null)
-              echo "=========================================="
-              echo "Uploading $FILENAME ($FILESIZE bytes)..."
-              echo "=========================================="
-              
-              HTTP_CODE=$(curl -s -w "%{http_code}" -X POST \
-                -H "Authorization: token $GITEE_TOKEN" \
-                -F "file=@$file" \
-                --max-time 300 \
-                "https://gitee.com/api/v5/repos/$GITEE_OWNER/$GITEE_REPO/releases/$RELEASE_ID/attach_files")
-              
-              echo "Upload response code: $HTTP_CODE"
-              if [ "$HTTP_CODE" != "201" ] && [ "$HTTP_CODE" != "200" ]; then
-                echo "Warning: Upload may have failed for $FILENAME (HTTP $HTTP_CODE)"
-              else
-                echo "Successfully uploaded $FILENAME"
-              fi
-              echo ""
-            fi
-          done
+          # Upload macOS artifact
+          MACOS_FILE="artifacts/Toolbox-macos/Toolbox-macos.zip"
+          if [ -f "$MACOS_FILE" ]; then
+            echo "Uploading Toolbox-macos.zip..."
+            curl -i -X POST -H "Authorization: token $GITEE_TOKEN" \
+              -F "file=@$MACOS_FILE" \
+              --max-time 300 \
+              "https://gitee.com/api/v5/repos/$GITEE_OWNER/$GITEE_REPO/releases/$RELEASE_ID/attach_files"
+            echo ""
+          else
+            echo "Warning: $MACOS_FILE not found"
+          fi
+          
+          # Upload Windows artifact
+          WIN_FILE="artifacts/Toolbox-windows/Toolbox-windows.exe"
+          if [ -f "$WIN_FILE" ]; then
+            echo "Uploading Toolbox-windows.exe..."
+            curl -i -X POST -H "Authorization: token $GITEE_TOKEN" \
+              -F "file=@$WIN_FILE" \
+              --max-time 300 \
+              "https://gitee.com/api/v5/repos/$GITEE_OWNER/$GITEE_REPO/releases/$RELEASE_ID/attach_files"
+            echo ""
+          else
+            echo "Warning: $WIN_FILE not found"
+          fi
           
           echo "Gitee Release sync complete!"
 

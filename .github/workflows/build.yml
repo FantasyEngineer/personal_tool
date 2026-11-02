@@ -136,6 +136,67 @@ jobs:
             ${{ matrix.asset_name }}
           generate_release_notes: true
 
+  sync-to-gitee:
+    name: Sync to Gitee Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Gitee Release and Upload Assets
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_OWNER: jimmy_hou
+          GITEE_REPO: personal_tool
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -e
+          echo "Creating/updating Gitee Release for tag: $TAG"
+          
+          # Check if release already exists
+          EXISTING=$(curl -s -H "Authorization: token $GITEE_TOKEN" \
+            "https://gitee.com/api/v5/repos/$GITEE_OWNER/$GITEE_REPO/releases/tags/$TAG" | jq -r '.id // empty')
+          
+          if [ -n "$EXISTING" ]; then
+            RELEASE_ID="$EXISTING"
+            echo "Release already exists (ID: $RELEASE_ID), updating..."
+          else
+            # Create new release
+            RESPONSE=$(curl -s -X POST -H "Authorization: token $GITEE_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://gitee.com/api/v5/repos/$GITEE_OWNER/$GITEE_REPO/releases" \
+              -d "{
+                \"tag_name\": \"$TAG\",
+                \"name\": \"$TAG\",
+                \"body\": \"Automatically synced from GitHub Actions\",
+                \"prerelease\": false
+              }")
+            RELEASE_ID=$(echo "$RESPONSE" | jq -r '.id')
+            if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" = "null" ]; then
+              echo "Failed to create release: $RESPONSE"
+              exit 1
+            fi
+            echo "Created release ID: $RELEASE_ID"
+          fi
+          
+          # Upload each artifact
+          for file in artifacts/*/*; do
+            if [ -f "$file" ]; then
+              FILENAME=$(basename "$file")
+              echo "Uploading $FILENAME..."
+              curl -s -X POST -H "Authorization: token $GITEE_TOKEN" \
+                -F "file=@$file" \
+                "https://gitee.com/api/v5/repos/$GITEE_OWNER/$GITEE_REPO/releases/$RELEASE_ID/attach_files"
+              echo ""
+            fi
+          done
+          
+          echo "Gitee Release sync complete!"
+
 # Signing setup (one-time, done in the GitHub UI):
 #   Secret   SIGNPATH_API_TOKEN            API token created in SignPath
 #   Variable SIGNPATH_ORGANIZATION_ID      SignPath organization id

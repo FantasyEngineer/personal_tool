@@ -179,14 +179,30 @@ jobs:
             echo "Created release ID: $RELEASE_ID"
           fi
           
-          # Upload each artifact
+          # Upload each artifact separately with error handling
+          echo "Listing files to upload:"
+          find artifacts -type f -ls
+          
           for file in artifacts/*/*; do
             if [ -f "$file" ]; then
               FILENAME=$(basename "$file")
-              echo "Uploading $FILENAME..."
-              curl -s -X POST -H "Authorization: token $GITEE_TOKEN" \
+              FILESIZE=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null)
+              echo "=========================================="
+              echo "Uploading $FILENAME ($FILESIZE bytes)..."
+              echo "=========================================="
+              
+              HTTP_CODE=$(curl -s -w "%{http_code}" -X POST \
+                -H "Authorization: token $GITEE_TOKEN" \
                 -F "file=@$file" \
-                "https://gitee.com/api/v5/repos/$GITEE_OWNER/$GITEE_REPO/releases/$RELEASE_ID/attach_files"
+                --max-time 300 \
+                "https://gitee.com/api/v5/repos/$GITEE_OWNER/$GITEE_REPO/releases/$RELEASE_ID/attach_files")
+              
+              echo "Upload response code: $HTTP_CODE"
+              if [ "$HTTP_CODE" != "201" ] && [ "$HTTP_CODE" != "200" ]; then
+                echo "Warning: Upload may have failed for $FILENAME (HTTP $HTTP_CODE)"
+              else
+                echo "Successfully uploaded $FILENAME"
+              fi
               echo ""
             fi
           done

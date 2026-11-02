@@ -119,7 +119,7 @@ jobs:
           $src = if ($signed) { $signed.FullName } else { 'dist/Toolbox.exe' }
           if (-not (Test-Path $src)) { Write-Error "no Toolbox.exe to package"; exit 1 }
           Write-Host "Packaging $src"
-          Compress-Archive -Path $src -DestinationPath ${{ matrix.asset_name }}.zip
+          Compress-Archive -Path $src -DestinationPath ${{ matrix.asset_name }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

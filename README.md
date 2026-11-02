@@ -100,12 +100,21 @@ git tag v1.0.11 && git push origin v1.0.11
 [`.github/workflows/build.yml`](.github/workflows/build.yml) 在 macOS 和 Windows 原生 runner 上分别构建：
 
 - 推送到 `main`：只构建并上传构建产物（artifact），不发版
-- 推送 `v*` 标签：把 tag 版本号注入应用 → 构建 → 发布 GitHub Release → 上传安装包到 Gitee Release → 自动生成 `version.json` 并提交到 Gitee 仓库 `main` 分支，应用随即能检测到更新
+- 推送 `v*` 标签：把 tag 版本号注入应用 → 构建 → 发布 GitHub Release → 上传安装包到 Cloudflare R2 → 自动生成 `version.json` 并提交到 Gitee/GitHub 仓库 `main` 分支，应用随即能检测到更新
+- 安装包按版本存放（`releases/<tag>/Toolbox-macos.zip`、`releases/<tag>/Toolbox-windows.zip`），历史版本的下载链接不会失效
 - `version.json` 的 `changelog` 优先取附注 tag 的说明（`git tag -a`），否则自动汇总上一个 tag 到本次的提交记录
 - Windows 发布物通过 [SignPath](https://signpath.org/) 签名（需在仓库 Secrets 中配置 `SIGNPATH_API_TOKEN`，Variables 中配置组织/项目/策略；未配置时自动跳过）
-- Gitee 同步需要仓库 Secret `GITEE_TOKEN`（Gitee 私人令牌，勾选 `projects` 权限）
 
-注意：Gitee 单个附件上限 100MB，打包产物超过时需先精简依赖再发版。
+发版依赖以下仓库 Secrets：
+
+| Secret | 说明 |
+| --- | --- |
+| `R2_ACCOUNT_ID` | Cloudflare 账户 ID |
+| `R2_ACCESS_KEY_ID` | R2 API Token 的 Access Key ID |
+| `R2_SECRET_ACCESS_KEY` | R2 API Token 的 Secret Access Key |
+| `R2_BUCKET` | 存放安装包的桶名 |
+| `R2_PUBLIC_BASE_URL` | 桶绑定的公开访问域名，如 `https://dl.example.com` |
+| `GITEE_TOKEN` | Gitee 私人令牌（勾选 `projects` 权限），仅用于回写 `version.json` |
 
 ## 项目结构
 

@@ -2,8 +2,8 @@ name: build
 
 # Builds a macOS .app and a Windows .exe with PyInstaller on native runners.
 # - Push to `main` (or manual run): produces downloadable artifacts.
-# - Push a tag like `v1.0.0`: additionally publishes a GitHub Release, mirrors
-#   the installers to a Gitee Release and rewrites version.json, so the running
+# - Push a tag like `v1.0.0`: additionally publishes a GitHub Release, uploads
+#   the installers to Cloudflare R2 and rewrites version.json, so the running
 #   app can detect the update with no manual download/upload step.
 # - Windows releases are code-signed through SignPath when the credentials
 #   below are configured (see "Signing setup" at the end of this file).
@@ -158,14 +158,15 @@ jobs:
             ${{ matrix.asset_name }}
           generate_release_notes: true
 
-  sync-to-gitee:
-    name: Publish to Gitee and update version.json
+  publish:
+    name: Upload to R2 and update version.json
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     env:
       TAG: ${{ github.ref_name }}
       GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+      R2_PUBLIC_BASE_URL: ${{ secrets.R2_PUBLIC_BASE_URL }}
     steps:
       # fetch-depth 0 才能读到 tag 与历史提交，用于自动生成 changelog。
       - uses: actions/checkout@v4
@@ -177,13 +178,13 @@ jobs:
         with:
           path: artifacts
 
-      # 由 tag 自动生成 version.json：版本号取自 tag，下载地址指向该 tag 的
-      # Gitee Release 资源，changelog 优先用附注 tag 的说明，其次用提交记录。
+      # 由 tag 自动生成 version.json：版本号取自 tag，下载地址指向该 tag 在 R2 上的
+      # 安装包，changelog 优先用附注 tag 的说明，其次用提交记录。
       - name: Generate version.json
         run: |
           set -euo pipefail
           VERSION="${TAG#v}"
-          BASE="https://gitee.com/$GITEE_OWNER/$GITEE_REPO/releases/download/$TAG"
+          BASE="${R2_PUBLIC_BASE_URL%/}/releases/$TAG"
 
           TAG_TYPE="$(git for-each-ref "refs/tags/$TAG" --format='%(objecttype)')"
           if [ "$TAG_TYPE" = "tag" ]; then
@@ -215,31 +216,20 @@ jobs:
           sys.stdout.write(text)
           PY
 
-      - name: Create Gitee Release and upload assets
+      # 安装包上传到 Cloudflare R2（S3 兼容）。GitHub 海外 runner 直传 Gitee 的
+      # 大文件链路会被限速甚至挂死，走 R2 后不再依赖跨境上传。
+      # 对象路径带版本目录，历史版本的旧链接不会失效。
+      - name: Upload installers to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
           set -euo pipefail
-          API="https://gitee.com/api/v5/repos/$GITEE_OWNER/$GITEE_REPO"
-          AUTH_HEADER="Authorization: token $GITEE_TOKEN"
+          ENDPOINT="https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com"
 
-          # 1. 复用或创建 Release
-          RELEASE_ID="$(curl -fsS -H "$AUTH_HEADER" "$API/releases/tags/$TAG" | jq -r '.id // empty' || true)"
-          if [ -z "$RELEASE_ID" ]; then
-            echo "Release $TAG not found, creating..."
-            PAYLOAD="$(jq -n --arg t "$TAG" '{
-              tag_name: $t, name: $t,
-              body: "Automatically synced from GitHub Actions",
-              target_commitish: "main", prerelease: false }')"
-            RESPONSE="$(curl -sS -X POST -H "$AUTH_HEADER" -H "Content-Type: application/json" \
-              -d "$PAYLOAD" "$API/releases")" || true
-            RELEASE_ID="$(echo "$RESPONSE" | jq -r '.id // empty' || true)"
-            if [ -z "$RELEASE_ID" ]; then
-              echo "::error::failed to create Gitee release: $RESPONSE"
-              exit 1
-            fi
-          fi
-          echo "Release id: $RELEASE_ID"
-
-          # 2. 逐个上传；失败会显式报错并让 job 失败，不再静默跳过。
           upload_asset() {
             local name="$1"
             local path="artifacts/${name%.zip}/$name"
@@ -249,40 +239,11 @@ jobs:
               return 1
             fi
             echo "::group::Upload $name ($(du -h "$path" | cut -f1))"
-
-            # 重跑同一 tag 时，先删掉同名旧附件，否则 Gitee 会报"文件已存在"。
-            local old_ids
-            old_ids="$(curl -fsS -H "$AUTH_HEADER" \
-              "$API/releases/$RELEASE_ID/attach_files?per_page=100" \
-              | jq -r --arg n "$name" '.. | objects | select(.name? == $n) | .id' 2>/dev/null || true)"
-            for id in $old_ids; do
-              echo "Deleting existing attachment $id ($name)"
-              curl -sS -X DELETE -H "$AUTH_HEADER" \
-                "$API/releases/$RELEASE_ID/attach_files/$id" >/dev/null || true
-            done
-
-            local i code body response
-            for i in 1 2 3; do
-              echo "Attempt $i..."
-              response="$(curl -sS -w '\n%{http_code}' -X POST \
-                -H "$AUTH_HEADER" \
-                -F "file=@$path" \
-                --connect-timeout 30 --max-time 1800 \
-                "$API/releases/$RELEASE_ID/attach_files")" || true
-              code="$(printf '%s' "$response" | tail -n1)"
-              body="$(printf '%s' "$response" | sed '$d')"
-              echo "HTTP $code: $body"
-              if [ "$code" = "201" ] || [ "$code" = "200" ]; then
-                echo "Uploaded $name"
-                echo "::endgroup::"
-                return 0
-              fi
-              echo "Retrying in 15s..."
-              sleep 15
-            done
+            aws s3 cp "$path" "s3://$R2_BUCKET/releases/$TAG/$name" \
+              --endpoint-url "$ENDPOINT" \
+              --content-type application/zip \
+              --cache-control "public, max-age=31536000, immutable"
             echo "::endgroup::"
-            echo "::error::failed to upload $name after retries (Gitee 单附件上限 100MB)"
-            return 1
           }
 
           status=0
@@ -337,9 +298,14 @@ jobs:
             -d "$PAYLOAD" "$API" >/dev/null
           echo "version.json published to GitHub ($TAG)"
 
-# Signing setup (one-time, done in the GitHub UI):
+# Setup (one-time, done in the GitHub UI):
 #   Secret   SIGNPATH_API_TOKEN            API token created in SignPath
-#   Secret   GITEE_TOKEN                   Gitee 私人令牌（勾选 projects 权限）
+#   Secret   GITEE_TOKEN                   Gitee 私人令牌（勾选 projects 权限，仅用于回写 version.json）
+#   Secret   R2_ACCOUNT_ID                 Cloudflare 账户 ID
+#   Secret   R2_ACCESS_KEY_ID              R2 API Token 的 Access Key ID
+#   Secret   R2_SECRET_ACCESS_KEY          R2 API Token 的 Secret Access Key
+#   Secret   R2_BUCKET                     存放安装包的桶名
+#   Secret   R2_PUBLIC_BASE_URL            桶绑定的公开访问域名，如 https://dl.example.com
 #   Variable SIGNPATH_ORGANIZATION_ID      SignPath organization id
 #   Variable SIGNPATH_PROJECT_SLUG         e.g. personal-tool
 #   Variable SIGNPATH_SIGNING_POLICY_SLUG  e.g. release-signing

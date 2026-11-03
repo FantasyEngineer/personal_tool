@@ -1,6 +1,6 @@
 {
-  "version": "1.0.14",
-  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.14/Toolbox-macos.zip",
-  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.14/Toolbox-windows.zip",
-  "changelog": "- 更新走后台线程并优化界面与托盘\n- chore: update version.json for v1.0.13 [skip ci]\n- chore: update version.json for v1.0.13"
+  "version": "1.0.16",
+  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.16/Toolbox-macos.zip",
+  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.16/Toolbox-windows.zip",
+  "changelog": "- 更新下载改用系统浏览器,发布后自动清理 R2 旧版本\n- chore: update version.json for v1.0.14"
 }

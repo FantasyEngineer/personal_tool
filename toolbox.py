@@ -48,7 +48,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QProgressDialog, QSystemTrayIcon, QMenu, QAction,
                               QTreeWidget, QTreeWidgetItem, QHeaderView,
                               QStyledItemDelegate, QStyle, QGraphicsOpacityEffect)
-from PyQt5.QtCore import Qt, QPoint, QPointF, QRectF, QThread, pyqtSignal, QTimer, QUrl
+from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QThread, pyqtSignal, QTimer, QUrl
 from PyQt5.QtGui import (QFont, QCursor, QColor, QPen, QPixmap, QPainter, QIcon,
                          QImage, QLinearGradient, QBrush, QDesktopServices)
 
@@ -1336,9 +1336,10 @@ class MarkupWindow(TabbedToolWindow):
 
 class GeneratorWindow(TabbedToolWindow):
     def __init__(self):
-        super().__init__("UUID/二维码", (
-            (UuidWindow, "UUID"),
+        super().__init__("二维码/条形码/UUID", (
             (QrCodeWindow, "二维码"),
+            (BarcodeWindow, "条形码"),
+            (UuidWindow, "UUID"),
         ))
 
 
@@ -4659,7 +4660,7 @@ class QrCodeWindow(QMainWindow):
 
         self.text_input = QPlainTextEdit()
         self.text_input.setFixedHeight(90)
-        self.text_input.setPlaceholderText("输入文字或链接，实时生成二维码")
+        self.text_input.setPlaceholderText("输入文字或链接，点击“生成”输出二维码")
         self.text_input.setStyleSheet("""
             QPlainTextEdit { border: 1px solid #D0D0D0; border-radius: 4px; padding: 8px;
                 font-family: "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13px; }
@@ -4676,6 +4677,16 @@ class QrCodeWindow(QMainWindow):
         """)
         gen_btn.clicked.connect(self.do_generate)
         btn_layout.addWidget(gen_btn)
+
+        paste_btn = QPushButton("粘贴")
+        paste_btn.setFixedSize(90, 30)
+        paste_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        paste_btn.setStyleSheet("""
+            QPushButton { color: #333333; background: #F0F0F0; border: 1px solid #D0D0D0; border-radius: 4px; font-size: 12px; }
+            QPushButton:hover { background: #E4E4E4; }
+        """)
+        paste_btn.clicked.connect(self.do_paste)
+        btn_layout.addWidget(paste_btn)
 
         save_btn = QPushButton("保存图片")
         save_btn.setFixedSize(90, 30)
@@ -4697,6 +4708,12 @@ class QrCodeWindow(QMainWindow):
         layout.addWidget(self.qr_label, 1)
 
         self._current_img = None
+
+    def do_paste(self):
+        text = QApplication.clipboard().text().strip()
+        if text:
+            self.text_input.setPlainText(text)
+        self.text_input.setFocus()
 
     def do_generate(self):
         text = self.text_input.toPlainText().strip()
@@ -4729,6 +4746,192 @@ class QrCodeWindow(QMainWindow):
         if path:
             try:
                 self._current_img.save(path)
+                QMessageBox.information(self, "提示", "已保存", QMessageBox.Ok)
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"保存失败: {e}", QMessageBox.Ok)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+
+
+# Code 128 条形码，自实现（不引入条码库）。表按 symbol 值索引：0..105 是六位
+# “条-空”宽度（每位和=11 模块），106 是结束符（七位，和=13）。错位不会报错，
+# 只会生成扫不出来的码，改动后需按值校验。
+_CODE128_PATTERNS = [
+    "212222", "222122", "222221", "121223", "121322", "131222", "122213", "122312",
+    "132212", "221213", "221312", "231212", "112232", "122132", "122231", "113222",
+    "123122", "123221", "223211", "221132", "221231", "213212", "223112", "312131",
+    "311222", "321122", "321221", "312212", "322112", "322211", "212123", "212321",
+    "232121", "111323", "131123", "131321", "112313", "132113", "132311", "211313",
+    "231113", "231311", "112133", "112331", "132131", "113123", "113321", "133121",
+    "313121", "211331", "231131", "213113", "213311", "213131", "311123", "311321",
+    "331121", "312113", "312311", "332111", "314111", "221411", "431111", "111224",
+    "111422", "121124", "121421", "141122", "141221", "112214", "112412", "122114",
+    "122411", "142112", "142211", "241211", "221114", "413111", "241112", "134111",
+    "111242", "121142", "121241", "114212", "124112", "124211", "411212", "421112",
+    "421211", "212141", "214121", "412121", "111143", "111341", "131141", "114113",
+    "114311", "411113", "411311", "113141", "114131", "311141", "411131", "211412",
+    "211214", "211232",
+]
+_CODE128_STOP = "2331112"
+_CODE128_START_B = 104   # Code Set B：可打印 ASCII 32..126
+_CODE128_QUIET = 10       # 左右静默区（模块数）
+
+
+def _code128_values(text):
+    """按 Code Set B 把文本编码为 symbol 值序列（含起始符与校验位）。"""
+    values = [_CODE128_START_B]
+    for ch in text:
+        o = ord(ch)
+        if o < 32 or o > 126:
+            raise ValueError(f"仅支持可打印 ASCII（空格 至 ~），不支持中文等字符：{ch!r}")
+        values.append(o - 32)
+    checksum = values[0] + sum(i * v for i, v in enumerate(values[1:], 1))
+    values.append(checksum % 103)
+    return values
+
+
+def _code128_widths(text):
+    """返回交替的条/空宽度序列（首个为条），供逐段绘制。"""
+    widths = []
+    for v in _code128_values(text):
+        widths.extend(int(d) for d in _CODE128_PATTERNS[v])
+    widths.extend(int(d) for d in _CODE128_STOP)
+    return widths
+
+
+def render_code128(text, module=3, height=130):
+    """用 QPainter 绘制 Code 128 位图（含底部可读文字），返回 QPixmap 原始分辨率。"""
+    widths = _code128_widths(text)
+    total_modules = sum(widths) + 2 * _CODE128_QUIET
+    pm_w = total_modules * module
+    img = QImage(pm_w, height + 24, QImage.Format_RGB32)
+    painter = QPainter(img)
+    painter.fillRect(0, 0, pm_w, height + 24, Qt.white)
+    painter.setPen(Qt.NoPen)
+    bar = QColor(0, 0, 0)
+    x = _CODE128_QUIET * module
+    black = True
+    for w in widths:
+        if black:
+            painter.fillRect(QRect(x, 0, w * module, height), bar)
+        x += w * module
+        black = not black
+    font = QFont("Menlo")
+    font.setPixelSize(16)
+    painter.setFont(font)
+    painter.setPen(QColor(0, 0, 0))
+    painter.drawText(QRect(0, height, pm_w, 24), Qt.AlignCenter, text)
+    painter.end()
+    return QPixmap.fromImage(img)
+
+
+class BarcodeWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("条形码生成")
+        self.setGeometry(*tool_win_geometry())
+        self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
+        self.init_ui()
+
+    def init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(15, 15, 15, 10)
+        layout.setSpacing(10)
+
+        input_label = QLabel("内容")
+        input_label.setFont(QFont("PingFang SC", 12, QFont.Bold))
+        input_label.setStyleSheet("color: #333333;")
+        layout.addWidget(input_label)
+
+        self.text_input = QPlainTextEdit()
+        self.text_input.setFixedHeight(90)
+        self.text_input.setPlaceholderText("输入文字/链接（Code 128，可打印 ASCII）")
+        self.text_input.setStyleSheet("""
+            QPlainTextEdit { border: 1px solid #D0D0D0; border-radius: 4px; padding: 8px;
+                font-family: "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13px; }
+        """)
+        layout.addWidget(self.text_input)
+
+        btn_layout = QHBoxLayout()
+        gen_btn = QPushButton("生成")
+        gen_btn.setFixedSize(90, 30)
+        gen_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        gen_btn.setStyleSheet("""
+            QPushButton { color: #FFFFFF; background: #1A73E8; border: none; border-radius: 4px; font-size: 12px; }
+            QPushButton:hover { background: #1557B0; }
+        """)
+        gen_btn.clicked.connect(self.do_generate)
+        btn_layout.addWidget(gen_btn)
+
+        paste_btn = QPushButton("粘贴")
+        paste_btn.setFixedSize(90, 30)
+        paste_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        paste_btn.setStyleSheet("""
+            QPushButton { color: #333333; background: #F0F0F0; border: 1px solid #D0D0D0; border-radius: 4px; font-size: 12px; }
+            QPushButton:hover { background: #E4E4E4; }
+        """)
+        paste_btn.clicked.connect(self.do_paste)
+        btn_layout.addWidget(paste_btn)
+
+        save_btn = QPushButton("保存图片")
+        save_btn.setFixedSize(90, 30)
+        save_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        save_btn.setStyleSheet("""
+            QPushButton { color: #1A73E8; background: #FFFFFF; border: 1px solid #1A73E8; border-radius: 4px; font-size: 12px; }
+            QPushButton:hover { background: #F0F6FF; }
+        """)
+        save_btn.clicked.connect(self.save_image)
+        btn_layout.addWidget(save_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        self.bar_label = QLabel()
+        self.bar_label.setAlignment(Qt.AlignCenter)
+        self.bar_label.setMinimumHeight(240)
+        self.bar_label.setStyleSheet("color: #999999; font-size: 13px;")
+        self.bar_label.setText("请输入内容")
+        layout.addWidget(self.bar_label, 1)
+
+        self._current_pix = None
+
+    def do_paste(self):
+        text = QApplication.clipboard().text().strip()
+        if text:
+            self.text_input.setPlainText(text)
+        self.text_input.setFocus()
+
+    def do_generate(self):
+        text = self.text_input.toPlainText().strip()
+        if not text:
+            self.bar_label.setText("请输入内容")
+            self._current_pix = None
+            return
+        try:
+            pix = render_code128(text)
+        except ValueError as e:
+            self.bar_label.setText(str(e))
+            self._current_pix = None
+            return
+        self._current_pix = pix
+        avail_w = self.bar_label.width() or 600
+        avail_h = self.bar_label.height() or 240
+        scaled = pix.scaled(max(1, avail_w - 8), max(1, avail_h - 8),
+                           Qt.KeepAspectRatio, Qt.FastTransformation)
+        self.bar_label.setPixmap(scaled)
+
+    def save_image(self):
+        if self._current_pix is None:
+            QMessageBox.warning(self, "提示", "请先生成条形码", QMessageBox.Ok)
+            return
+        from PyQt5.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getSaveFileName(self, "保存条形码", "barcode.png", "PNG 图片 (*.png)")
+        if path:
+            try:
+                self._current_pix.save(path, "PNG")
                 QMessageBox.information(self, "提示", "已保存", QMessageBox.Ok)
             except Exception as e:
                 QMessageBox.warning(self, "错误", f"保存失败: {e}", QMessageBox.Ok)
@@ -8666,7 +8869,7 @@ TOOL_TIPS = {
     "编解码": "页签：Base64 / URL / Unicode 转义",
     "加解密": "页签：JWT / AES / RSA / HMAC / 口令哈希 / 随机密钥",
     "正则测试": "功能：常用正则预设 · 实时匹配与高亮",
-    "UUID/二维码": "页签：UUID / 二维码",
+    "二维码/条形码/UUID": "页签：二维码 / 条形码 / UUID",
     "格式转换": "页签：颜色 / 时间戳 / JSON-YAML",
     "文本统计": "功能：字符数 / 行数 / 词数 / 字节数 / 中文字数",
     "文本对比": "功能：逐行 diff · 忽略空白 / 大小写 · 只看差异 · 复制 diff",
@@ -8689,7 +8892,7 @@ TOOL_TIPS = {
 class ToolboxWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("系统工具箱")
+        self.setWindowTitle(f"系统工具箱 v{APP_VERSION}")
         screen = QApplication.primaryScreen().availableGeometry()
         w, h = 700, min(500, screen.height() - 40)
         self.setGeometry(screen.x() + (screen.width() - w) // 2,
@@ -8760,7 +8963,7 @@ class ToolboxWindow(QMainWindow):
 
         section3 = self.create_section("文本处理", [
             "JSON/XML", "编解码", "加解密",
-            "正则测试", "UUID/二维码",
+            "正则测试", "二维码/条形码/UUID",
             "格式转换", "文本统计", "文本对比", "Cron 表达式", "哈希计算"
         ], {
             "JSON/XML": self.show_markup,
@@ -8769,7 +8972,7 @@ class ToolboxWindow(QMainWindow):
             "加解密": self.show_crypto,
             "正则测试": self.show_regex,
             "文本对比": self.show_diff,
-            "UUID/二维码": self.show_generator,
+            "二维码/条形码/UUID": self.show_generator,
             "格式转换": self.show_convert,
             "文本统计": self.show_textstat,
             "Cron 表达式": self.show_cron

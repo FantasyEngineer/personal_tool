@@ -48,9 +48,9 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QProgressDialog, QSystemTrayIcon, QMenu, QAction,
                               QTreeWidget, QTreeWidgetItem, QHeaderView,
                               QStyledItemDelegate, QStyle, QGraphicsOpacityEffect)
-from PyQt5.QtCore import Qt, QPoint, QPointF, QRectF, QThread, pyqtSignal, QTimer
+from PyQt5.QtCore import Qt, QPoint, QPointF, QRectF, QThread, pyqtSignal, QTimer, QUrl
 from PyQt5.QtGui import (QFont, QCursor, QColor, QPen, QPixmap, QPainter, QIcon,
-                         QImage, QLinearGradient, QBrush)
+                         QImage, QLinearGradient, QBrush, QDesktopServices)
 
 
 APP_VERSION = "1.0.14"
@@ -9288,7 +9288,7 @@ class ToolboxWindow(QMainWindow):
             QMessageBox.information(self, "检查更新", f"当前已是最新版本 v{APP_VERSION}", QMessageBox.Ok)
             return
         
-        msg = f"发现新版本 v{remote_version}\n\n更新内容：\n{changelog}\n\n是否下载？"
+        msg = f"发现新版本 v{remote_version}\n\n更新内容：\n{changelog}\n\n是否用浏览器打开下载？"
         reply = QMessageBox.question(self, "检查更新", msg, QMessageBox.Yes | QMessageBox.No)
         
         if reply == QMessageBox.Yes:
@@ -9304,48 +9304,27 @@ class ToolboxWindow(QMainWindow):
             return False
 
     def _download_update(self, data):
-        """下载更新包到 ~/Downloads/"""
+        """用系统浏览器打开 R2 安装包地址下载。
+        浏览器自带正常 UA、可走系统代理，避免应用内直连 r2.dev 被 403 拦截。"""
         system = platform.system()
         if system == "Darwin":
             url = data.get('mac_url', '')
-            filename = f"Toolbox-v{data['version']}-mac.zip"
         elif system == "Windows":
             url = data.get('win_url', '')
-            filename = f"Toolbox-v{data['version']}-win.zip"
         else:
             QMessageBox.warning(self, "下载更新", "不支持的平台", QMessageBox.Ok)
             return
-        
+
         if not url:
             QMessageBox.warning(self, "下载更新", "未找到对应平台的下载链接", QMessageBox.Ok)
             return
-        
-        download_dir = os.path.expanduser("~/Downloads")
-        os.makedirs(download_dir, exist_ok=True)
-        filepath = os.path.join(download_dir, filename)
-        
-        # 禁用按钮，显示下载中
-        self.update_btn.setEnabled(False)
-        self.update_btn.setText("下载中...")
-        
-        # 启动后台下载线程
-        self.download_thread = DownloadThread(url, filepath)
-        self.download_thread.progress.connect(self._on_download_progress)
-        self.download_thread.finished.connect(self._on_download_finished)
-        self.download_thread.start()
-    
-    def _on_download_progress(self, percent):
-        self.update_btn.setText(f"下载中 {percent}%")
-    
-    def _on_download_finished(self, success, filepath, error):
-        self.update_btn.setEnabled(True)
-        self.update_btn.setText("检查更新")
-        if success:
-            msg = f"下载完成！\n\n文件保存在：\n{filepath}\n\n请退出应用后手动解压并替换旧版本。"
-            QMessageBox.information(self, "下载完成", msg, QMessageBox.Ok)
-        else:
-            if error != "用户取消":
-                QMessageBox.warning(self, "下载更新", f"下载失败：\n{error}", QMessageBox.Ok)
+
+        QDesktopServices.openUrl(QUrl(url))
+        QMessageBox.information(
+            self, "已在浏览器打开",
+            f"新版本 v{data.get('version', '')} 的下载地址已在默认浏览器打开。\n"
+            "下载完成后请退出应用，解压并替换旧版本。",
+            QMessageBox.Ok)
 
 
 class CheckUpdateThread(QThread):
@@ -9366,36 +9345,6 @@ class CheckUpdateThread(QThread):
             print(f"[Update] Error: {type(e).__name__}: {e}")
             traceback.print_exc()
             self.result.emit(False, {}, f"检查更新时出错：\n{e}")
-
-
-class DownloadThread(QThread):
-    """后台下载线程"""
-    progress = pyqtSignal(int)
-    finished = pyqtSignal(bool, str, str)
-    
-    def __init__(self, url, filepath):
-        super().__init__()
-        self.url = url
-        self.filepath = filepath
-        self.cancelled = False
-    
-    def cancel(self):
-        self.cancelled = True
-    
-    def run(self):
-        try:
-            def report_hook(block_num, block_size, total_size):
-                if self.cancelled:
-                    raise Exception("用户取消")
-                if total_size > 0:
-                    percent = min(100, int(block_num * block_size * 100 / total_size))
-                    self.progress.emit(percent)
-            
-            urllib.request.urlretrieve(self.url, self.filepath, reporthook=report_hook)
-            self.progress.emit(100)
-            self.finished.emit(True, self.filepath, "")
-        except Exception as e:
-            self.finished.emit(False, self.filepath, str(e))
 
 
 def startup_log_path():

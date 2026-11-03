@@ -57,6 +57,22 @@ APP_VERSION = "1.0.14"
 UPDATE_CHECK_URL = "https://gitee.com/jimmy_hou/personal_tool/raw/main/version.json"
 
 
+def ui_font(pt_mac, px_win, bold=False, family_mac="PingFang SC"):
+    """QFont for the main window chrome.
+
+    macOS keeps the original point size; Windows pins an explicit pixel size so
+    titles and the bottom bar aren't inflated by the point->pixel DPI scaling
+    that makes them look oversized next to the pixel-based section buttons.
+    """
+    if platform.system() == "Windows":
+        font = QFont("Microsoft YaHei")
+        font.setPixelSize(px_win)
+    else:
+        font = QFont(family_mac, pt_mac)
+    font.setBold(bold)
+    return font
+
+
 def get_effective_ip():
     system = platform.system()
     try:
@@ -8817,19 +8833,19 @@ class ToolboxWindow(QMainWindow):
         bottom_layout.setContentsMargins(0, 0, 0, 0)
 
         self.cpu_label = QLabel("CPU: --")
-        self.cpu_label.setFont(QFont("PingFang SC", 10))
+        self.cpu_label.setFont(ui_font(10, 11))
         self.cpu_label.setStyleSheet("color: #999999;")
         bottom_layout.addWidget(self.cpu_label)
 
         self.mem_label = QLabel("内存: --")
-        self.mem_label.setFont(QFont("PingFang SC", 10))
+        self.mem_label.setFont(ui_font(10, 11))
         self.mem_label.setStyleSheet("color: #999999;")
         bottom_layout.addWidget(self.mem_label)
 
         bottom_layout.addStretch()
 
         repo_label = QLabel('<a href="https://github.com/FantasyEngineer/personal_tool">仓库</a>')
-        repo_label.setFont(QFont("PingFang SC", 10))
+        repo_label.setFont(ui_font(10, 11))
         repo_label.setCursor(QCursor(Qt.PointingHandCursor))
         repo_label.setToolTip("在 GitHub 上查看源码")
         repo_label.setOpenExternalLinks(True)
@@ -8840,7 +8856,7 @@ class ToolboxWindow(QMainWindow):
         info_text = f"{ip_text}  |  {mac_text}" if mac_text else ip_text
 
         info_label = QLabel(info_text)
-        info_label.setFont(QFont("PingFang SC", 10))
+        info_label.setFont(ui_font(10, 11))
         info_label.setStyleSheet("color: #999999;")
         info_label.setCursor(QCursor(Qt.PointingHandCursor))
         info_label.setToolTip("点击复制 IP")
@@ -8848,7 +8864,7 @@ class ToolboxWindow(QMainWindow):
         bottom_layout.addWidget(info_label)
 
         self.update_btn = QPushButton("检查更新")
-        self.update_btn.setFont(QFont("PingFang SC", 10))
+        self.update_btn.setFont(ui_font(10, 11))
         self.update_btn.setCursor(QCursor(Qt.PointingHandCursor))
         self.update_btn.setStyleSheet("""
             QPushButton {
@@ -8891,7 +8907,7 @@ class ToolboxWindow(QMainWindow):
         layout.setSpacing(10)
 
         title_label = QLabel(title)
-        title_label.setFont(QFont("PingFang SC", 14, QFont.Bold))
+        title_label.setFont(ui_font(14, 15, bold=True))
         title_label.setStyleSheet("color: #222222;")
         layout.addWidget(title_label)
 
@@ -8913,7 +8929,7 @@ class ToolboxWindow(QMainWindow):
                     border: 1px solid #CFCFCF;
                     border-radius: 4px;
                     font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
-                    font-size: 12px;
+                    font-size: __FS__px;
                     font-weight: normal;
                     padding: 0 14px;
                 }
@@ -8925,7 +8941,7 @@ class ToolboxWindow(QMainWindow):
                 QPushButton:pressed {
                     background: #E8E8E8;
                 }
-            """
+            """.replace("__FS__", "13" if platform.system() == "Windows" else "12")
             )
             if btn_text in toggle_callbacks:
                 btn.setCheckable(True)

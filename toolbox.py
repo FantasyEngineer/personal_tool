@@ -47,13 +47,15 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QFileDialog, QInputDialog, QListWidget, QListWidgetItem,
                               QProgressDialog, QSystemTrayIcon, QMenu, QAction,
                               QTreeWidget, QTreeWidgetItem, QHeaderView,
-                              QStyledItemDelegate, QStyle, QGraphicsOpacityEffect)
-from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QThread, pyqtSignal, QTimer, QUrl
+                              QStyledItemDelegate, QStyle, QGraphicsOpacityEffect,
+                              QDialog, QFormLayout, QDialogButtonBox,
+                              QDateEdit, QDateTimeEdit, QGroupBox)
+from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QThread, pyqtSignal, QTimer, QUrl, QLockFile, QDate, QDateTime
 from PyQt5.QtGui import (QFont, QCursor, QColor, QPen, QPixmap, QPainter, QIcon,
                          QImage, QLinearGradient, QBrush, QDesktopServices)
 
 
-APP_VERSION = "1.0.14"
+APP_VERSION = "1.0.18"
 UPDATE_CHECK_URL = "https://gitee.com/jimmy_hou/personal_tool/raw/main/version.json"
 
 
@@ -393,6 +395,7 @@ def app_icon():
 
 HISTORY_LIMIT = 50
 JSON_HISTORY_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "json_history.json")
+TOOL_USAGE_HISTORY_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "tool_usage_history.json")
 
 
 def load_history(path):
@@ -1347,7 +1350,6 @@ class ConvertWindow(TabbedToolWindow):
     def __init__(self):
         super().__init__("格式转换", (
             (ColorWindow, "颜色"),
-            (TimestampWindow, "时间戳"),
             (JsonYamlWindow, "JSON-YAML"),
         ))
 
@@ -6500,6 +6502,25 @@ def git_global_path():
     return os.path.join(os.path.expanduser("~"), ".gitconfig")
 
 
+def _refresh_path_from_system():
+    """Windows 上从注册表重新读取 PATH，识别新安装的工具（如 git）。"""
+    if os.name != "nt":
+        return
+    try:
+        import winreg
+        # 系统 PATH
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                           r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment") as key:
+            sys_path, _ = winreg.QueryValueEx(key, "Path")
+        # 用户 PATH
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            usr_path, _ = winreg.QueryValueEx(key, "Path")
+        # 合并并更新当前进程的环境变量
+        os.environ["PATH"] = sys_path + ";" + usr_path
+    except Exception:
+        pass
+
+
 def _run_git(args):
     try:
         return subprocess.run(["git", "config"] + args, capture_output=True,
@@ -6513,6 +6534,7 @@ def _git_error(result):
 
 
 def git_global_list():
+    _refresh_path_from_system()
     if shutil.which("git") is None:
         raise RuntimeError("未找到 git 命令，请确认已安装 Git 并在 PATH 中")
     # git exits 128 on a missing file and 1 on an empty one; neither is an error here.
@@ -6530,12 +6552,14 @@ def git_global_list():
 
 
 def git_global_set(key, value):
+    _refresh_path_from_system()
     result = _run_git(["--global", key, value])
     if result.returncode != 0:
         raise RuntimeError(_git_error(result))
 
 
 def git_global_unset(key):
+    _refresh_path_from_system()
     # rc 1 = no entries left in the file, rc 5 = that key was not set. Both are no-ops.
     result = _run_git(["--global", "--unset-all", key])
     if result.returncode not in (0, 1, 5):
@@ -6560,11 +6584,11 @@ class _GitConfigPage(QWidget):
 
         row = QHBoxLayout()
         for text, slot, primary in (
-                ("设置用户名", lambda: self.set_key("user.name"), True),
-                ("设置邮箱", lambda: self.set_key("user.email"), True),
+                ("设置身份", self.set_identity, True),
                 ("添加配置项", self.do_add, False),
                 ("删除选中", self.do_delete, False),
-                ("刷新", self.refresh, False)):
+                ("刷新", self.refresh, False),
+                ("下载 Git", self.open_git_download, False)):
             btn = QPushButton(text)
             btn.setFixedHeight(30)
             btn.setCursor(QCursor(Qt.PointingHandCursor))
@@ -6601,6 +6625,9 @@ class _GitConfigPage(QWidget):
     def _set_status(self, text, color):
         self.status_label.setText(text)
         self.status_label.setStyleSheet("color: %s; font-family: 'PingFang SC'; font-size: 12px;" % color)
+
+    def open_git_download(self):
+        QDesktopServices.openUrl(QUrl("https://git-scm.com/downloads"))
 
     def refresh(self):
         try:
@@ -6651,6 +6678,59 @@ class _GitConfigPage(QWidget):
             if answer != QMessageBox.Yes:
                 return
         self._write(key, value)
+
+    def set_identity(self):
+        """一次性设置 user.name 和 user.email。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("设置 Git 身份")
+        dlg.setFixedWidth(360)
+        form = QFormLayout(dlg)
+        form.setContentsMargins(16, 16, 16, 12)
+        form.setSpacing(10)
+
+        name_edit = QLineEdit(self._current_of("user.name"))
+        name_edit.setPlaceholderText("如 Zhang San")
+        name_edit.setStyleSheet(_lineedit_style())
+        form.addRow("用户名 (user.name)", name_edit)
+
+        email_edit = QLineEdit(self._current_of("user.email"))
+        email_edit.setPlaceholderText("如 zhangsan@example.com")
+        email_edit.setStyleSheet(_lineedit_style())
+        form.addRow("邮箱 (user.email)", email_edit)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        name = name_edit.text().strip()
+        email = email_edit.text().strip()
+
+        if not name:
+            self._set_status("用户名不能为空。", "#D93025")
+            return
+        if not email:
+            self._set_status("邮箱不能为空。", "#D93025")
+            return
+        if "@" not in email:
+            answer = QMessageBox.question(
+                self, "确认邮箱", "%s 不含 @，看起来不像邮箱地址。\n仍要保存吗？" % email,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+
+        try:
+            git_global_set("user.name", name)
+            git_global_set("user.email", email)
+        except RuntimeError as e:
+            self._fail("保存失败", e)
+            return
+        self.refresh()
+        self._set_status("已保存 user.name = %s，user.email = %s（%s）"
+                         % (name, email, git_global_path()), "#188038")
 
     def do_add(self):
         key, ok = QInputDialog.getText(self, "添加配置项", "配置项 (如 core.editor):")
@@ -8856,6 +8936,447 @@ class MortgageWindow(QMainWindow):
             self.close()
 
 
+class HttpStatusWindow(QMainWindow):
+    """HTTP 状态码速查：按代码或关键词搜索，显示含义和常见场景。"""
+
+    STATUS_CODES = [
+        (100, "Continue", "继续", "客户端应继续发送请求主体"),
+        (101, "Switching Protocols", "切换协议", "服务器同意切换协议，如 WebSocket"),
+        (200, "OK", "成功", "请求成功，最常见的高效代码"),
+        (201, "Created", "已创建", "资源创建成功，常用于 POST 后"),
+        (202, "Accepted", "已接受", "请求已接受但未处理完成，异步任务"),
+        (204, "No Content", "无内容", "请求成功但无返回内容，常用于 DELETE"),
+        (301, "Moved Permanently", "永久重定向", "资源已永久移动到新 URL"),
+        (302, "Found", "临时重定向", "资源临时移动到新 URL"),
+        (304, "Not Modified", "未修改", "缓存有效，可使用本地缓存"),
+        (400, "Bad Request", "错误请求", "请求语法错误，服务器无法理解"),
+        (401, "Unauthorized", "未授权", "需要身份验证，如登录"),
+        (403, "Forbidden", "禁止访问", "已认证但无权限访问资源"),
+        (404, "Not Found", "未找到", "请求的资源不存在"),
+        (405, "Method Not Allowed", "方法不允许", "请求方法不支持，如用 POST 访问只支持 GET 的接口"),
+        (408, "Request Timeout", "请求超时", "服务器等待请求超时"),
+        (409, "Conflict", "冲突", "请求与资源状态冲突，如重复创建"),
+        (410, "Gone", "已删除", "资源已永久删除"),
+        (413, "Payload Too Large", "载荷过大", "请求主体超过服务器限制"),
+        (414, "URI Too Long", "URI 过长", "请求 URL 超过服务器限制"),
+        (415, "Unsupported Media Type", "不支持的媒体类型", "请求格式不支持"),
+        (429, "Too Many Requests", "请求过多", "触发限流，请稍后重试"),
+        (500, "Internal Server Error", "服务器内部错误", "服务器遇到未预期的错误"),
+        (501, "Not Implemented", "未实现", "服务器不支持请求的功能"),
+        (502, "Bad Gateway", "错误网关", "网关或代理服务器收到无效响应"),
+        (503, "Service Unavailable", "服务不可用", "服务器过载或维护中"),
+        (504, "Gateway Timeout", "网关超时", "网关或代理服务器未及时收到响应"),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("HTTP 状态码速查")
+        self.setGeometry(*tool_win_geometry())
+        self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
+        self.init_ui()
+        self.apply_filter()
+
+    def init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(15, 15, 15, 10)
+        layout.setSpacing(10)
+
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("搜索状态码或关键词，例如 404、重定向、超时…")
+        self.search_edit.setStyleSheet(_lineedit_style())
+        self.search_edit.textChanged.connect(self.apply_filter)
+        layout.addWidget(self.search_edit)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        self.scroll.viewport().setStyleSheet("background: #FFFFFF;")
+        layout.addWidget(self.scroll, 1)
+
+        self.container = QWidget()
+        self.container_layout = QVBoxLayout(self.container)
+        self.container_layout.setContentsMargins(0, 0, 0, 0)
+        self.container_layout.setSpacing(8)
+        self.container_layout.addStretch()
+        self.scroll.setWidget(self.container)
+
+    def apply_filter(self):
+        while self.container_layout.count() > 1:
+            item = self.container_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        keyword = self.search_edit.text().strip().lower()
+        count = 0
+        for code, en_name, zh_name, desc in self.STATUS_CODES:
+            if keyword:
+                if (keyword not in str(code) and
+                    keyword not in en_name.lower() and
+                    keyword not in zh_name and
+                    keyword not in desc):
+                    continue
+            row = self._make_row(code, en_name, zh_name, desc)
+            self.container_layout.insertWidget(count, row)
+            count += 1
+        if count == 0:
+            empty = QLabel("没有匹配的状态码")
+            empty.setAlignment(Qt.AlignCenter)
+            empty.setStyleSheet("color: #999999; padding: 20px; font-size: 13px;")
+            self.container_layout.insertWidget(0, empty)
+
+    def _make_row(self, code, en_name, zh_name, desc):
+        frame = QFrame()
+        frame.setStyleSheet("""
+            QFrame { background: #FAFAFA; border: 1px solid #E0E0E0; border-radius: 6px; }
+            QFrame:hover { background: #F0F7FF; border-color: #1A73E8; }
+        """)
+        layout = QHBoxLayout(frame)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(12)
+
+        code_label = QLabel(str(code))
+        code_font = QFont("Menlo", 16, QFont.Bold)
+        code_label.setFont(code_font)
+        color = self._code_color(code)
+        code_label.setStyleSheet(f"color: {color}; min-width: 50px;")
+        layout.addWidget(code_label)
+
+        text_box = QVBoxLayout()
+        text_box.setSpacing(4)
+        title = QLabel(f"{zh_name} ({en_name})")
+        title.setFont(QFont("PingFang SC", 13, QFont.Bold))
+        title.setStyleSheet("color: #333333;")
+        text_box.addWidget(title)
+        desc_label = QLabel(desc)
+        desc_label.setFont(QFont("PingFang SC", 12))
+        desc_label.setStyleSheet("color: #666666;")
+        desc_label.setWordWrap(True)
+        text_box.addWidget(desc_label)
+        layout.addLayout(text_box, 1)
+
+        return frame
+
+    @staticmethod
+    def _code_color(code):
+        if code < 200:
+            return "#6B7280"
+        if code < 300:
+            return "#188038"
+        if code < 400:
+            return "#1A73E8"
+        if code < 500:
+            return "#D93025"
+        return "#EA8600"
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+
+
+class ChmodWindow(QMainWindow):
+    """chmod 权限计算器：八进制 ↔ 符号表示互转，可视化 9 个权限位。"""
+
+    PERM_BITS = [
+        ("所有者", ["读 (r)", "写 (w)", "执行 (x)"]),
+        ("用户组", ["读 (r)", "写 (w)", "执行 (x)"]),
+        ("其他人", ["读 (r)", "写 (w)", "执行 (x)"]),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("chmod 权限计算器")
+        self.setGeometry(*tool_win_geometry())
+        self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
+        self.checkboxes = []
+        self.init_ui()
+        self.update_from_octal("755")
+
+    def init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(15, 15, 15, 10)
+        layout.setSpacing(12)
+
+        input_layout = QHBoxLayout()
+        input_layout.addWidget(QLabel("八进制:"))
+        self.octal_input = QLineEdit("755")
+        self.octal_input.setFixedWidth(80)
+        self.octal_input.setStyleSheet(_lineedit_style())
+        self.octal_input.textChanged.connect(self.on_octal_changed)
+        input_layout.addWidget(self.octal_input)
+        input_layout.addSpacing(20)
+        input_layout.addWidget(QLabel("符号:"))
+        self.symbolic_label = QLabel("rwxr-xr-x")
+        self.symbolic_label.setFont(QFont("Menlo", 14))
+        self.symbolic_label.setStyleSheet("color: #1A73E8; padding: 4px 8px; background: #F0F7FF; border-radius: 4px;")
+        input_layout.addWidget(self.symbolic_label)
+        input_layout.addStretch()
+        layout.addLayout(input_layout)
+
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        for group_idx, (group_name, perms) in enumerate(self.PERM_BITS):
+            group_label = QLabel(group_name)
+            group_label.setFont(QFont("PingFang SC", 12, QFont.Bold))
+            group_label.setStyleSheet("color: #333333;")
+            grid.addWidget(group_label, group_idx, 0)
+            for perm_idx, perm_name in enumerate(perms):
+                cb = QCheckBox(perm_name)
+                cb.setStyleSheet("QCheckBox { font-size: 12px; }")
+                cb.stateChanged.connect(self.on_checkbox_changed)
+                grid.addWidget(cb, group_idx, perm_idx + 1)
+                self.checkboxes.append(cb)
+        layout.addLayout(grid)
+
+        cmd_layout = QHBoxLayout()
+        cmd_layout.addWidget(QLabel("chmod 命令:"))
+        self.cmd_label = QLabel("chmod 755 file")
+        self.cmd_label.setFont(QFont("Menlo", 13))
+        self.cmd_label.setStyleSheet("color: #333333; background: #F5F5F5; padding: 6px 10px; border-radius: 4px;")
+        self.cmd_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        cmd_layout.addWidget(self.cmd_label, 1)
+        copy_btn = QPushButton("复制")
+        copy_btn.setFixedSize(60, 28)
+        copy_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        copy_btn.setStyleSheet(_secondary_btn())
+        copy_btn.clicked.connect(self.copy_command)
+        cmd_layout.addWidget(copy_btn)
+        layout.addLayout(cmd_layout)
+
+        layout.addStretch()
+
+    def on_octal_changed(self, text):
+        text = text.strip()
+        if not text or not text.isdigit():
+            return
+        try:
+            value = int(text)
+            if value < 0 or value > 777:
+                return
+            self.update_from_octal(text)
+        except ValueError:
+            pass
+
+    def on_checkbox_changed(self):
+        octal = self.compute_octal()
+        self.octal_input.blockSignals(True)
+        self.octal_input.setText(octal)
+        self.octal_input.blockSignals(False)
+        self.update_display(octal)
+
+    def update_from_octal(self, octal_str):
+        value = int(octal_str, 8)
+        bits = []
+        for i in range(8, -1, -1):
+            bits.append(bool(value & (1 << i)))
+        for cb, bit in zip(self.checkboxes, bits):
+            cb.blockSignals(True)
+            cb.setChecked(bit)
+            cb.blockSignals(False)
+        self.update_display(octal_str)
+
+    def compute_octal(self):
+        value = 0
+        for i, cb in enumerate(self.checkboxes):
+            if cb.isChecked():
+                value |= (1 << (8 - i))
+        return oct(value)[2:].zfill(3)
+
+    def update_display(self, octal_str):
+        value = int(octal_str, 8)
+        symbolic = ""
+        for i in range(8, -1, -1):
+            bit = value & (1 << i)
+            pos = 8 - i
+            if pos % 3 == 0:
+                symbolic += "r" if bit else "-"
+            elif pos % 3 == 1:
+                symbolic += "w" if bit else "-"
+            else:
+                symbolic += "x" if bit else "-"
+        self.symbolic_label.setText(symbolic)
+        self.cmd_label.setText(f"chmod {octal_str} file")
+
+    def copy_command(self):
+        QApplication.clipboard().setText(self.cmd_label.text())
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+
+
+class DateTimeWindow(QMainWindow):
+    """日期时间计算器：日期差、加减天数、时区转换。"""
+
+    TIMEZONES = [
+        ("UTC", 0),
+        ("北京 (UTC+8)", 8),
+        ("东京 (UTC+9)", 9),
+        ("首尔 (UTC+9)", 9),
+        ("悉尼 (UTC+10)", 10),
+        ("莫斯科 (UTC+3)", 3),
+        ("迪拜 (UTC+4)", 4),
+        ("柏林 (UTC+1)", 1),
+        ("巴黎 (UTC+1)", 1),
+        ("伦敦 (UTC+0)", 0),
+        ("纽约 (UTC-5)", -5),
+        ("芝加哥 (UTC-6)", -6),
+        ("丹佛 (UTC-7)", -7),
+        ("洛杉矶 (UTC-8)", -8),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("日期时间计算器")
+        self.setGeometry(*tool_win_geometry())
+        self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
+        self.init_ui()
+
+    def init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(15, 15, 15, 10)
+        layout.setSpacing(15)
+
+        # 日期差计算
+        diff_group = QGroupBox("两个日期间的天数差")
+        diff_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #D0D0D0; border-radius: 6px; margin-top: 10px; padding-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
+        diff_layout = QVBoxLayout(diff_group)
+        diff_row = QHBoxLayout()
+        diff_row.addWidget(QLabel("开始:"))
+        self.date1 = QDateEdit()
+        self.date1.setCalendarPopup(True)
+        self.date1.setDate(QDate.currentDate())
+        self.date1.setDisplayFormat("yyyy-MM-dd")
+        self.date1.setStyleSheet(_lineedit_style())
+        diff_row.addWidget(self.date1)
+        diff_row.addWidget(QLabel("结束:"))
+        self.date2 = QDateEdit()
+        self.date2.setCalendarPopup(True)
+        self.date2.setDate(QDate.currentDate())
+        self.date2.setDisplayFormat("yyyy-MM-dd")
+        self.date2.setStyleSheet(_lineedit_style())
+        diff_row.addWidget(self.date2)
+        calc_diff_btn = QPushButton("计算")
+        calc_diff_btn.setFixedSize(60, 28)
+        calc_diff_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        calc_diff_btn.setStyleSheet(_primary_btn())
+        calc_diff_btn.clicked.connect(self.calc_diff)
+        diff_row.addWidget(calc_diff_btn)
+        diff_layout.addLayout(diff_row)
+        self.diff_result = QLabel("")
+        self.diff_result.setFont(QFont("PingFang SC", 13, QFont.Bold))
+        self.diff_result.setStyleSheet("color: #1A73E8; padding: 6px;")
+        diff_layout.addWidget(self.diff_result)
+        layout.addWidget(diff_group)
+
+        # 加减天数
+        add_group = QGroupBox("日期加减天数")
+        add_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #D0D0D0; border-radius: 6px; margin-top: 10px; padding-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
+        add_layout = QVBoxLayout(add_group)
+        add_row = QHBoxLayout()
+        add_row.addWidget(QLabel("基准日期:"))
+        self.base_date = QDateEdit()
+        self.base_date.setCalendarPopup(True)
+        self.base_date.setDate(QDate.currentDate())
+        self.base_date.setDisplayFormat("yyyy-MM-dd")
+        self.base_date.setStyleSheet(_lineedit_style())
+        add_row.addWidget(self.base_date)
+        add_row.addWidget(QLabel("天数:"))
+        self.days_spin = QSpinBox()
+        self.days_spin.setRange(-36500, 36500)
+        self.days_spin.setValue(30)
+        self.days_spin.setStyleSheet(_lineedit_style())
+        add_row.addWidget(self.days_spin)
+        calc_add_btn = QPushButton("计算")
+        calc_add_btn.setFixedSize(60, 28)
+        calc_add_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        calc_add_btn.setStyleSheet(_primary_btn())
+        calc_add_btn.clicked.connect(self.calc_add)
+        add_row.addWidget(calc_add_btn)
+        add_layout.addLayout(add_row)
+        self.add_result = QLabel("")
+        self.add_result.setFont(QFont("PingFang SC", 13, QFont.Bold))
+        self.add_result.setStyleSheet("color: #1A73E8; padding: 6px;")
+        add_layout.addWidget(self.add_result)
+        layout.addWidget(add_group)
+
+        # 时区转换
+        tz_group = QGroupBox("时区转换")
+        tz_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #D0D0D0; border-radius: 6px; margin-top: 10px; padding-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
+        tz_layout = QVBoxLayout(tz_group)
+        tz_row = QHBoxLayout()
+        tz_row.addWidget(QLabel("时间:"))
+        self.time_input = QDateTimeEdit()
+        self.time_input.setCalendarPopup(True)
+        self.time_input.setDateTime(QDateTime.currentDateTime())
+        self.time_input.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        self.time_input.setStyleSheet(_lineedit_style())
+        tz_row.addWidget(self.time_input)
+        tz_row.addWidget(QLabel("从"))
+        self.tz_from = QComboBox()
+        for name, _ in self.TIMEZONES:
+            self.tz_from.addItem(name)
+        self.tz_from.setCurrentText("北京 (UTC+8)")
+        self.tz_from.setStyleSheet(_combo_style())
+        tz_row.addWidget(self.tz_from)
+        tz_row.addWidget(QLabel("到"))
+        self.tz_to = QComboBox()
+        for name, _ in self.TIMEZONES:
+            self.tz_to.addItem(name)
+        self.tz_to.setCurrentText("纽约 (UTC-5)")
+        self.tz_to.setStyleSheet(_combo_style())
+        tz_row.addWidget(self.tz_to)
+        calc_tz_btn = QPushButton("转换")
+        calc_tz_btn.setFixedSize(60, 28)
+        calc_tz_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        calc_tz_btn.setStyleSheet(_primary_btn())
+        calc_tz_btn.clicked.connect(self.calc_tz)
+        tz_row.addWidget(calc_tz_btn)
+        tz_layout.addLayout(tz_row)
+        self.tz_result = QLabel("")
+        self.tz_result.setFont(QFont("PingFang SC", 13, QFont.Bold))
+        self.tz_result.setStyleSheet("color: #1A73E8; padding: 6px;")
+        self.tz_result.setWordWrap(True)
+        tz_layout.addWidget(self.tz_result)
+        layout.addWidget(tz_group)
+
+        layout.addStretch()
+
+    def calc_diff(self):
+        d1 = self.date1.date()
+        d2 = self.date2.date()
+        days = d1.daysTo(d2)
+        self.diff_result.setText(f"相差 {abs(days)} 天" + ("（结束早于开始）" if days < 0 else ""))
+
+    def calc_add(self):
+        base = self.base_date.date()
+        days = self.days_spin.value()
+        result = base.addDays(days)
+        self.add_result.setText(f"结果：{result.toString('yyyy-MM-dd')}（{'+' if days >= 0 else ''}{days} 天）")
+
+    def calc_tz(self):
+        dt = self.time_input.dateTime()
+        from_idx = self.tz_from.currentIndex()
+        to_idx = self.tz_to.currentIndex()
+        from_offset = self.TIMEZONES[from_idx][1]
+        to_offset = self.TIMEZONES[to_idx][1]
+        diff_hours = to_offset - from_offset
+        result_dt = dt.addSecs(diff_hours * 3600)
+        from_name = self.TIMEZONES[from_idx][0]
+        to_name = self.TIMEZONES[to_idx][0]
+        self.tz_result.setText(f"{from_name} {dt.toString('yyyy-MM-dd HH:mm:ss')}\n→ {to_name} {result_dt.toString('yyyy-MM-dd HH:mm:ss')}")
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+
+
 # 首页按钮的悬停说明：直接列出工具内部的页签或主要功能，省得一个个点开找。
 TOOL_TIPS = {
     "进程管理": "功能：进程列表 · 按名称/PID/窗口标题搜索 · 按端口过滤 · 结束进程",
@@ -8869,13 +9390,20 @@ TOOL_TIPS = {
     "编解码": "页签：Base64 / URL / Unicode 转义",
     "加解密": "页签：JWT / AES / RSA / HMAC / 口令哈希 / 随机密钥",
     "正则测试": "功能：常用正则预设 · 实时匹配与高亮",
-    "二维码/条形码/UUID": "页签：二维码 / 条形码 / UUID",
+    "二维码": "功能：输入文字或链接生成二维码 · 支持保存为 PNG",
+    "条形码": "功能：输入文本生成 Code 128 条形码",
+    "UUID": "功能：生成 UUID v1 / v4 · 支持批量生成",
     "格式转换": "页签：颜色 / 时间戳 / JSON-YAML",
+    "颜色": "功能：颜色选择器 · HEX / RGB / HSL 互转",
+    "JSON-YAML": "功能：JSON 与 YAML 格式互转",
     "文本统计": "功能：字符数 / 行数 / 词数 / 字节数 / 中文字数",
     "文本对比": "功能：逐行 diff · 忽略空白 / 大小写 · 只看差异 · 复制 diff",
     "Cron 表达式": "页签：执行计划 / 书写规范",
     "哈希计算": "页签：文本哈希 / 文件哈希（MD5 / SHA1 / SHA256 / SHA512）",
     "命令速查": "分类：全部 / Docker / Linux / SSH / Vim / Windows / Git",
+    "HTTP 状态码": "功能：按代码或关键词搜索 HTTP 状态码，显示含义和常见场景",
+    "chmod 权限": "功能：八进制 ↔ 符号表示互转，可视化 9 个权限位",
+    "日期时间": "功能：日期差计算、加减天数、时区转换",
     "房贷计算器": "功能：等额本息 / 等额本金",
     "图片处理": "页签：转 Base64 / 格式转换 / 缩放压缩",
     "文字雨": "功能：桌面字符雨特效，开启时自动防黑屏（开关）",
@@ -8888,13 +9416,87 @@ TOOL_TIPS = {
     "罗马数字": "功能：阿拉伯数字 ↔ 罗马数字",
 }
 
+# 拼音搜索映射：支持输入拼音匹配工具（不增加依赖的轻量方案）
+PINYIN_MAP = {
+    "jincheng": ["进程管理"],
+    "duankou": ["端口扫描"],
+    "ping": ["Ping 测试"],
+    "dns": ["DNS 查询"],
+    "luyou": ["路由追踪"],
+    "wangluo": ["网络测速"],
+    "cesu": ["网络测速"],
+    "peizhi": ["配置"],
+    "huanjing": ["配置"],
+    "bianma": ["编解码"],
+    "base64": ["编解码"],
+    "url": ["编解码"],
+    "unicode": ["编解码"],
+    "jiami": ["加解密"],
+    "jwt": ["加解密"],
+    "aes": ["加解密"],
+    "rsa": ["加解密"],
+    "hmac": ["加解密"],
+    "zhengze": ["正则测试"],
+    "regex": ["正则测试"],
+    "erweima": ["二维码"],
+    "tiaoxingma": ["条形码"],
+    "uuid": ["UUID"],
+    "geshi": ["格式转换"],
+    "yanse": ["颜色"],
+    "shijianchuo": ["格式转换"],
+    "json": ["JSON/XML", "格式转换"],
+    "xml": ["JSON/XML"],
+    "tongji": ["文本统计"],
+    "duibi": ["文本对比"],
+    "diff": ["文本对比"],
+    "cron": ["Cron 表达式"],
+    "hash": ["哈希计算"],
+    "md5": ["哈希计算"],
+    "sha": ["哈希计算"],
+    "mingling": ["命令速查"],
+    "docker": ["命令速查"],
+    "linux": ["命令速查"],
+    "ssh": ["命令速查"],
+    "vim": ["命令速查"],
+    "windows": ["命令速查"],
+    "git": ["命令速查", "配置"],
+    "http": ["HTTP 状态码"],
+    "zhuangtai": ["HTTP 状态码"],
+    "chmod": ["chmod 权限"],
+    "quanxian": ["chmod 权限"],
+    "riqi": ["日期时间"],
+    "shijian": ["日期时间", "格式转换"],
+    "shiqu": ["日期时间"],
+    "shizhong": ["日期时间"],
+    "fangdai": ["房贷计算器"],
+    "tupian": ["图片处理"],
+    "wenziyu": ["文字雨"],
+    "yu": ["文字雨"],
+    "fangheiping": ["防黑屏"],
+    "heiping": ["防黑屏"],
+    "xiuxi": ["防黑屏"],
+    "jinzhi": ["进制转换"],
+    "eryuan": ["商余计算"],
+    "shangyu": ["商余计算"],
+    "danwei": ["单位转换"],
+    "wendu": ["单位转换"],
+    "changdu": ["单位转换"],
+    "zhongliang": ["单位转换"],
+    "suijishu": ["随机数"],
+    "suiji": ["随机数"],
+    "jine": ["金额大写"],
+    "daxie": ["金额大写"],
+    "renminbi": ["金额大写"],
+    "luoma": ["罗马数字"],
+}
+
 
 class ToolboxWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"系统工具箱 v{APP_VERSION}")
         screen = QApplication.primaryScreen().availableGeometry()
-        w, h = 700, min(500, screen.height() - 40)
+        w, h = 700, int(screen.height() * 0.6)
         self.setGeometry(screen.x() + (screen.width() - w) // 2,
                          screen.y() + (screen.height() - h) // 2, w, h)
         self.setStyleSheet("""
@@ -8909,9 +9511,14 @@ class ToolboxWindow(QMainWindow):
         self.regex_window = None
         self.diff_window = None
         self.generator_window = None
+        self.qr_window = None
+        self.barcode_window = None
+        self.uuid_window = None
         self.baseconvert_window = None
         self.divmod_window = None
         self.convert_window = None
+        self.color_window = None
+        self.json_yaml_window = None
         self.config_window = None
         self.unit_window = None
         self.random_window = None
@@ -8927,6 +9534,10 @@ class ToolboxWindow(QMainWindow):
         self.speedtest_window = None
         self.cmdref_window = None
         self.mortgage_window = None
+        self.http_status_window = None
+        self.chmod_window = None
+        self.datetime_window = None
+        self.timestamp_window = None
         self.tray_icon = None
         self.init_ui()
         self.init_tray()
@@ -8935,8 +9546,99 @@ class ToolboxWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(15, 15, 15, 4)
+        main_layout.setContentsMargins(15, 8, 15, 4)
         main_layout.setSpacing(4)
+
+        # 搜索框：模糊匹配工具名称和内部功能
+        search_container = QWidget()
+        search_container.setStyleSheet("""
+            QWidget {
+                background: #F5F5F5;
+                border: 1px solid #E0E0E0;
+                border-radius: 8px;
+                margin: 2px 15px;
+            }
+            QWidget:focus-within {
+                border: 1px solid #1A73E8;
+                background: #FFFFFF;
+            }
+        """)
+        search_layout = QHBoxLayout(search_container)
+        search_layout.setContentsMargins(12, 6, 12, 6)
+        search_layout.setSpacing(8)
+        
+        # 搜索输入框
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("搜索工具或功能，支持拼音…")
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.setStyleSheet("""
+            QLineEdit {
+                border: none;
+                background: transparent;
+                font-size: 13px;
+                color: #333333;
+                padding: 0;
+                padding-right: 8px;
+            }
+            QLineEdit::placeholder {
+                color: #999999;
+            }
+            QLineEdit > QPushButton {
+                background: #CCCCCC;
+                border-radius: 10px;
+                min-width: 20px;
+                max-width: 20px;
+                min-height: 20px;
+                max-height: 20px;
+            }
+            QLineEdit > QPushButton:hover {
+                background: #999999;
+            }
+        """)
+        self.search_input.textChanged.connect(self.filter_tools)
+        self.search_input.returnPressed.connect(self.open_single_match)
+        self.search_input.setFocusPolicy(Qt.ClickFocus)
+        search_layout.addWidget(self.search_input, 1)
+        
+        main_layout.addWidget(search_container)
+        
+        # 使用历史区域
+        self.history_widget = QWidget()
+        self.history_widget.setVisible(False)
+        history_layout = QVBoxLayout(self.history_widget)
+        history_layout.setContentsMargins(15, 0, 15, 4)
+        history_layout.setSpacing(6)
+        
+        history_header = QHBoxLayout()
+        history_label = QLabel("最近使用")
+        history_label.setStyleSheet("font-size: 12px; color: #999999; border: none; margin: 0;")
+        history_header.addWidget(history_label)
+        history_header.addStretch()
+        
+        history_clear_all = QPushButton("清空")
+        history_clear_all.setCursor(Qt.PointingHandCursor)
+        history_clear_all.setStyleSheet("""
+            QPushButton {
+                font-size: 11px;
+                color: #999999;
+                border: none;
+                background: transparent;
+                padding: 2px 6px;
+            }
+            QPushButton:hover {
+                color: #1A73E8;
+            }
+        """)
+        history_clear_all.clicked.connect(self._clear_all_history)
+        history_header.addWidget(history_clear_all)
+        history_layout.addLayout(history_header)
+        
+        self.history_buttons_layout = QHBoxLayout()
+        self.history_buttons_layout.setSpacing(6)
+        self.history_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        history_layout.addLayout(self.history_buttons_layout)
+        
+        main_layout.addWidget(self.history_widget)
 
         content_area = QWidget()
         content_layout = QVBoxLayout(content_area)
@@ -8947,6 +9649,11 @@ class ToolboxWindow(QMainWindow):
         self._caffeinate = None
         self._rain_overlay = None
         self._rain_saved_awake = None
+        self.all_buttons = {}  # 存储按钮引用用于搜索过滤
+        self.sections = []  # 存储 (section_widget, [button_texts]) 用于搜索时隐藏空分类
+        self.usage_history = []  # 使用历史记录
+        self.max_history = 10  # 最多记录10条
+        self.usage_history = self._load_usage_history()
 
         section1 = self.create_section("系统工具", [
             "进程管理", "端口扫描", "Ping 测试", "DNS 查询", "路由追踪",
@@ -8961,48 +9668,78 @@ class ToolboxWindow(QMainWindow):
             "配置": self.show_config
         })
 
+        section_generate = self.create_section("生成工具", [
+            "二维码", "条形码", "UUID", "随机数"
+        ], {
+            "二维码": self.show_qrcode,
+            "条形码": self.show_barcode,
+            "UUID": self.show_uuid,
+            "随机数": self.show_random
+        })
+
+        section_crypto = self.create_section("加解密/编解码", [
+            "加解密", "编解码", "哈希计算"
+        ], {
+            "加解密": self.show_crypto,
+            "编解码": self.show_codec,
+            "哈希计算": self.show_hash
+        })
+
         section3 = self.create_section("文本处理", [
-            "JSON/XML", "编解码", "加解密",
-            "正则测试", "二维码/条形码/UUID",
-            "格式转换", "文本统计", "文本对比", "Cron 表达式", "哈希计算"
+            "JSON/XML", "JSON-YAML", "正则测试", "文本对比", "文本统计"
         ], {
             "JSON/XML": self.show_markup,
-            "编解码": self.show_codec,
-            "哈希计算": self.show_hash,
-            "加解密": self.show_crypto,
+            "JSON-YAML": self.show_json_yaml,
             "正则测试": self.show_regex,
             "文本对比": self.show_diff,
-            "二维码/条形码/UUID": self.show_generator,
-            "格式转换": self.show_convert,
-            "文本统计": self.show_textstat,
-            "Cron 表达式": self.show_cron
+            "文本统计": self.show_textstat
         })
-        content_layout.addWidget(section3)
 
-        section6 = self.create_section("其他", [
-            "命令速查", "房贷计算器", "图片处理", "文字雨", "防黑屏"
+        section_time = self.create_section("时间工具", [
+            "日期时间", "时间戳"
+        ], {
+            "日期时间": self.show_datetime,
+            "时间戳": self.show_timestamp
+        })
+
+        section4 = self.create_section("数学工具", [
+            "进制转换", "商余计算", "单位转换", "金额大写", "罗马数字"
+        ], {
+            "进制转换": self.show_base_convert,
+            "商余计算": self.show_divmod,
+            "单位转换": self.show_unit_convert,
+            "金额大写": self.show_rmb,
+            "罗马数字": self.show_roman
+        })
+
+        section_dev = self.create_section("开发工具", [
+            "命令速查", "HTTP 状态码", "chmod 权限", "Cron 表达式", "颜色"
         ], {
             "命令速查": self.show_command_reference,
+            "HTTP 状态码": self.show_http_status,
+            "chmod 权限": self.show_chmod,
+            "Cron 表达式": self.show_cron,
+            "颜色": self.show_color
+        })
+
+        section6 = self.create_section("其他", [
+            "房贷计算器", "图片处理", "文字雨", "防黑屏"
+        ], {
             "房贷计算器": self.show_mortgage,
             "图片处理": self.show_image_tool
         }, {
             "文字雨": self.set_matrix_rain,
             "防黑屏": self.set_awake
         })
-        content_layout.addWidget(section6)
 
-        section4 = self.create_section("数学工具", [
-            "进制转换", "商余计算", "单位转换", "随机数", "金额大写", "罗马数字"
-        ], {
-            "进制转换": self.show_base_convert,
-            "商余计算": self.show_divmod,
-            "单位转换": self.show_unit_convert,
-            "随机数": self.show_random,
-            "金额大写": self.show_rmb,
-            "罗马数字": self.show_roman
-        })
-        content_layout.addWidget(section4)
         content_layout.addWidget(section1)
+        content_layout.addWidget(section_generate)
+        content_layout.addWidget(section_crypto)
+        content_layout.addWidget(section3)
+        content_layout.addWidget(section_time)
+        content_layout.addWidget(section4)
+        content_layout.addWidget(section_dev)
+        content_layout.addWidget(section6)
 
         content_layout.addStretch()
         scroll = QScrollArea()
@@ -9047,6 +9784,25 @@ class ToolboxWindow(QMainWindow):
 
         bottom_layout.addStretch()
 
+        cache_btn = QPushButton("缓存目录")
+        cache_btn.setFont(ui_font(10, 11))
+        cache_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        cache_btn.setToolTip("打开缓存文件夹")
+        cache_btn.setStyleSheet("""
+            QPushButton {
+                color: #1A73E8;
+                border: none;
+                background: transparent;
+                padding: 0;
+                text-decoration: underline;
+            }
+            QPushButton:hover {
+                color: #1557b0;
+            }
+        """)
+        cache_btn.clicked.connect(self._open_cache_dir)
+        bottom_layout.addWidget(cache_btn)
+
         repo_label = QLabel('<a href="https://github.com/FantasyEngineer/personal_tool">仓库</a>')
         repo_label.setFont(ui_font(10, 11))
         repo_label.setCursor(QCursor(Qt.PointingHandCursor))
@@ -9083,6 +9839,23 @@ class ToolboxWindow(QMainWindow):
         self.update_btn.clicked.connect(self.check_for_updates)
         bottom_layout.addWidget(self.update_btn)
 
+        exit_btn = QPushButton("退出")
+        exit_btn.setFont(ui_font(10, 11))
+        exit_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        exit_btn.setStyleSheet("""
+            QPushButton {
+                color: #D32F2F;
+                background: transparent;
+                border: none;
+                padding: 4px 6px;
+            }
+            QPushButton:hover {
+                color: #B71C1C;
+            }
+        """)
+        exit_btn.clicked.connect(QApplication.instance().quit)
+        bottom_layout.addWidget(exit_btn)
+
         main_layout.addWidget(bottom_bar)
 
         self.stats_timer = QTimer(self)
@@ -9118,6 +9891,7 @@ class ToolboxWindow(QMainWindow):
         btn_layout = QGridLayout()
         btn_layout.setSpacing(8)
 
+        section_buttons = []  # 记录这个分类包含哪些按钮
         for i, btn_text in enumerate(buttons):
             btn = QPushButton(btn_text)
             btn.setFixedHeight(36)
@@ -9158,10 +9932,12 @@ class ToolboxWindow(QMainWindow):
                     background: #1666CE;
                 }
                 """)
-                btn.toggled.connect(toggle_callbacks[btn_text])
+                btn.toggled.connect(lambda checked, t=btn_text: self._record_usage_and_call(toggle_callbacks[t], checked))
                 self.toggle_buttons[btn_text] = btn
             elif callbacks and btn_text in callbacks:
-                btn.clicked.connect(callbacks[btn_text])
+                btn.clicked.connect(lambda _, t=btn_text: self._record_usage_and_call(callbacks[t]))
+            self.all_buttons[btn_text] = btn  # 存储按钮引用用于搜索
+            section_buttons.append(btn_text)  # 记录到分类按钮列表
             row = i // 6
             col = i % 6
             btn_layout.addWidget(btn, row, col)
@@ -9170,6 +9946,8 @@ class ToolboxWindow(QMainWindow):
             btn_layout.setColumnStretch(col, 1)
         layout.addLayout(btn_layout)
 
+        # 存储分类信息：(section_widget, title_label, [button_texts], btn_layout)
+        self.sections.append((section, title_label, section_buttons, btn_layout))
         return section
 
     def set_awake(self, active):
@@ -9355,6 +10133,24 @@ class ToolboxWindow(QMainWindow):
         self.generator_window.show()
         self.generator_window.activateWindow()
 
+    def show_qrcode(self):
+        if self.qr_window is None:
+            self.qr_window = QrCodeWindow()
+        self.qr_window.show()
+        self.qr_window.activateWindow()
+
+    def show_barcode(self):
+        if self.barcode_window is None:
+            self.barcode_window = BarcodeWindow()
+        self.barcode_window.show()
+        self.barcode_window.activateWindow()
+
+    def show_uuid(self):
+        if self.uuid_window is None:
+            self.uuid_window = UuidWindow()
+        self.uuid_window.show()
+        self.uuid_window.activateWindow()
+
     def show_base_convert(self):
         if self.baseconvert_window is None:
             self.baseconvert_window = BaseConvertWindow()
@@ -9373,6 +10169,18 @@ class ToolboxWindow(QMainWindow):
         self.convert_window.show()
         self.convert_window.activateWindow()
 
+    def show_color(self):
+        if self.color_window is None:
+            self.color_window = ColorWindow()
+        self.color_window.show()
+        self.color_window.activateWindow()
+
+    def show_json_yaml(self):
+        if self.json_yaml_window is None:
+            self.json_yaml_window = JsonYamlWindow()
+        self.json_yaml_window.show()
+        self.json_yaml_window.activateWindow()
+
     def show_config(self):
         if self.config_window is None:
             self.config_window = ConfigWindow()
@@ -9390,6 +10198,30 @@ class ToolboxWindow(QMainWindow):
             self.mortgage_window = MortgageWindow()
         self.mortgage_window.show()
         self.mortgage_window.activateWindow()
+
+    def show_http_status(self):
+        if self.http_status_window is None:
+            self.http_status_window = HttpStatusWindow()
+        self.http_status_window.show()
+        self.http_status_window.activateWindow()
+
+    def show_chmod(self):
+        if self.chmod_window is None:
+            self.chmod_window = ChmodWindow()
+        self.chmod_window.show()
+        self.chmod_window.activateWindow()
+
+    def show_datetime(self):
+        if self.datetime_window is None:
+            self.datetime_window = DateTimeWindow()
+        self.datetime_window.show()
+        self.datetime_window.activateWindow()
+
+    def show_timestamp(self):
+        if self.timestamp_window is None:
+            self.timestamp_window = TimestampWindow()
+        self.timestamp_window.show()
+        self.timestamp_window.activateWindow()
 
     def show_unit_convert(self):
         if self.unit_window is None:
@@ -9462,6 +10294,233 @@ class ToolboxWindow(QMainWindow):
             self.speedtest_window = SpeedTestWindow()
         self.speedtest_window.show()
         self.speedtest_window.activateWindow()
+
+    def filter_tools(self):
+        """根据搜索框内容过滤工具按钮，匹配工具名称、内部功能和拼音。"""
+        keyword = self.search_input.text().strip().lower()
+        if not keyword:
+            # 无搜索词时显示所有按钮和分类
+            for btn in self.all_buttons.values():
+                btn.setVisible(True)
+                btn._filter_match = True
+            for section, title_label, _, _ in self.sections:
+                section.setVisible(True)
+            return
+        # 模糊匹配：工具名称、提示内容或拼音包含关键词
+        for btn_text, btn in self.all_buttons.items():
+            tip = TOOL_TIPS.get(btn_text, "").lower()
+            # 检查拼音映射
+            pinyin_match = any(py.startswith(keyword) or keyword == py 
+                             for py, tools in PINYIN_MAP.items() 
+                             if btn_text in tools)
+            match = keyword in btn_text.lower() or keyword in tip or pinyin_match
+            btn.setVisible(match)
+            btn._filter_match = match
+        
+        # 隐藏没有匹配按钮的分类
+        for section, title_label, btn_texts, btn_layout in self.sections:
+            has_visible = any(self.all_buttons[text]._filter_match 
+                            for text in btn_texts if text in self.all_buttons)
+            section.setVisible(has_visible)
+
+    def open_single_match(self):
+        """搜索框按回车时，如果只有一个匹配项，直接打开该工具。"""
+        keyword = self.search_input.text().strip().lower()
+        if not keyword:
+            return
+        matches = []
+        for btn_text, btn in self.all_buttons.items():
+            if not getattr(btn, '_filter_match', False):
+                continue
+            matches.append(btn_text)
+        if len(matches) == 1:
+            btn = self.all_buttons[matches[0]]
+            btn.click()
+            self.search_input.clear()
+
+    def _record_usage_and_call(self, callback, *args):
+        """记录工具使用历史，然后调用原始回调。"""
+        # 从回调函数名推断工具名称
+        callback_name = callback.__name__ if hasattr(callback, '__name__') else str(callback)
+        # 查找对应的工具名称
+        tool_name = None
+        for name, method in [
+            ('进程管理', self.show_process_search),
+            ('端口扫描', self.show_portscan),
+            ('Ping 测试', self.show_ping),
+            ('DNS 查询', self.show_dns),
+            ('路由追踪', self.show_traceroute),
+            ('网络测速', self.show_speedtest),
+            ('配置', self.show_config),
+            ('JSON/XML', self.show_markup),
+            ('编解码', self.show_codec),
+            ('哈希计算', self.show_hash),
+            ('加解密', self.show_crypto),
+            ('正则测试', self.show_regex),
+            ('文本对比', self.show_diff),
+            ('二维码', self.show_qrcode),
+            ('条形码', self.show_barcode),
+            ('UUID', self.show_uuid),
+            ('格式转换', self.show_convert),
+            ('颜色', self.show_color),
+            ('JSON-YAML', self.show_json_yaml),
+            ('文本统计', self.show_textstat),
+            ('Cron 表达式', self.show_cron),
+            ('命令速查', self.show_command_reference),
+            ('HTTP 状态码', self.show_http_status),
+            ('chmod 权限', self.show_chmod),
+            ('日期时间', self.show_datetime),
+            ('时间戳', self.show_timestamp),
+            ('房贷计算器', self.show_mortgage),
+            ('图片处理', self.show_image_tool),
+            ('进制转换', self.show_base_convert),
+            ('商余计算', self.show_divmod),
+            ('单位转换', self.show_unit_convert),
+            ('随机数', self.show_random),
+            ('金额大写', self.show_rmb),
+            ('罗马数字', self.show_roman),
+        ]:
+            if callback == method:
+                tool_name = name
+                break
+        
+        # 记录到历史
+        if tool_name:
+            self._add_to_history(tool_name)
+        
+        # 调用原始回调
+        callback(*args)
+
+    def _load_usage_history(self):
+        """从文件加载使用历史。"""
+        try:
+            with open(TOOL_USAGE_HISTORY_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data[:self.max_history]
+                elif isinstance(data, dict):
+                    # 兼容 LRU 格式，取 key 列表
+                    return list(data.keys())[:self.max_history]
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+        return []
+
+    def _save_usage_history(self):
+        """保存使用历史到文件。"""
+        try:
+            os.makedirs(os.path.dirname(TOOL_USAGE_HISTORY_PATH), exist_ok=True)
+            with open(TOOL_USAGE_HISTORY_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.usage_history, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
+    def _add_to_history(self, tool_name):
+        """添加工具到使用历史。"""
+        if tool_name in self.usage_history:
+            self.usage_history.remove(tool_name)
+        self.usage_history.insert(0, tool_name)
+        if len(self.usage_history) > self.max_history:
+            self.usage_history = self.usage_history[:self.max_history]
+        self._save_usage_history()
+        self._refresh_history_display()
+
+    def _refresh_history_display(self):
+        """刷新使用历史按钮区域。"""
+        # 清空现有历史按钮
+        while self.history_buttons_layout.count():
+            item = self.history_buttons_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        
+        if not self.usage_history:
+            self.history_widget.setVisible(False)
+            return
+        
+        self.history_widget.setVisible(True)
+        
+        # 回调映射
+        callback_map = {
+            '进程管理': self.show_process_search,
+            '端口扫描': self.show_portscan,
+            'Ping 测试': self.show_ping,
+            'DNS 查询': self.show_dns,
+            '路由追踪': self.show_traceroute,
+            '网络测速': self.show_speedtest,
+            '配置': self.show_config,
+            'JSON/XML': self.show_markup,
+            '编解码': self.show_codec,
+            '哈希计算': self.show_hash,
+            '加解密': self.show_crypto,
+            '正则测试': self.show_regex,
+            '文本对比': self.show_diff,
+            '二维码': self.show_qrcode,
+            '条形码': self.show_barcode,
+            'UUID': self.show_uuid,
+            '格式转换': self.show_convert,
+            '颜色': self.show_color,
+            'JSON-YAML': self.show_json_yaml,
+            '文本统计': self.show_textstat,
+            'Cron 表达式': self.show_cron,
+            '命令速查': self.show_command_reference,
+            'HTTP 状态码': self.show_http_status,
+            'chmod 权限': self.show_chmod,
+            '日期时间': self.show_datetime,
+            '时间戳': self.show_timestamp,
+            '房贷计算器': self.show_mortgage,
+            '图片处理': self.show_image_tool,
+            '进制转换': self.show_base_convert,
+            '商余计算': self.show_divmod,
+            '单位转换': self.show_unit_convert,
+            '随机数': self.show_random,
+            '金额大写': self.show_rmb,
+            '罗马数字': self.show_roman,
+        }
+        
+        for name in self.usage_history:
+            btn = QPushButton(name)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(28)
+            btn.setStyleSheet("""
+                QPushButton {
+                    background: #FFFFFF;
+                    border: 1px solid #E0E0E0;
+                    border-radius: 14px;
+                    padding: 0 14px;
+                    font-size: 12px;
+                    color: #555555;
+                }
+                QPushButton:hover {
+                    background: #F0F5FF;
+                    border: 1px solid #1A73E8;
+                    color: #1A73E8;
+                }
+            """)
+            cb = callback_map.get(name)
+            if cb:
+                btn.clicked.connect(lambda checked, callback=cb: callback())
+            self.history_buttons_layout.addWidget(btn)
+        
+        self.history_buttons_layout.addStretch()
+
+    def _clear_all_history(self):
+        """清空所有使用历史。"""
+        self.usage_history.clear()
+        self._save_usage_history()
+        self._refresh_history_display()
+
+    def _open_cache_dir(self):
+        """打开缓存目录。"""
+        import subprocess
+        cache_dir = os.path.join(os.path.expanduser("~"), ".personal_toolbox")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        if sys.platform == "win32":
+            os.startfile(cache_dir)
+        elif sys.platform == "darwin":
+            subprocess.call(["open", cache_dir])
+        else:
+            subprocess.call(["xdg-open", cache_dir])
 
     def copy_to_clipboard(self, text):
         clipboard = QApplication.clipboard()
@@ -9551,23 +10610,16 @@ class CheckUpdateThread(QThread):
 
 
 def startup_log_path():
-    """启动日志：打包后放 exe 旁边，开发时放项目目录，不可写再退回用户目录。"""
-    if getattr(sys, "frozen", False):
-        folders = [os.path.dirname(sys.executable),
-                   os.path.join(os.path.expanduser("~"), ".personal_toolbox")]
-    else:
-        folders = [os.path.dirname(os.path.abspath(__file__)),
-                   os.path.join(os.path.expanduser("~"), ".personal_toolbox")]
-    for folder in folders:
-        path = os.path.join(folder, "startup.log")
-        try:
-            os.makedirs(folder, exist_ok=True)
-            with open(path, "a", encoding="utf-8"):
-                pass
-            return path
-        except OSError:
-            continue
-    return None
+    """启动日志：统一保存到用户缓存目录。"""
+    folder = os.path.join(os.path.expanduser("~"), ".personal_toolbox")
+    path = os.path.join(folder, "startup.log")
+    try:
+        os.makedirs(folder, exist_ok=True)
+        with open(path, "a", encoding="utf-8"):
+            pass
+        return path
+    except OSError:
+        return None
 
 
 def write_startup_log(text, reset=False):
@@ -9611,6 +10663,14 @@ if __name__ == "__main__":
             faulthandler.enable(file=crash_file, all_threads=True)
         except OSError:
             crash_file = None
+    # 防止多开：用 QLockFile 锁定用户目录下的锁文件，进程退出自动释放。
+    lock_dir = os.path.join(os.path.expanduser("~"), ".personal_toolbox")
+    os.makedirs(lock_dir, exist_ok=True)
+    lock_file = QLockFile(os.path.join(lock_dir, "app.lock"))
+    if not lock_file.tryLock(0):
+        write_startup_log("检测到已有实例运行，退出")
+        fatal_dialog("应用已在运行中，请勿重复打开。")
+        sys.exit(1)
     try:
         app = QApplication(sys.argv)
         app.setWindowIcon(app_icon())

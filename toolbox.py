@@ -49,8 +49,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QTreeWidget, QTreeWidgetItem, QHeaderView,
                               QStyledItemDelegate, QStyle, QGraphicsOpacityEffect,
                               QDialog, QFormLayout, QDialogButtonBox,
-                              QDateEdit, QDateTimeEdit, QGroupBox)
-from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QThread, pyqtSignal, QTimer, QUrl, QLockFile, QDate, QDateTime
+                              QDateEdit, QDateTimeEdit, QGroupBox, QTimeEdit)
+from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QThread, QObject, pyqtSignal, QTimer, QUrl, QLockFile, QDate, QDateTime, QTime
 from PyQt5.QtGui import (QFont, QCursor, QColor, QPen, QPixmap, QPainter, QIcon,
                          QImage, QLinearGradient, QBrush, QDesktopServices)
 
@@ -7106,6 +7106,77 @@ def _mac_cover_menu_bar(widget):
     return True
 
 
+def _mac_objc_runtime():
+    import ctypes
+    import ctypes.util
+    objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+    objc.sel_registerName.restype = ctypes.c_void_p
+    objc.sel_registerName.argtypes = [ctypes.c_char_p]
+    objc.objc_getClass.restype = ctypes.c_void_p
+    objc.objc_getClass.argtypes = [ctypes.c_char_p]
+    return objc
+
+
+def _mac_is_cocoa():
+    return platform.system() == "Darwin" and QApplication.platformName() == "cocoa"
+
+
+def _mac_frontmost_pid():
+    """提醒弹出时用户正在用的 app 的 PID；本进程或取不到时返回 None。"""
+    if not _mac_is_cocoa():
+        return None
+    import ctypes
+    try:
+        objc = _mac_objc_runtime()
+        send = objc.objc_msgSend
+        send.restype = ctypes.c_void_p
+        send.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        workspace = send(objc.objc_getClass(b"NSWorkspace"),
+                         objc.sel_registerName(b"sharedWorkspace"))
+        app = send(workspace, objc.sel_registerName(b"frontmostApplication"))
+        if not app:
+            return None
+        send.restype = ctypes.c_int
+        pid = send(app, objc.sel_registerName(b"processIdentifier"))
+    except Exception:
+        return None
+    return pid if pid > 0 and pid != os.getpid() else None
+
+
+def _mac_reactivate(pid):
+    """把前台交还给指定 PID 的 app：点掉提醒卡片不该顺手把工具箱吊起来。"""
+    if not pid or pid <= 0 or not _mac_is_cocoa():
+        return False
+    import ctypes
+    try:
+        objc = _mac_objc_runtime()
+        send = objc.objc_msgSend
+        send.restype = ctypes.c_void_p
+        send.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+        app = send(objc.objc_getClass(b"NSRunningApplication"),
+                   objc.sel_registerName(b"runningApplicationWithProcessIdentifier:"), int(pid))
+        if not app:
+            return False
+
+        # macOS 14 起 activateWithOptions: 换成 activate；探测后再调，
+        # 命中不存在的 selector 是 doesNotRecognizeSelector，Python 抓不到直接 abort。
+        send.restype = ctypes.c_bool
+        send.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        probe = objc.sel_registerName(b"respondsToSelector:")
+        if send(app, probe, objc.sel_registerName(b"activate")):
+            send.restype = ctypes.c_bool
+            send.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            return bool(send(app, objc.sel_registerName(b"activate")))
+        if send(app, probe, objc.sel_registerName(b"activateWithOptions:")):
+            send.restype = ctypes.c_bool
+            send.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+            # NSApplicationActivateIgnoringOtherApps
+            return bool(send(app, objc.sel_registerName(b"activateWithOptions:"), 1 << 1))
+    except Exception:
+        return False
+    return False
+
+
 class MatrixRainOverlay(QWidget):
     """全屏黑客帝国代码雨覆盖层，置顶并覆盖菜单栏；ESC 或双击任意处关闭。"""
 
@@ -9404,6 +9475,7 @@ TOOL_TIPS = {
     "HTTP 状态码": "功能：按代码或关键词搜索 HTTP 状态码，显示含义和常见场景",
     "chmod 权限": "功能：八进制 ↔ 符号表示互转，可视化 9 个权限位",
     "日期时间": "功能：日期差计算、加减天数、时区转换",
+    "打卡提醒": "功能：定时弹框提醒（上班/下班打卡）· 工作日/每天/仅当天 · 稍后再提醒 · 提示音 · 开机自启",
     "房贷计算器": "功能：等额本息 / 等额本金",
     "图片处理": "页签：转 Base64 / 格式转换 / 缩放压缩",
     "文字雨": "功能：桌面字符雨特效，开启时自动防黑屏（开关）",
@@ -9468,6 +9540,10 @@ PINYIN_MAP = {
     "shijian": ["日期时间", "格式转换"],
     "shiqu": ["日期时间"],
     "shizhong": ["日期时间"],
+    "daka": ["打卡提醒"],
+    "tixing": ["打卡提醒"],
+    "shangban": ["打卡提醒"],
+    "xiaban": ["打卡提醒"],
     "fangdai": ["房贷计算器"],
     "tupian": ["图片处理"],
     "wenziyu": ["文字雨"],
@@ -9491,12 +9567,594 @@ PINYIN_MAP = {
 }
 
 
+# ---- 打卡提醒 -------------------------------------------------------------
+REMINDERS_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "reminders.json")
+REPEAT_DAILY = "每天"
+REPEAT_WEEKDAY = "工作日"
+REPEAT_ONCE = "仅当天"
+SNOOZE_MINUTES = 10
+# 错过太久就不再弹，避免开机时把昨天的提醒一次性补出来；只登记为已触发。
+MISSED_QUIET_SECONDS = 3 * 3600
+LAUNCH_AGENT_PATH = os.path.join(os.path.expanduser("~"), "Library",
+                                 "LaunchAgents", "com.personal.toolbox.plist")
+LAUNCH_AGENT_LABEL = "com.personal.toolbox"
+WIN_RUN_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
+WIN_RUN_NAME = "PersonalToolbox"
+
+
+def _hhmm_valid(text):
+    return bool(re.match(r"^([01]\d|2[0-3]):[0-5]\d$", text or ""))
+
+
+def _rule_time(rule):
+    return int(rule["time"][:2]), int(rule["time"][3:5])
+
+
+def load_reminders():
+    try:
+        with open(REMINDERS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {"rules": [], "sound": True}
+    rules = data.get("rules") if isinstance(data, dict) else None
+    clean = [r for r in (rules or [])
+             if isinstance(r, dict) and r.get("name") and _hhmm_valid(r.get("time"))]
+    sound = data.get("sound", True) if isinstance(data, dict) else True
+    return {"rules": clean, "sound": bool(sound)}
+
+
+def save_reminders(state):
+    try:
+        os.makedirs(os.path.dirname(REMINDERS_PATH), exist_ok=True)
+        with open(REMINDERS_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.chmod(REMINDERS_PATH, 0o600)
+    except OSError:
+        pass
+
+
+def reminder_occurrence(rule, now):
+    """规则在 now 之前最近一次的触发时刻；还没到点返回 None。"""
+    if not _hhmm_valid(rule.get("time")):
+        return None
+    hh, mm = _rule_time(rule)
+    repeat = rule.get("repeat", REPEAT_DAILY)
+    if repeat == REPEAT_ONCE:
+        day = QDate.fromString(rule.get("date", ""), "yyyy-MM-dd")
+        if not day.isValid():
+            return None
+        occ = QDateTime(day, QTime(hh, mm))
+        return occ if occ <= now else None
+    for back in range(0, 8):
+        day = now.date().addDays(-back)
+        if repeat == REPEAT_WEEKDAY and day.dayOfWeek() > 5:
+            continue
+        occ = QDateTime(day, QTime(hh, mm))
+        if occ <= now:
+            return occ
+    return None
+
+
+def reminder_upcoming(rule, now):
+    """规则在 now 之后最近一次的触发时刻，用于"下一条提醒"提示。"""
+    if not _hhmm_valid(rule.get("time")):
+        return None
+    hh, mm = _rule_time(rule)
+    repeat = rule.get("repeat", REPEAT_DAILY)
+    if repeat == REPEAT_ONCE:
+        day = QDate.fromString(rule.get("date", ""), "yyyy-MM-dd")
+        if not day.isValid():
+            return None
+        occ = QDateTime(day, QTime(hh, mm))
+        return occ if occ > now else None
+    for ahead in range(0, 8):
+        day = now.date().addDays(ahead)
+        if repeat == REPEAT_WEEKDAY and day.dayOfWeek() > 5:
+            continue
+        occ = QDateTime(day, QTime(hh, mm))
+        if occ > now:
+            return occ
+    return None
+
+
+def next_reminder(rules, now):
+    best_name, best_when = None, None
+    for rule in rules:
+        if not rule.get("enabled", True):
+            continue
+        when = reminder_upcoming(rule, now)
+        if when and (best_when is None or when < best_when):
+            best_when, best_name = when, rule.get("name", "")
+    return best_name, best_when
+
+
+def play_alert_sound():
+    """用系统自带能力发声，不引入依赖；环境不配合时静默。"""
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            subprocess.Popen(["afplay", "/System/Library/Sounds/Glass.aiff"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif system == "Windows":
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+    except (OSError, ImportError):
+        pass
+
+
+def app_launch_path():
+    """自启指向的目标：打包后是 .app/exe，源码运行是 python + 脚本。"""
+    if getattr(sys, "frozen", False):
+        exe = sys.executable
+        if platform.system() == "Darwin" and "/Contents/MacOS/" in exe:
+            return exe[:exe.index("/Contents/MacOS/")]
+        return exe
+    return os.path.abspath(__file__)
+
+
+def autostart_programs():
+    if getattr(sys, "frozen", False) and platform.system() == "Darwin":
+        return ["/usr/bin/open", "-a", app_launch_path()]
+    if getattr(sys, "frozen", False):
+        return [app_launch_path()]
+    return [sys.executable, app_launch_path()]
+
+
+def autostart_status():
+    if platform.system() == "Darwin":
+        return os.path.exists(LAUNCH_AGENT_PATH)
+    if platform.system() == "Windows":
+        result = subprocess.run(["reg", "query", WIN_RUN_KEY, "/v", WIN_RUN_NAME],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return result.returncode == 0
+    return False
+
+
+def set_autostart(enable):
+    """写入或移除开机自启项，返回给用户核对的说明文字。"""
+    system = platform.system()
+    if system == "Darwin":
+        import plistlib
+        if enable:
+            payload = {"Label": LAUNCH_AGENT_LABEL,
+                       "ProgramArguments": autostart_programs(),
+                       "RunAtLoad": True,
+                       "KeepAlive": False}
+            os.makedirs(os.path.dirname(LAUNCH_AGENT_PATH), exist_ok=True)
+            with open(LAUNCH_AGENT_PATH, "wb") as f:
+                plistlib.dump(payload, f)
+            os.chmod(LAUNCH_AGENT_PATH, 0o600)
+            uid = os.getuid()
+            # 只卸载旧任务、不 bootstrap：bootstrap 会按 RunAtLoad 立刻拉起一个新实例，
+            # 而新实例撞上单实例守卫，等于给用户自己弹一次"重复打开"。plist 留着，下次登录生效。
+            subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (uid, LAUNCH_AGENT_LABEL)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return "已开启：%s\n下次登录生效，启动命令：%s" % (
+                LAUNCH_AGENT_PATH, " ".join(autostart_programs()))
+        uid = os.getuid()
+        subprocess.run(["launchctl", "bootout", "gui/%d/%s" % (uid, LAUNCH_AGENT_LABEL)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            os.remove(LAUNCH_AGENT_PATH)
+        except OSError:
+            pass
+        return "已关闭：删除 %s" % LAUNCH_AGENT_PATH
+
+    if system == "Windows":
+        if enable:
+            subprocess.run(["reg", "add", WIN_RUN_KEY, "/v", WIN_RUN_NAME,
+                            "/t", "REG_SZ", "/d", '"%s"' % app_launch_path(), "/f"],
+                           check=True)
+            return "已开启：HKCU 启动项 %s = %s" % (WIN_RUN_NAME, app_launch_path())
+        subprocess.run(["reg", "delete", WIN_RUN_KEY, "/v", WIN_RUN_NAME, "/f"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return "已关闭：删除启动项 %s" % WIN_RUN_NAME
+
+    return "当前平台不支持开机自启，请保持应用运行（含最小化到托盘）"
+
+
+class ReminderCard(QWidget):
+    """屏幕正中的置顶打卡卡片。
+
+    外层窗口透明，只为阴影留出空间；白底圆角画在内层 body 上。裸 QWidget 不加
+    WA_StyledBackground 时样式表的 background 不会被绘制，整张卡片就是透明的。
+    """
+
+    snoozed = pyqtSignal()
+    dismissed = pyqtSignal()
+
+    CARD_W = 420
+    CARD_H = 190
+    SHADOW_MARGIN = 22
+
+    def __init__(self, title, subtitle, note):
+        # 不用 Qt.Tool/Qt.Dialog：这类面板在 macOS 上会随应用失焦被收起，
+        # 用户就只有"切回工具箱"时才能看到提醒。普通窗口 + AppKit 抬层级才常驻最上层。
+        super().__init__(None, Qt.Window | Qt.FramelessWindowHint |
+                         Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(self.CARD_W + 2 * self.SHADOW_MARGIN,
+                          self.CARD_H + 2 * self.SHADOW_MARGIN)
+        # 卡片出现时用户正在用的 app；关闭后把前台还给它（必须在 show 之前记录）
+        self._prev_pid = _mac_frontmost_pid()
+
+        body = QWidget(self)
+        body.setObjectName("reminderCardBody")
+        body.setAttribute(Qt.WA_StyledBackground, True)
+        body.setFixedSize(self.CARD_W, self.CARD_H)
+        body.move(self.SHADOW_MARGIN, self.SHADOW_MARGIN)
+        body.setStyleSheet("""
+            QWidget#reminderCardBody { background: #FFFFFF; border: 1px solid #D0D0D0;
+                border-radius: 10px; }
+        """)
+        shadow = QGraphicsDropShadowEffect(body)
+        shadow.setBlurRadius(40)
+        shadow.setOffset(0, 6)
+        shadow.setColor(QColor(0, 0, 0, 70))
+        body.setGraphicsEffect(shadow)
+
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(24, 22, 24, 18)
+        layout.setSpacing(6)
+
+        title_label = QLabel(title)
+        title_label.setFont(QFont("PingFang SC", 20, QFont.Bold))
+        title_label.setStyleSheet("color: #1F2328; border: none;")
+        layout.addWidget(title_label)
+
+        sub_label = QLabel(subtitle)
+        sub_label.setStyleSheet("color: #57606A; font-size: 13px; border: none;")
+        layout.addWidget(sub_label)
+
+        if note:
+            note_label = QLabel(note)
+            note_label.setStyleSheet("color: #CF222E; font-size: 12px; border: none;")
+            layout.addWidget(note_label)
+
+        layout.addStretch()
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        done_btn = QPushButton("已打卡")
+        done_btn.setFixedSize(110, 34)
+        done_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        done_btn.setStyleSheet(_primary_btn() + "QPushButton { font-size: 13px; }")
+        done_btn.clicked.connect(self.close)
+        btn_row.addWidget(done_btn)
+
+        snooze_btn = QPushButton("稍后 %d 分钟" % SNOOZE_MINUTES)
+        snooze_btn.setFixedSize(130, 34)
+        snooze_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        snooze_btn.setStyleSheet(_secondary_btn() + "QPushButton { font-size: 13px; }")
+        snooze_btn.clicked.connect(self._do_snooze)
+        btn_row.addWidget(snooze_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self._center_on_screen()
+
+    def _do_snooze(self):
+        self.snoozed.emit()
+        self.close()
+
+    def _center_on_screen(self):
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        geo = screen.availableGeometry()
+        self.move(geo.x() + (geo.width() - self.width()) // 2,
+                  geo.y() + (geo.height() - self.height()) // 2)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.raise_()
+        self.activateWindow()
+        self.setFocus()
+        # 抬到菜单栏之上并关掉 hidesOnDeactivate：这样切在别的应用里也能弹出来
+        if _mac_is_cocoa():
+            try:
+                _mac_cover_menu_bar(self)
+            except Exception:
+                pass
+
+    def closeEvent(self, event):
+        self.dismissed.emit()
+        super().closeEvent(event)
+        # 点按钮会让 macOS 顺手激活工具箱，这里立刻把前台还给提醒弹出时用户在用的 app
+        if self._prev_pid:
+            _mac_reactivate(self._prev_pid)
+            self._prev_pid = None
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
+
+
+class ReminderEngine(QObject):
+    """20 秒轮询一次：到点弹框，顺带覆盖睡眠唤醒后错过的提醒。"""
+
+    def __init__(self, state, parent=None):
+        super().__init__(parent)
+        self.state = state
+        self.card = None
+        self.snoozes = []
+        self._timer = QTimer(self)
+        self._timer.setInterval(20000)
+        self._timer.timeout.connect(self.tick)
+        self._timer.start()
+        self.tick()
+
+    def rules(self):
+        return self.state["rules"]
+
+    def tick(self):
+        if self.card is not None:
+            return
+        now = QDateTime.currentDateTime()
+
+        due = [s for s in self.snoozes if s[0] <= now]
+        if due:
+            due.sort(key=lambda s: s[0])
+            when, rule, key = due[0]
+            self.snoozes.remove(due[0])
+            self._popup(rule, key, now, again=True)
+            return
+
+        for rule in self.rules():
+            if not rule.get("enabled", True):
+                continue
+            occ = reminder_occurrence(rule, now)
+            if occ is None:
+                continue
+            key = occ.toString("yyyy-MM-dd HH:mm")
+            if rule.get("last_fired") == key:
+                continue
+            elapsed = occ.secsTo(now)
+            if elapsed > MISSED_QUIET_SECONDS:
+                # 太久以前：不打扰，也不写"上次触发"；仅当天规则顺手停用，避免悬着
+                if rule.get("repeat") == REPEAT_ONCE:
+                    rule["enabled"] = False
+                    save_reminders(self.state)
+                continue
+            rule["last_fired"] = key
+            if rule.get("repeat") == REPEAT_ONCE:
+                rule["enabled"] = False
+            save_reminders(self.state)
+            self._popup(rule, key, now, missed=elapsed > 120)
+            return
+
+    def _popup(self, rule, key, now, missed=False, again=False):
+        subtitle = "%s · %s" % (rule.get("time", ""), rule.get("repeat", REPEAT_DAILY))
+        note = ""
+        if missed:
+            note = "已错过 %s（现在 %s）" % (key.split(" ")[1], now.toString("HH:mm"))
+        elif again:
+            note = "上次提醒后你选择了稍后再提醒"
+        self.card = ReminderCard(rule.get("name", "提醒"), subtitle, note)
+        self.card.snoozed.connect(lambda: self._add_snooze(rule, key))
+        self.card.dismissed.connect(self._clear_card)
+        if self.state.get("sound", True):
+            play_alert_sound()
+        self.card.show()
+
+    def _add_snooze(self, rule, key):
+        when = QDateTime.currentDateTime().addSecs(SNOOZE_MINUTES * 60)
+        self.snoozes.append((when, rule, key))
+
+    def _clear_card(self):
+        if self.card is not None:
+            self.card.deleteLater()
+            self.card = None
+
+
+class ReminderWindow(QMainWindow):
+    """打卡提醒设置：规则增删、提示音、开机自启。"""
+
+    def __init__(self, engine):
+        super().__init__()
+        self.engine = engine
+        self.setWindowTitle("打卡提醒")
+        self.setGeometry(*tool_win_geometry())
+        self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
+        self._loading = False
+        self.init_ui()
+        self.reload_table()
+
+    def init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(15, 15, 15, 10)
+        layout.setSpacing(10)
+
+        hint = QLabel("应用在运行（含最小化到托盘）时才会提醒；错过的提醒在 3 小时内补弹。")
+        hint.setStyleSheet("color: #57606A; font-size: 12px;")
+        layout.addWidget(hint)
+
+        form = QHBoxLayout()
+        form.setSpacing(8)
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("提醒名称，如 上班打卡")
+        self.name_input.setFixedWidth(200)
+        self.name_input.setStyleSheet(_lineedit_style())
+        self.name_input.returnPressed.connect(self.add_rule)
+        form.addWidget(self.name_input)
+
+        self.time_input = QTimeEdit()
+        self.time_input.setDisplayFormat("HH:mm")
+        self.time_input.setTime(QTime(9, 0))
+        self.time_input.setFixedWidth(90)
+        self.time_input.setStyleSheet(_lineedit_style().replace("QLineEdit", "QTimeEdit"))
+        form.addWidget(self.time_input)
+
+        self.repeat_input = QComboBox()
+        self.repeat_input.addItems([REPEAT_DAILY, REPEAT_WEEKDAY, REPEAT_ONCE])
+        self.repeat_input.setFixedWidth(110)
+        self.repeat_input.setStyleSheet(_combo_style())
+        form.addWidget(self.repeat_input)
+
+        add_btn = QPushButton("添加")
+        add_btn.setFixedSize(90, 30)
+        add_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        add_btn.setStyleSheet(_primary_btn())
+        add_btn.clicked.connect(self.add_rule)
+        form.addWidget(add_btn)
+
+        del_btn = QPushButton("删除选中")
+        del_btn.setFixedSize(90, 30)
+        del_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        del_btn.setStyleSheet(_secondary_btn())
+        del_btn.clicked.connect(self.delete_rule)
+        form.addWidget(del_btn)
+        form.addStretch()
+        layout.addLayout(form)
+
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(8)
+        for label, hour in (("上班 09:00", 9), ("下班 18:00", 18), ("午休 12:00", 12)):
+            btn = QPushButton(label)
+            btn.setFixedSize(110, 28)
+            btn.setCursor(QCursor(Qt.PointingHandCursor))
+            btn.setStyleSheet(_secondary_btn())
+            btn.clicked.connect(lambda _=False, h=hour, n=label: self.fill_preset(n, h))
+            preset_row.addWidget(btn)
+        preset_row.addStretch()
+        layout.addLayout(preset_row)
+
+        self.table = QTreeWidget()
+        self.table.setHeaderLabels(["名称", "时间", "重复", "启用", "上次触发"])
+        self.table.setRootIsDecorated(False)
+        self.table.setSelectionMode(QTreeWidget.SingleSelection)
+        self.table.setStyleSheet("""
+            QTreeWidget { border: 1px solid #D0D0D0; border-radius: 4px;
+                font-family: "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13px; }
+            QHeaderView::section { background: #FAFAFA; color: #57606A; border: none;
+                border-bottom: 1px solid #E0E0E0; padding: 6px; }
+        """)
+        self.table.header().setStretchLastSection(True)
+        for i, width in enumerate((180, 80, 80, 70)):
+            self.table.setColumnWidth(i, width)
+        self.table.itemChanged.connect(self.on_item_changed)
+        layout.addWidget(self.table, 1)
+
+        bottom = QHBoxLayout()
+        bottom.setSpacing(14)
+        self.sound_check = QCheckBox("提示音")
+        self.sound_check.setChecked(bool(self.engine.state.get("sound", True)))
+        self.sound_check.toggled.connect(self.on_sound_toggled)
+        bottom.addWidget(self.sound_check)
+
+        self.autostart_check = QCheckBox("开机自动启动")
+        self.autostart_check.setChecked(autostart_status())
+        self.autostart_check.toggled.connect(self.on_autostart_toggled)
+        bottom.addWidget(self.autostart_check)
+        bottom.addStretch()
+        layout.addLayout(bottom)
+
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color: #57606A; font-size: 12px;")
+        layout.addWidget(self.status_label)
+
+        self.update_next_label()
+
+    def fill_preset(self, label, hour):
+        name = "上班打卡" if "上班" in label else ("下班打卡" if "下班" in label else "午休提醒")
+        self.name_input.setText(name)
+        self.time_input.setTime(QTime(hour, 0))
+        self.repeat_input.setCurrentText(REPEAT_WEEKDAY)
+        self.name_input.setFocus()
+
+    def add_rule(self):
+        name = self.name_input.text().strip()
+        if not name:
+            self.status_label.setText("请填写提醒名称")
+            self.name_input.setFocus()
+            return
+        rule = {"name": name,
+                "time": self.time_input.time().toString("HH:mm"),
+                "repeat": self.repeat_input.currentText(),
+                "enabled": True}
+        if rule["repeat"] == REPEAT_ONCE:
+            rule["date"] = QDate.currentDate().toString("yyyy-MM-dd")
+        self.engine.rules().append(rule)
+        save_reminders(self.engine.state)
+        self.name_input.clear()
+        self.reload_table()
+        self.update_next_label()
+
+    def delete_rule(self):
+        item = self.table.currentItem()
+        if item is None:
+            self.status_label.setText("请先选中要删除的提醒")
+            return
+        index = self.table.indexOfTopLevelItem(item)
+        if 0 <= index < len(self.engine.rules()):
+            self.engine.rules().pop(index)
+            save_reminders(self.engine.state)
+        self.reload_table()
+        self.update_next_label()
+
+    def reload_table(self):
+        self._loading = True
+        self.table.clear()
+        for rule in self.engine.rules():
+            item = QTreeWidgetItem([
+                rule.get("name", ""),
+                rule.get("time", ""),
+                rule.get("repeat", REPEAT_DAILY),
+                "",
+                rule.get("last_fired", "—"),
+            ])
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(3, Qt.Checked if rule.get("enabled", True) else Qt.Unchecked)
+            self.table.addTopLevelItem(item)
+        self._loading = False
+
+    def on_item_changed(self, item, column):
+        if self._loading or column != 3:
+            return
+        index = self.table.indexOfTopLevelItem(item)
+        if not (0 <= index < len(self.engine.rules())):
+            return
+        rule = self.engine.rules()[index]
+        rule["enabled"] = item.checkState(3) == Qt.Checked
+        save_reminders(self.engine.state)
+        self.update_next_label()
+
+    def on_sound_toggled(self, checked):
+        self.engine.state["sound"] = checked
+        save_reminders(self.engine.state)
+
+    def on_autostart_toggled(self, checked):
+        try:
+            self.status_label.setText(set_autostart(checked))
+        except Exception as exc:
+            self.autostart_check.blockSignals(True)
+            self.autostart_check.setChecked(autostart_status())
+            self.autostart_check.blockSignals(False)
+            self.status_label.setText("设置失败：%s" % exc)
+
+    def update_next_label(self):
+        now = QDateTime.currentDateTime()
+        name, when = next_reminder(self.engine.rules(), now)
+        if when is None:
+            self.status_label.setText("当前没有启用的提醒")
+        else:
+            self.status_label.setText("下一条：%s  %s" % (
+                name, when.toString("MM-dd HH:mm")))
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+
+
 class ToolboxWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"系统工具箱 v{APP_VERSION}")
         screen = QApplication.primaryScreen().availableGeometry()
-        w, h = 700, int(screen.height() * 0.6)
+        w, h = 700, int(screen.height() * 0.68)
         self.setGeometry(screen.x() + (screen.width() - w) // 2,
                          screen.y() + (screen.height() - h) // 2, w, h)
         self.setStyleSheet("""
@@ -9538,9 +10196,12 @@ class ToolboxWindow(QMainWindow):
         self.chmod_window = None
         self.datetime_window = None
         self.timestamp_window = None
+        self.reminder_window = None
         self.tray_icon = None
         self.init_ui()
         self.init_tray()
+        # 引擎挂在主窗口上：窗口关掉、最小化到托盘后照样按点弹框
+        self.reminder_engine = ReminderEngine(load_reminders(), self)
 
     def init_ui(self):
         central = QWidget()
@@ -9696,10 +10357,11 @@ class ToolboxWindow(QMainWindow):
         })
 
         section_time = self.create_section("时间工具", [
-            "日期时间", "时间戳"
+            "日期时间", "时间戳", "打卡提醒"
         ], {
             "日期时间": self.show_datetime,
-            "时间戳": self.show_timestamp
+            "时间戳": self.show_timestamp,
+            "打卡提醒": self.show_reminder
         })
 
         section4 = self.create_section("数学工具", [
@@ -10223,6 +10885,13 @@ class ToolboxWindow(QMainWindow):
         self.timestamp_window.show()
         self.timestamp_window.activateWindow()
 
+    def show_reminder(self):
+        if self.reminder_window is None:
+            self.reminder_window = ReminderWindow(self.reminder_engine)
+        self.reminder_window.update_next_label()
+        self.reminder_window.show()
+        self.reminder_window.activateWindow()
+
     def show_unit_convert(self):
         if self.unit_window is None:
             self.unit_window = UnitConvertWindow()
@@ -10636,6 +11305,9 @@ def write_startup_log(text, reset=False):
 def fatal_dialog(text):
     """启动失败时弹出看得见的提示；Qt 建不起来就用 Win32 弹窗兜底。"""
     try:
+        # QMessageBox 之前必须有 QApplication，否则 Qt 直接 abort()：那是 C++ 层的崩溃，
+        # Python 的 except 抓不到，只会留下一份崩溃报告。引用必须握住，临时对象一析构就又没了。
+        _app_keepalive = QApplication.instance() or QApplication(sys.argv[:1])
         QMessageBox.critical(None, "系统工具箱启动失败", text)
         return
     except Exception:
@@ -10644,7 +11316,7 @@ def fatal_dialog(text):
         import ctypes
         ctypes.windll.user32.MessageBoxW(0, text, "系统工具箱启动失败", 0x10)
     except Exception:
-        pass
+        print(text, file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -49,13 +49,14 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QTreeWidget, QTreeWidgetItem, QHeaderView,
                               QStyledItemDelegate, QStyle, QGraphicsOpacityEffect,
                               QDialog, QFormLayout, QDialogButtonBox,
-                              QDateEdit, QDateTimeEdit, QGroupBox, QTimeEdit)
+                              QDateEdit, QDateTimeEdit, QGroupBox, QTimeEdit,
+                              QAbstractItemView)
 from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QThread, QObject, pyqtSignal, QTimer, QUrl, QLockFile, QDate, QDateTime, QTime
 from PyQt5.QtGui import (QFont, QCursor, QColor, QPen, QPixmap, QPainter, QIcon,
-                         QImage, QLinearGradient, QBrush, QDesktopServices)
+                         QImage, QLinearGradient, QBrush, QDesktopServices, QPalette)
 
 
-APP_VERSION = "1.0.18"
+APP_VERSION = "1.0.19"
 UPDATE_CHECK_URL = "https://gitee.com/jimmy_hou/personal_tool/raw/main/version.json"
 
 
@@ -396,6 +397,8 @@ def app_icon():
 HISTORY_LIMIT = 50
 JSON_HISTORY_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "json_history.json")
 TOOL_USAGE_HISTORY_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "tool_usage_history.json")
+SECTION_ORDER_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "section_order.json")
+TOOL_ORDER_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "tool_order.json")
 
 
 def load_history(path):
@@ -420,6 +423,46 @@ def append_history(path, entry):
     except OSError:
         pass
     return items
+
+
+def load_section_order():
+    try:
+        with open(SECTION_ORDER_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    return [t for t in data if isinstance(t, str)] if isinstance(data, list) else []
+
+
+def save_section_order(order):
+    try:
+        os.makedirs(os.path.dirname(SECTION_ORDER_PATH), exist_ok=True)
+        with open(SECTION_ORDER_PATH, "w", encoding="utf-8") as f:
+            json.dump(order, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def load_tool_order():
+    try:
+        with open(TOOL_ORDER_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: [t for t in v if isinstance(t, str)]
+            for k, v in data.items()
+            if isinstance(k, str) and isinstance(v, list)}
+
+
+def save_tool_order(order):
+    try:
+        os.makedirs(os.path.dirname(TOOL_ORDER_PATH), exist_ok=True)
+        with open(TOOL_ORDER_PATH, "w", encoding="utf-8") as f:
+            json.dump(order, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
 
 
 class _ProcessItem(QTreeWidgetItem):
@@ -10149,6 +10192,174 @@ class ReminderWindow(QMainWindow):
             self.close()
 
 
+class _DragTree(QTreeWidget):
+    orderChanged = pyqtSignal()
+
+    def dropEvent(self, event):
+        super().dropEvent(event)
+        self.orderChanged.emit()
+
+
+class SectionOrderWindow(QMainWindow):
+    """大类/工具排序：拖动大类调整顺序，拖动工具在类内排序或换到别的大类。"""
+
+    def __init__(self, main):
+        super().__init__()
+        self.main = main
+        self.setWindowTitle("大类排序")
+        self.setGeometry(*tool_win_geometry())
+        self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(15, 12, 15, 12)
+        layout.setSpacing(8)
+
+        hint = QLabel("拖动大类调整顺序；展开大类后拖动工具可在类内排序，或拖到别的大类上换类；也可选中后用右侧上移 / 下移微调。调整后立即生效并保存。")
+        hint.setStyleSheet("color: #57606A; font-size: 12px;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        mid = QHBoxLayout()
+        mid.setSpacing(8)
+        self.tree = _DragTree()
+        self.tree.setHeaderHidden(True)
+        self.tree.setIndentation(20)
+        self.tree.setDragDropMode(QAbstractItemView.InternalMove)
+        self.tree.setDragEnabled(True)
+        self.tree.setAcceptDrops(True)
+        self.tree.setDropIndicatorShown(True)
+        self.tree.setDefaultDropAction(Qt.MoveAction)
+        self.tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.tree.setStyleSheet("""
+            QTreeWidget { border: 1px solid #E5E7EB; border-radius: 8px; background: #FFFFFF; outline: 0; }
+            QTreeWidget::item { height: 30px; color: #1F2328; font-size: 13px; }
+            QTreeWidget::item:selected { background: transparent; color: #1F2328; }
+            QTreeWidget::item:hover { background: #F5F8FC; }
+        """)
+        pal = self.tree.palette()
+        pal.setColor(QPalette.Highlight, Qt.transparent)
+        pal.setColor(QPalette.HighlightedText, QColor("#1F2328"))
+        self.tree.setPalette(pal)
+        self.tree.orderChanged.connect(self._sync_from_tree)
+        self.tree.currentItemChanged.connect(self._update_move_buttons)
+        mid.addWidget(self.tree, 1)
+
+        side = QVBoxLayout()
+        side.setSpacing(6)
+        self.up_btn = QPushButton("上移")
+        self.down_btn = QPushButton("下移")
+        for b in (self.up_btn, self.down_btn):
+            b.setFixedSize(56, 30)
+            b.setCursor(QCursor(Qt.PointingHandCursor))
+            b.setStyleSheet(_secondary_btn() + "QPushButton { font-size: 12px; }")
+        self.up_btn.clicked.connect(lambda: self._move(-1))
+        self.down_btn.clicked.connect(lambda: self._move(1))
+        side.addWidget(self.up_btn)
+        side.addWidget(self.down_btn)
+        side.addStretch()
+        mid.addLayout(side)
+        layout.addLayout(mid, 1)
+
+        btn_row = QHBoxLayout()
+        reset_btn = QPushButton("恢复默认")
+        reset_btn.setFixedSize(90, 30)
+        reset_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        reset_btn.setStyleSheet(_secondary_btn() + "QPushButton { font-size: 12px; }")
+        reset_btn.clicked.connect(self._reset)
+        btn_row.addWidget(reset_btn)
+        btn_row.addStretch()
+        done_btn = QPushButton("完成")
+        done_btn.setFixedSize(80, 30)
+        done_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        done_btn.setStyleSheet(_primary_btn() + "QPushButton { font-size: 12px; }")
+        done_btn.clicked.connect(self.close)
+        btn_row.addWidget(done_btn)
+        layout.addLayout(btn_row)
+
+        self.refresh()
+
+    def refresh(self):
+        self.tree.clear()
+        for cat in self.main.section_order:
+            ci = QTreeWidgetItem([cat])
+            self.tree.addTopLevelItem(ci)
+            for name in self.main.tool_order.get(cat, []):
+                ci.addChild(QTreeWidgetItem([name]))
+            ci.setExpanded(False)
+        self._update_move_buttons()
+
+    def _sync_from_tree(self):
+        root = self.tree.invisibleRootItem()
+        cat_set = set(self.main.section_order)
+        all_tools = set(self.main.all_buttons.keys())
+        cats, tools, seen = [], {}, set()
+        valid = True
+        for i in range(root.childCount()):
+            ci = root.child(i)
+            cat = ci.text(0)
+            if cat not in cat_set or cat in cats:
+                valid = False
+                break
+            cats.append(cat)
+            lst = []
+            for j in range(ci.childCount()):
+                ti = ci.child(j)
+                name = ti.text(0)
+                if ti.childCount() or name not in all_tools or name in seen:
+                    valid = False
+                    break
+                seen.add(name)
+                lst.append(name)
+            if not valid:
+                break
+            tools[cat] = lst
+        if valid and set(cats) == cat_set and seen == all_tools:
+            self.main.section_order = cats
+            self.main.tool_order = tools
+            self.main.apply_section_order()
+            self.main.apply_tool_order()
+        else:
+            # 非法落点（工具变成顶层 / 大类嵌套等）回退到当前生效顺序
+            self.refresh()
+        self._update_move_buttons()
+
+    def _move(self, delta):
+        item = self.tree.currentItem()
+        if item is None:
+            return
+        parent = item.parent() or self.tree.invisibleRootItem()
+        idx = parent.indexOfChild(item)
+        target = idx + delta
+        if not 0 <= target < parent.childCount():
+            return
+        parent.takeChild(idx)
+        parent.insertChild(target, item)
+        self.tree.setCurrentItem(item)
+        self._sync_from_tree()
+
+    def _update_move_buttons(self, *args):
+        item = self.tree.currentItem()
+        if item is None:
+            self.up_btn.setEnabled(False)
+            self.down_btn.setEnabled(False)
+            return
+        parent = item.parent() or self.tree.invisibleRootItem()
+        idx = parent.indexOfChild(item)
+        self.up_btn.setEnabled(idx > 0)
+        self.down_btn.setEnabled(idx < parent.childCount() - 1)
+
+    def _reset(self):
+        self.main.reset_section_order()
+        self.refresh()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
+
+
 class ToolboxWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -10197,6 +10408,7 @@ class ToolboxWindow(QMainWindow):
         self.datetime_window = None
         self.timestamp_window = None
         self.reminder_window = None
+        self.section_order_window = None
         self.tray_icon = None
         self.init_ui()
         self.init_tray()
@@ -10263,22 +10475,25 @@ class ToolboxWindow(QMainWindow):
         
         main_layout.addWidget(search_container)
         
-        # 使用历史区域
+        # 使用历史区域：固定预留一行胶囊的高度，点击工具时不再把下面的网格顶下去
+        # 64 = 标题 20 + 间距 6 + 胶囊一行 28 + 间距 6 + 底边距 4
         self.history_widget = QWidget()
-        self.history_widget.setVisible(False)
+        self.history_widget.setFixedHeight(64)
         history_layout = QVBoxLayout(self.history_widget)
         history_layout.setContentsMargins(15, 0, 15, 4)
         history_layout.setSpacing(6)
-        
+
         history_header = QHBoxLayout()
         history_label = QLabel("最近使用")
+        history_label.setFixedHeight(20)
         history_label.setStyleSheet("font-size: 12px; color: #999999; border: none; margin: 0;")
         history_header.addWidget(history_label)
         history_header.addStretch()
-        
-        history_clear_all = QPushButton("清空")
-        history_clear_all.setCursor(Qt.PointingHandCursor)
-        history_clear_all.setStyleSheet("""
+
+        self.history_clear_all = QPushButton("清空")
+        self.history_clear_all.setFixedHeight(20)
+        self.history_clear_all.setCursor(Qt.PointingHandCursor)
+        self.history_clear_all.setStyleSheet("""
             QPushButton {
                 font-size: 11px;
                 color: #999999;
@@ -10290,15 +10505,16 @@ class ToolboxWindow(QMainWindow):
                 color: #1A73E8;
             }
         """)
-        history_clear_all.clicked.connect(self._clear_all_history)
-        history_header.addWidget(history_clear_all)
+        self.history_clear_all.clicked.connect(self._clear_all_history)
+        history_header.addWidget(self.history_clear_all)
         history_layout.addLayout(history_header)
-        
-        self.history_buttons_layout = QHBoxLayout()
-        self.history_buttons_layout.setSpacing(6)
-        self.history_buttons_layout.setContentsMargins(0, 0, 0, 0)
-        history_layout.addLayout(self.history_buttons_layout)
-        
+
+        self.history_rows_layout = QVBoxLayout()
+        self.history_rows_layout.setSpacing(6)
+        self.history_rows_layout.setContentsMargins(0, 0, 0, 0)
+        history_layout.addLayout(self.history_rows_layout)
+        history_layout.addStretch()
+
         main_layout.addWidget(self.history_widget)
 
         content_area = QWidget()
@@ -10315,6 +10531,8 @@ class ToolboxWindow(QMainWindow):
         self.usage_history = []  # 使用历史记录
         self.max_history = 10  # 最多记录10条
         self.usage_history = self._load_usage_history()
+        # 启动就把历史显示出来：否则第一次点击时这一行才出现，整块网格会往下跳
+        self._refresh_history_display()
 
         section1 = self.create_section("系统工具", [
             "进程管理", "端口扫描", "Ping 测试", "DNS 查询", "路由追踪",
@@ -10394,14 +10612,31 @@ class ToolboxWindow(QMainWindow):
             "防黑屏": self.set_awake
         })
 
-        content_layout.addWidget(section1)
-        content_layout.addWidget(section_generate)
-        content_layout.addWidget(section_crypto)
-        content_layout.addWidget(section3)
-        content_layout.addWidget(section_time)
-        content_layout.addWidget(section4)
-        content_layout.addWidget(section_dev)
-        content_layout.addWidget(section6)
+        self.content_layout = content_layout
+        default_order = [s[1].text() for s in self.sections]
+        saved = load_section_order()
+        # 保存过的顺序优先；新增的大类追加到末尾，删掉的大类自动忽略
+        self.section_order = ([t for t in saved if t in default_order] +
+                              [t for t in default_order if t not in saved])
+        self.apply_section_order()
+
+        # 工具顺序/归属：保存过的优先（含跨大类），没保存过的新工具回落到默认大类
+        self.default_tool_order = {s[1].text(): list(s[2]) for s in self.sections}
+        saved_tools = load_tool_order()
+        all_names = set(n for lst in self.default_tool_order.values() for n in lst)
+        assigned = set()
+        self.tool_order = {cat: [] for cat in self.section_order}
+        for cat in self.section_order:
+            for n in saved_tools.get(cat, []):
+                if n in all_names and n not in assigned:
+                    assigned.add(n)
+                    self.tool_order[cat].append(n)
+        for cat in self.section_order:
+            for n in self.default_tool_order[cat]:
+                if n not in assigned:
+                    assigned.add(n)
+                    self.tool_order[cat].append(n)
+        self.apply_tool_order()
 
         content_layout.addStretch()
         scroll = QScrollArea()
@@ -10445,6 +10680,25 @@ class ToolboxWindow(QMainWindow):
         bottom_layout.addWidget(self.mem_label)
 
         bottom_layout.addStretch()
+
+        order_btn = QPushButton("排序")
+        order_btn.setFont(ui_font(10, 11))
+        order_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        order_btn.setToolTip("调整首页大类的展示顺序")
+        order_btn.setStyleSheet("""
+            QPushButton {
+                color: #1A73E8;
+                border: none;
+                background: transparent;
+                padding: 0;
+                text-decoration: underline;
+            }
+            QPushButton:hover {
+                color: #1557b0;
+            }
+        """)
+        order_btn.clicked.connect(self.show_section_order)
+        bottom_layout.addWidget(order_btn)
 
         cache_btn = QPushButton("缓存目录")
         cache_btn.setFont(ui_font(10, 11))
@@ -11094,19 +11348,19 @@ class ToolboxWindow(QMainWindow):
         self._refresh_history_display()
 
     def _refresh_history_display(self):
-        """刷新使用历史按钮区域。"""
-        # 清空现有历史按钮
-        while self.history_buttons_layout.count():
-            item = self.history_buttons_layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-        
+        """刷新使用历史按钮区域：每行最多 6 个胶囊，超出换行。"""
+        while self.history_rows_layout.count():
+            row = self.history_rows_layout.takeAt(0).layout()
+            if row:
+                while row.count():
+                    w = row.takeAt(0).widget()
+                    if w:
+                        w.deleteLater()
+                row.deleteLater()
+
+        self.history_clear_all.setVisible(bool(self.usage_history))
         if not self.usage_history:
-            self.history_widget.setVisible(False)
             return
-        
-        self.history_widget.setVisible(True)
         
         # 回调映射
         callback_map = {
@@ -11146,7 +11400,11 @@ class ToolboxWindow(QMainWindow):
             '罗马数字': self.show_roman,
         }
         
-        for name in self.usage_history:
+        # 只展示一行：最多 6 个胶囊，更早的历史仍保存在文件里
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        row.setContentsMargins(0, 0, 0, 0)
+        for name in self.usage_history[:6]:
             btn = QPushButton(name)
             btn.setCursor(Qt.PointingHandCursor)
             btn.setFixedHeight(28)
@@ -11168,15 +11426,55 @@ class ToolboxWindow(QMainWindow):
             cb = callback_map.get(name)
             if cb:
                 btn.clicked.connect(lambda checked, callback=cb: callback())
-            self.history_buttons_layout.addWidget(btn)
-        
-        self.history_buttons_layout.addStretch()
+            row.addWidget(btn)
+        row.addStretch()
+        self.history_rows_layout.addLayout(row)
 
     def _clear_all_history(self):
         """清空所有使用历史。"""
         self.usage_history.clear()
         self._save_usage_history()
         self._refresh_history_display()
+
+    def apply_section_order(self):
+        """按 self.section_order 重排首页分组，并持久化。"""
+        by_title = {s[1].text(): s[0] for s in self.sections}
+        for i in reversed(range(self.content_layout.count())):
+            if self.content_layout.itemAt(i).widget() is not None:
+                self.content_layout.takeAt(i)
+        for pos, title in enumerate(self.section_order):
+            self.content_layout.insertWidget(pos, by_title[title])
+        save_section_order(self.section_order)
+
+    def apply_tool_order(self):
+        """按 self.tool_order 重排/跨类移动首页按钮，并持久化。"""
+        # 先全部摘下来，再按新归属装回去，避免按钮同时挂在两个网格上
+        for section, title_label, texts, grid in self.sections:
+            for n in list(texts):
+                b = self.all_buttons.get(n)
+                if b is not None:
+                    grid.removeWidget(b)
+        for section, title_label, texts, grid in self.sections:
+            names = self.tool_order.get(title_label.text(), list(texts))
+            texts[:] = names
+            for i, n in enumerate(names):
+                b = self.all_buttons.get(n)
+                if b is not None:
+                    grid.addWidget(b, i // 6, i % 6)
+        save_tool_order(self.tool_order)
+
+    def reset_section_order(self):
+        self.section_order = [s[1].text() for s in self.sections]
+        self.tool_order = {cat: list(names) for cat, names in self.default_tool_order.items()}
+        self.apply_section_order()
+        self.apply_tool_order()
+
+    def show_section_order(self):
+        if self.section_order_window is None:
+            self.section_order_window = SectionOrderWindow(self)
+        self.section_order_window.show()
+        self.section_order_window.raise_()
+        self.section_order_window.activateWindow()
 
     def _open_cache_dir(self):
         """打开缓存目录。"""

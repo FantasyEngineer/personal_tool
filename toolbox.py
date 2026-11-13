@@ -27,6 +27,8 @@ import difflib
 import hmac
 import secrets
 import string
+import threading
+import ctypes
 import yaml
 from PIL import Image
 from cryptography.hazmat.primitives import hashes, serialization
@@ -2721,6 +2723,209 @@ class RomanNumeralWindow(QMainWindow):
             self.close()
 
 
+class ScreenPickOverlay(QWidget):
+    """全屏透明取色罩：跟随鼠标的放大镜 loupe。C 复制并退出、X 切换 HEX/RGB、左键/右键/ESC 退出。
+    复制只进剪贴板，复制后放大镜消失，不弹出任何应用窗口。"""
+
+    copied = pyqtSignal(QColor)
+    closed = pyqtSignal()
+    SRC = 25          # 采样边长（奇数，中心即光标像素）
+    ZOOM = 10         # 放大倍数
+    OFFSET = 28       # loupe 相对光标的偏移，避免采样到自身
+
+    def __init__(self):
+        # 普通窗口 + WA_ShowWithoutActivating + AppKit 抬层级：罩在最前但不切换前台应用，
+        # 被取色的应用保持原样。不用 showFullScreen()（原生全屏 Space 切换会黑屏）。
+        super().__init__(None, Qt.Window | Qt.FramelessWindowHint |
+                         Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CrossCursor)
+        self._pos = QCursor.pos()
+        self._center = QColor("#FFFFFF")
+        self._hint = ""
+        self._prev_pid = None
+        self._format = "HEX"
+        self._key_prev = {"esc": False, "c": False, "x": False}
+        self._cg = None
+        # 不抢焦点，故 ESC/C/X 用 HID 键态轮询读取（无需辅助功能权限）
+        self._key_timer = QTimer(self)
+        self._key_timer.setInterval(40)
+        self._key_timer.timeout.connect(self._poll_keys)
+
+    def start(self):
+        self._pos = QCursor.pos()
+        self._prev_pid = _mac_frontmost_pid()
+        self._key_prev = {"esc": False, "c": False, "x": False}
+        geo = QRect()
+        for s in QApplication.screens():
+            geo = geo.united(s.geometry())
+        if geo.isNull():
+            geo = QApplication.primaryScreen().geometry()
+        self.setGeometry(geo)
+        # 只 show()（WA_ShowWithoutActivating）；raise_/activateWindow/setFocus/
+        # makeKeyAndOrderFront 都会把本应用切到前台、挤掉被取色的应用，一律不用。
+        self.show()
+        if _mac_is_cocoa():
+            try:
+                _mac_picker_nonactivating(self)
+            except Exception:
+                pass
+        self._key_timer.start()
+        self.update()
+
+    def _poll_keys(self):
+        try:
+            if platform.system() == "Darwin":
+                if self._cg is None:
+                    import ctypes.util
+                    self._cg = ctypes.cdll.LoadLibrary(
+                        ctypes.util.find_library("CoreGraphics"))
+                    self._cg.CGEventSourceKeyState.restype = ctypes.c_bool
+                    self._cg.CGEventSourceKeyState.argtypes = [
+                        ctypes.c_int, ctypes.c_uint16]
+                # kCGEventSourceStateHIDSystemState=1; kVK_Escape=53, C=8, X=7
+                state = {"esc": self._cg.CGEventSourceKeyState(1, 53),
+                         "c": self._cg.CGEventSourceKeyState(1, 8),
+                         "x": self._cg.CGEventSourceKeyState(1, 7)}
+            elif platform.system() == "Windows":
+                g = ctypes.windll.user32.GetAsyncKeyState
+                state = {"esc": bool(g(0x1B) & 0x8000),
+                         "c": bool(g(0x43) & 0x8000),
+                         "x": bool(g(0x58) & 0x8000)}
+            else:
+                return
+            for key, pressed in state.items():
+                rising = pressed and not self._key_prev[key]
+                self._key_prev[key] = pressed
+                if not rising:
+                    continue
+                if key == "esc":
+                    self.close()
+                    return
+                elif key == "c":
+                    self._copy_current()
+                    return
+                elif key == "x":
+                    self._toggle_format()
+        except Exception:
+            pass
+
+    def _format_value(self, fmt):
+        r, g, b, _ = self._center.getRgb()
+        if fmt == "HEX":
+            return self._center.name().upper()
+        return "rgb(%d, %d, %d)" % (r, g, b)
+
+    def _copy_current(self):
+        text = self._format_value(self._format)
+        QApplication.clipboard().setText(text)
+        self.copied.emit(QColor(self._center))
+        # 复制即退出取色：放大镜消失，owner 静默不弹窗
+        self.close()
+
+    def _toggle_format(self):
+        self._format = "RGB" if self._format == "HEX" else "HEX"
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        self._pos = event.globalPos()
+        self.update()
+
+    def mousePressEvent(self, event):
+        # 左键/右键都退出；复制改由 C 键触发，不再弹窗
+        if event.button() in (Qt.LeftButton, Qt.RightButton):
+            self.close()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+        elif event.key() == Qt.Key_C:
+            self._copy_current()
+        elif event.key() == Qt.Key_X:
+            self._toggle_format()
+        else:
+            super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        self._key_timer.stop()
+        # 退出时把前台交还给取色前的应用，不让它退到后台
+        if self._prev_pid:
+            _mac_reactivate(self._prev_pid)
+        self.closed.emit()
+        super().closeEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        screen = QApplication.screenAt(self._pos) or QApplication.primaryScreen()
+        geo = screen.geometry()
+        half = self.SRC // 2
+        grab = screen.grabWindow(0, self._pos.x() - half, self._pos.y() - half,
+                                 self.SRC, self.SRC)
+        loupe = self.SRC * self.ZOOM
+        # loupe 位置：光标右下，夹在屏幕内
+        lx = min(max(self._pos.x() + self.OFFSET, geo.x()), geo.right() - loupe - 8)
+        ly = min(max(self._pos.y() + self.OFFSET, geo.y()), geo.bottom() - loupe - 76)
+        box = QRect(lx, ly, loupe, loupe)
+
+        if grab.isNull():
+            self._hint = "无法读取屏幕：请在系统隐私设置中授予屏幕录制权限"
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(255, 255, 255, 235))
+            painter.drawRoundedRect(box, 6, 6)
+            painter.setPen(QColor("#D93025"))
+            painter.setFont(QFont("PingFang SC", 11))
+            painter.drawText(box.adjusted(12, 12, -12, -12),
+                             Qt.AlignCenter | Qt.TextWordWrap, self._hint)
+            painter.end()
+            return
+
+        img = grab.toImage()
+        self._center = img.pixelColor(half, half)
+        mag = img.scaled(loupe, loupe, Qt.IgnoreAspectRatio, Qt.FastTransformation)
+        painter.drawImage(box, mag)
+
+        # 像素网格
+        painter.setPen(QColor(255, 255, 255, 40))
+        for i in range(1, self.SRC):
+            painter.drawLine(box.x() + i * self.ZOOM, box.y(),
+                             box.x() + i * self.ZOOM, box.bottom())
+            painter.drawLine(box.x(), box.y() + i * self.ZOOM,
+                             box.right(), box.y() + i * self.ZOOM)
+        # 中心像素高亮 + 十字
+        cx = box.x() + half * self.ZOOM
+        cy = box.y() + half * self.ZOOM
+        painter.setPen(QPen(QColor("#FFFFFF"), 2))
+        painter.drawRect(cx, cy, self.ZOOM, self.ZOOM)
+        painter.setPen(QPen(QColor("#000000"), 1))
+        painter.drawRect(cx - 1, cy - 1, self.ZOOM + 2, self.ZOOM + 2)
+        # 外框
+        painter.setPen(QPen(QColor("#1A73E8"), 2))
+        painter.drawRoundedRect(box.adjusted(-1, -1, 1, 1), 6, 6)
+
+        # 信息条：色块 + 当前格式值 / 另一格式 / 按键提示（三行，避免重叠）
+        info = QRect(box.x(), box.bottom() + 6, loupe, 64)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 235))
+        painter.drawRoundedRect(info, 6, 6)
+        painter.setBrush(self._center)
+        painter.setPen(QPen(QColor("#D0D0D0"), 1))
+        painter.drawRoundedRect(info.x() + 8, info.y() + 12, 40, 40, 4, 4)
+        other = "RGB" if self._format == "HEX" else "HEX"
+        painter.setPen(QColor("#1F2328"))
+        painter.setFont(QFont("Menlo", 12, QFont.Bold))
+        painter.drawText(info.x() + 56, info.y() + 22, self._format_value(self._format))
+        painter.setFont(QFont("Menlo", 10))
+        painter.setPen(QColor("#57606A"))
+        painter.drawText(info.x() + 56, info.y() + 38, self._format_value(other))
+        painter.setFont(QFont("PingFang SC", 9))
+        painter.setPen(QColor("#8B949E"))
+        painter.drawText(info.x() + 56, info.y() + 54, "C 复制并退出 · X 切换 · 左键/ESC 退出")
+        painter.end()
+
+
 class ColorWindow(QMainWindow):
     FORMATS = ["HEX", "RGB", "RGBA", "HSL", "HSV", "CMYK"]
 
@@ -2731,6 +2936,9 @@ class ColorWindow(QMainWindow):
         self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
         self._rgb = None
         self._alpha = 255
+        self._pick_overlay = None
+        self._pick_prev_pid = None
+        self._pick_silent_exit = False
         self.init_ui()
 
     def init_ui(self):
@@ -2760,15 +2968,26 @@ class ColorWindow(QMainWindow):
         self.color_edit.textChanged.connect(self.convert)
         form.addWidget(self.color_edit, 0, 1, 1, 2)
 
-        pick_btn = QPushButton("取色")
-        pick_btn.setFixedSize(70, 30)
-        pick_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        pick_btn.setStyleSheet("""
+        screen_btn = QPushButton("屏幕取色")
+        screen_btn.setFixedSize(84, 30)
+        screen_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        screen_btn.setStyleSheet("""
             QPushButton { color: #FFFFFF; background: #1A73E8; border: none; border-radius: 4px; font-size: 12px; }
             QPushButton:hover { background: #1557B0; }
         """)
+        screen_btn.setToolTip("全屏放大镜取色：移动鼠标放大像素，左键取色，右键/ESC 退出")
+        screen_btn.clicked.connect(self.start_screen_pick)
+        form.addWidget(screen_btn, 0, 3)
+
+        pick_btn = QPushButton("调色板")
+        pick_btn.setFixedSize(70, 30)
+        pick_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        pick_btn.setStyleSheet("""
+            QPushButton { color: #333333; background: #F0F0F0; border: 1px solid #D0D0D0; border-radius: 4px; font-size: 12px; }
+            QPushButton:hover { background: #E0E0E0; }
+        """)
         pick_btn.clicked.connect(self.do_pick)
-        form.addWidget(pick_btn, 0, 3)
+        form.addWidget(pick_btn, 0, 4)
 
         clear_btn = QPushButton("清空")
         clear_btn.setFixedSize(70, 30)
@@ -2778,7 +2997,7 @@ class ColorWindow(QMainWindow):
             QPushButton:hover { background: #E0E0E0; }
         """)
         clear_btn.clicked.connect(self.do_clear)
-        form.addWidget(clear_btn, 0, 4)
+        form.addWidget(clear_btn, 0, 5)
 
         layout.addLayout(form)
 
@@ -2850,6 +3069,44 @@ class ColorWindow(QMainWindow):
         color = QColorDialog.getColor(init, self, "选择颜色")
         if color.isValid():
             self.color_edit.setText(color.name().upper())
+
+    def start_screen_pick(self):
+        if self._pick_overlay is not None:
+            self._pick_overlay.close()
+        self._pick_prev_pid = _mac_frontmost_pid()
+        self.hide()
+        ov = ScreenPickOverlay()
+        ov.setAttribute(Qt.WA_DeleteOnClose)
+        ov.copied.connect(self._on_overlay_copied)
+        ov.closed.connect(self._on_overlay_gone)
+        self._pick_overlay = ov
+        ov.start()
+
+    def _on_overlay_copied(self, color):
+        # 复制即退出：静默回填，不显示/不激活窗口（复制不弹窗）
+        self._pick_silent_exit = True
+        hexval = color.name().upper()
+        self.color_edit.setText(hexval)
+        self.set_status(f"屏幕取色 {hexval}，已复制到剪贴板", ok=True)
+
+    def _on_overlay_gone(self, *_):
+        self._pick_overlay = None
+        prev = self._pick_prev_pid
+        self._pick_prev_pid = None
+        silent = self._pick_silent_exit
+        self._pick_silent_exit = False
+        if not silent:
+            self.show()
+        if prev:
+            _mac_reactivate(prev)
+
+    def closeEvent(self, event):
+        ov = self._pick_overlay
+        self._pick_overlay = None
+        if ov is not None:
+            ov.closed.disconnect(self._on_overlay_gone)
+            ov.close()
+        super().closeEvent(event)
 
     def copy_value(self, fmt):
         text = self.value_edits[fmt].text()
@@ -7149,6 +7406,34 @@ def _mac_cover_menu_bar(widget):
     return True
 
 
+def _mac_picker_nonactivating(widget):
+    """把取色罩抬到菜单栏之上并覆盖所有 Space，但只 orderFront、不 makeKey、不 activate：
+    被取色的应用保持原样停在最前，不会退到后台。键盘退出靠 HID 键态轮询。"""
+    import ctypes
+    import ctypes.util
+    objc = _mac_objc_runtime()
+    send = objc.objc_msgSend
+    send.restype = ctypes.c_void_p
+    send.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    view = int(widget.winId())
+    window = send(view, objc.sel_registerName(b"window"))
+    if not window:
+        return False
+    cg = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreGraphics"))
+    cg.CGShieldingWindowLevel.restype = ctypes.c_int
+    send.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_longlong]
+    send(window, objc.sel_registerName(b"setLevel:"), cg.CGShieldingWindowLevel())
+    send(window, objc.sel_registerName(b"setCollectionBehavior:"),
+         (1 << 0) | (1 << 2) | (1 << 7))
+    send.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+    send(window, objc.sel_registerName(b"setHidesOnDeactivate:"), 0)
+    # 关掉原生投影：否则首帧 loupe 的阴影会缓存成糊在初始位置的"影子"
+    send(window, objc.sel_registerName(b"setHasShadow:"), 0)
+    send.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    send(window, objc.sel_registerName(b"orderFront:"), None)
+    return True
+
+
 def _mac_objc_runtime():
     import ctypes
     import ctypes.util
@@ -9509,6 +9794,7 @@ TOOL_TIPS = {
     "UUID": "功能：生成 UUID v1 / v4 · 支持批量生成",
     "格式转换": "页签：颜色 / 时间戳 / JSON-YAML",
     "颜色": "功能：颜色选择器 · HEX / RGB / HSL 互转",
+    "屏幕取色": "功能：全屏放大镜取色 · C 复制并退出 · X 切换 HEX/RGB · 左键/ESC 退出",
     "JSON-YAML": "功能：JSON 与 YAML 格式互转",
     "文本统计": "功能：字符数 / 行数 / 词数 / 字节数 / 中文字数",
     "文本对比": "功能：逐行 diff · 忽略空白 / 大小写 · 只看差异 · 复制 diff",
@@ -9518,7 +9804,7 @@ TOOL_TIPS = {
     "HTTP 状态码": "功能：按代码或关键词搜索 HTTP 状态码，显示含义和常见场景",
     "chmod 权限": "功能：八进制 ↔ 符号表示互转，可视化 9 个权限位",
     "日期时间": "功能：日期差计算、加减天数、时区转换",
-    "打卡提醒": "功能：定时弹框提醒（上班/下班打卡）· 工作日/每天/仅当天 · 稍后再提醒 · 提示音 · 开机自启",
+    "打卡提醒": "功能：定时弹框提醒（上班/下班打卡）· 工作日/每天/仅当天 · 稍后再提醒 · 提示音",
     "房贷计算器": "功能：等额本息 / 等额本金",
     "图片处理": "页签：转 Base64 / 格式转换 / 缩放压缩",
     "文字雨": "功能：桌面字符雨特效，开启时自动防黑屏（开关）",
@@ -9558,6 +9844,8 @@ PINYIN_MAP = {
     "uuid": ["UUID"],
     "geshi": ["格式转换"],
     "yanse": ["颜色"],
+    "quse": ["屏幕取色"],
+    "pingmu": ["屏幕取色"],
     "shijianchuo": ["格式转换"],
     "json": ["JSON/XML", "格式转换"],
     "xml": ["JSON/XML"],
@@ -9990,8 +10278,124 @@ class ReminderEngine(QObject):
             self.card = None
 
 
+class _EventHotKeyID(ctypes.Structure):
+    _fields_ = [("signature", ctypes.c_uint32), ("id", ctypes.c_uint32)]
+
+
+class _EventTypeSpec(ctypes.Structure):
+    _fields_ = [("eventClass", ctypes.c_uint32), ("eventKind", ctypes.c_uint32)]
+
+
+_CARBON_HANDLER = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+
+
+class GlobalHotkey(QObject):
+    """全局热键快速开关文字雨：Windows=Win+O，macOS=Control+Option+O。"""
+
+    triggered = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.error = ""
+        self._carbon = None
+        self._hotkey_ref = None
+        self._handler_ref = None
+        self._handler_cb = None
+        self._pump = None
+        self._win_tid = None
+
+    def start(self):
+        system = platform.system()
+        if system == "Windows":
+            threading.Thread(target=self._run_windows, daemon=True).start()
+        elif system == "Darwin":
+            self._start_mac()
+
+    def _start_mac(self):
+        carbon = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/Carbon.framework/Carbon")
+        carbon.GetApplicationEventTarget.restype = ctypes.c_void_p
+        carbon.RegisterEventHotKey.argtypes = [
+            ctypes.c_uint32, ctypes.c_uint32, _EventHotKeyID,
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+        carbon.RegisterEventHotKey.restype = ctypes.c_int32
+        carbon.InstallEventHandler.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+            ctypes.POINTER(_EventTypeSpec), ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        carbon.InstallEventHandler.restype = ctypes.c_int32
+        carbon.RunCurrentEventLoop.argtypes = [ctypes.c_double]
+        carbon.RunCurrentEventLoop.restype = ctypes.c_int32
+        carbon.UnregisterEventHotKey.argtypes = [ctypes.c_void_p]
+        carbon.UnregisterEventHotKey.restype = ctypes.c_int32
+        carbon.RemoveEventHandler.argtypes = [ctypes.c_void_p]
+        carbon.RemoveEventHandler.restype = ctypes.c_int32
+        self._carbon = carbon
+
+        target = carbon.GetApplicationEventTarget()
+        ref = ctypes.c_void_p()
+        # kVK_ANSI_O=0x1F；controlKey|optionKey
+        status = carbon.RegisterEventHotKey(0x1F, 0x1000 | 0x0800,
+                                            _EventHotKeyID(0x68746B31, 1),
+                                            target, 0, ctypes.byref(ref))
+        if status != 0:
+            self.error = "mac 热键注册失败 status=%s" % status
+            return
+        self._hotkey_ref = ref
+
+        spec = _EventTypeSpec(0x6B657962, 5)  # kEventClassKeyboard / kEventHotKeyPressed
+        self._handler_cb = _CARBON_HANDLER(self._on_carbon_hotkey)
+        href = ctypes.c_void_p()
+        status = carbon.InstallEventHandler(
+            target, ctypes.cast(self._handler_cb, ctypes.c_void_p), 1,
+            ctypes.byref(spec), None, ctypes.byref(href))
+        if status != 0:
+            self.error = "mac 热键 handler 安装失败 status=%s" % status
+            carbon.UnregisterEventHotKey(ref)
+            self._hotkey_ref = None
+            return
+        self._handler_ref = href
+        # Carbon 事件需在主线程派发：用定时器非阻塞泵事件循环
+        self._pump = QTimer(self)
+        self._pump.timeout.connect(lambda: carbon.RunCurrentEventLoop(0.0))
+        self._pump.start(50)
+
+    def _on_carbon_hotkey(self, next_handler, event, user_data):
+        self.triggered.emit()
+        return 0
+
+    def _run_windows(self):
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        MOD_WIN, VK_O, WM_HOTKEY = 0x0008, 0x4F, 0x0312
+        hotkey_id = 0xB001
+        self._win_tid = kernel32.GetCurrentThreadId()
+        if not user32.RegisterHotKey(None, hotkey_id, MOD_WIN, VK_O):
+            self.error = "Win+O 注册失败（可能被系统或其他程序占用）"
+            return
+        msg = wintypes.MSG()
+        while True:
+            r = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+            if r in (0, -1):
+                break
+            if msg.message == WM_HOTKEY and msg.wParam == hotkey_id:
+                self.triggered.emit()
+        user32.UnregisterHotKey(None, hotkey_id)
+
+    def stop(self):
+        if self._pump is not None:
+            self._pump.stop()
+        if self._carbon is not None:
+            if self._hotkey_ref is not None:
+                self._carbon.UnregisterEventHotKey(self._hotkey_ref)
+            if self._handler_ref is not None:
+                self._carbon.RemoveEventHandler(self._handler_ref)
+        if self._win_tid:
+            ctypes.windll.user32.PostThreadMessageW(self._win_tid, 0x0012, 0, 0)
+
+
 class ReminderWindow(QMainWindow):
-    """打卡提醒设置：规则增删、提示音、开机自启。"""
+    """打卡提醒设置：规则增删、提示音。"""
 
     def __init__(self, engine):
         super().__init__()
@@ -10086,11 +10490,6 @@ class ReminderWindow(QMainWindow):
         self.sound_check.setChecked(bool(self.engine.state.get("sound", True)))
         self.sound_check.toggled.connect(self.on_sound_toggled)
         bottom.addWidget(self.sound_check)
-
-        self.autostart_check = QCheckBox("开机自动启动")
-        self.autostart_check.setChecked(autostart_status())
-        self.autostart_check.toggled.connect(self.on_autostart_toggled)
-        bottom.addWidget(self.autostart_check)
         bottom.addStretch()
         layout.addLayout(bottom)
 
@@ -10168,15 +10567,6 @@ class ReminderWindow(QMainWindow):
     def on_sound_toggled(self, checked):
         self.engine.state["sound"] = checked
         save_reminders(self.engine.state)
-
-    def on_autostart_toggled(self, checked):
-        try:
-            self.status_label.setText(set_autostart(checked))
-        except Exception as exc:
-            self.autostart_check.blockSignals(True)
-            self.autostart_check.setChecked(autostart_status())
-            self.autostart_check.blockSignals(False)
-            self.status_label.setText("设置失败：%s" % exc)
 
     def update_next_label(self):
         now = QDateTime.currentDateTime()
@@ -10360,6 +10750,117 @@ class SectionOrderWindow(QMainWindow):
             super().keyPressEvent(event)
 
 
+class SettingsWindow(QMainWindow):
+    """通用设置：开机自启、缓存目录、源码仓库。"""
+
+    REPO_URL = "https://github.com/FantasyEngineer/personal_tool"
+
+    def __init__(self, main):
+        super().__init__()
+        self.main = main
+        self.setWindowTitle("设置")
+        self.setGeometry(*tool_win_geometry())
+        self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(15, 12, 15, 12)
+        layout.setSpacing(10)
+
+        layout.addWidget(self._group_title("开机自启"))
+        self.autostart_check = QCheckBox("开机自动启动工具箱")
+        self.autostart_check.setChecked(autostart_status())
+        self.autostart_check.toggled.connect(self.on_autostart_toggled)
+        layout.addWidget(self.autostart_check)
+        self.autostart_status = QLabel("已开启，下次登录生效" if autostart_status() else "未开启")
+        self.autostart_status.setWordWrap(True)
+        self.autostart_status.setStyleSheet("color: #57606A; font-size: 12px;")
+        layout.addWidget(self.autostart_status)
+
+        layout.addWidget(self._group_title("首页排序"))
+        sort_row = QHBoxLayout()
+        sort_row.setSpacing(8)
+        sort_hint = QLabel("调整大类与工具在首页的展示顺序")
+        sort_hint.setStyleSheet("color: #57606A; font-size: 12px;")
+        sort_row.addWidget(sort_hint, 1)
+        open_sort = QPushButton("打开")
+        open_sort.setFixedSize(70, 28)
+        open_sort.setCursor(QCursor(Qt.PointingHandCursor))
+        open_sort.setStyleSheet(_secondary_btn() + "QPushButton { font-size: 12px; }")
+        open_sort.clicked.connect(self.main.show_section_order)
+        sort_row.addWidget(open_sort)
+        layout.addLayout(sort_row)
+
+        layout.addWidget(self._group_title("缓存目录"))
+        cache_row = QHBoxLayout()
+        cache_row.setSpacing(8)
+        cache_path = QLabel(os.path.join(os.path.expanduser("~"), ".personal_toolbox"))
+        cache_path.setStyleSheet("color: #57606A; font-size: 12px;")
+        cache_row.addWidget(cache_path, 1)
+        open_cache = QPushButton("打开")
+        open_cache.setFixedSize(70, 28)
+        open_cache.setCursor(QCursor(Qt.PointingHandCursor))
+        open_cache.setStyleSheet(_secondary_btn() + "QPushButton { font-size: 12px; }")
+        open_cache.clicked.connect(self.main._open_cache_dir)
+        cache_row.addWidget(open_cache)
+        layout.addLayout(cache_row)
+
+        layout.addWidget(self._group_title("源码仓库"))
+        repo_row = QHBoxLayout()
+        repo_row.setSpacing(8)
+        repo_label = QLabel(self.REPO_URL)
+        repo_label.setStyleSheet("color: #57606A; font-size: 12px;")
+        repo_row.addWidget(repo_label, 1)
+        open_repo = QPushButton("打开")
+        open_repo.setFixedSize(70, 28)
+        open_repo.setCursor(QCursor(Qt.PointingHandCursor))
+        open_repo.setStyleSheet(_secondary_btn() + "QPushButton { font-size: 12px; }")
+        open_repo.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self.REPO_URL)))
+        repo_row.addWidget(open_repo)
+        layout.addLayout(repo_row)
+
+        layout.addWidget(self._group_title("检查更新"))
+        upd_row = QHBoxLayout()
+        upd_row.setSpacing(8)
+        upd_hint = QLabel("当前版本 v%s" % APP_VERSION)
+        upd_hint.setStyleSheet("color: #57606A; font-size: 12px;")
+        upd_row.addWidget(upd_hint, 1)
+        upd_row.addWidget(self.main.update_btn)
+        layout.addLayout(upd_row)
+
+        layout.addStretch()
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        done_btn = QPushButton("完成")
+        done_btn.setFixedSize(80, 30)
+        done_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        done_btn.setStyleSheet(_primary_btn() + "QPushButton { font-size: 12px; }")
+        done_btn.clicked.connect(self.close)
+        btn_row.addWidget(done_btn)
+        layout.addLayout(btn_row)
+
+    def _group_title(self, text):
+        lb = QLabel(text)
+        lb.setFont(ui_font(13, 14, bold=True))
+        lb.setStyleSheet("color: #222222;")
+        return lb
+
+    def on_autostart_toggled(self, checked):
+        try:
+            self.autostart_status.setText(set_autostart(checked))
+        except Exception as exc:
+            self.autostart_check.blockSignals(True)
+            self.autostart_check.setChecked(autostart_status())
+            self.autostart_check.blockSignals(False)
+            self.autostart_status.setText("设置失败：%s" % exc)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
+
+
 class ToolboxWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -10387,6 +10888,9 @@ class ToolboxWindow(QMainWindow):
         self.divmod_window = None
         self.convert_window = None
         self.color_window = None
+        self._screen_pick_overlay = None
+        self._screen_pick_prev_pid = None
+        self._screen_pick_silent_exit = False
         self.json_yaml_window = None
         self.config_window = None
         self.unit_window = None
@@ -10409,6 +10913,7 @@ class ToolboxWindow(QMainWindow):
         self.timestamp_window = None
         self.reminder_window = None
         self.section_order_window = None
+        self.settings_window = None
         self.tray_icon = None
         self.init_ui()
         self.init_tray()
@@ -10593,13 +11098,14 @@ class ToolboxWindow(QMainWindow):
         })
 
         section_dev = self.create_section("开发工具", [
-            "命令速查", "HTTP 状态码", "chmod 权限", "Cron 表达式", "颜色"
+            "命令速查", "HTTP 状态码", "chmod 权限", "Cron 表达式", "颜色", "屏幕取色"
         ], {
             "命令速查": self.show_command_reference,
             "HTTP 状态码": self.show_http_status,
             "chmod 权限": self.show_chmod,
             "Cron 表达式": self.show_cron,
-            "颜色": self.show_color
+            "颜色": self.show_color,
+            "屏幕取色": self.show_screen_pick
         })
 
         section6 = self.create_section("其他", [
@@ -10681,11 +11187,11 @@ class ToolboxWindow(QMainWindow):
 
         bottom_layout.addStretch()
 
-        order_btn = QPushButton("排序")
-        order_btn.setFont(ui_font(10, 11))
-        order_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        order_btn.setToolTip("调整首页大类的展示顺序")
-        order_btn.setStyleSheet("""
+        settings_btn = QPushButton("设置")
+        settings_btn.setFont(ui_font(10, 11))
+        settings_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        settings_btn.setToolTip("开机自启 / 首页排序 / 缓存目录 / 源码仓库 / 检查更新")
+        settings_btn.setStyleSheet("""
             QPushButton {
                 color: #1A73E8;
                 border: none;
@@ -10697,34 +11203,8 @@ class ToolboxWindow(QMainWindow):
                 color: #1557b0;
             }
         """)
-        order_btn.clicked.connect(self.show_section_order)
-        bottom_layout.addWidget(order_btn)
-
-        cache_btn = QPushButton("缓存目录")
-        cache_btn.setFont(ui_font(10, 11))
-        cache_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        cache_btn.setToolTip("打开缓存文件夹")
-        cache_btn.setStyleSheet("""
-            QPushButton {
-                color: #1A73E8;
-                border: none;
-                background: transparent;
-                padding: 0;
-                text-decoration: underline;
-            }
-            QPushButton:hover {
-                color: #1557b0;
-            }
-        """)
-        cache_btn.clicked.connect(self._open_cache_dir)
-        bottom_layout.addWidget(cache_btn)
-
-        repo_label = QLabel('<a href="https://github.com/FantasyEngineer/personal_tool">仓库</a>')
-        repo_label.setFont(ui_font(10, 11))
-        repo_label.setCursor(QCursor(Qt.PointingHandCursor))
-        repo_label.setToolTip("在 GitHub 上查看源码")
-        repo_label.setOpenExternalLinks(True)
-        bottom_layout.addWidget(repo_label)
+        settings_btn.clicked.connect(self.show_settings)
+        bottom_layout.addWidget(settings_btn)
 
         ip_text = f"IP: {self.ip}"
         mac_text = f"MAC: {self.mac}" if self.mac and self.mac != "-" else ""
@@ -10739,21 +11219,10 @@ class ToolboxWindow(QMainWindow):
         bottom_layout.addWidget(info_label)
 
         self.update_btn = QPushButton("检查更新")
-        self.update_btn.setFont(ui_font(10, 11))
+        self.update_btn.setFixedSize(90, 28)
         self.update_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self.update_btn.setStyleSheet("""
-            QPushButton {
-                color: #1A73E8;
-                background: transparent;
-                border: none;
-                padding: 4px 6px;
-            }
-            QPushButton:hover {
-                color: #1666CE;
-            }
-        """)
+        self.update_btn.setStyleSheet(_secondary_btn() + "QPushButton { font-size: 12px; }")
         self.update_btn.clicked.connect(self.check_for_updates)
-        bottom_layout.addWidget(self.update_btn)
 
         exit_btn = QPushButton("退出")
         exit_btn.setFont(ui_font(10, 11))
@@ -10778,6 +11247,15 @@ class ToolboxWindow(QMainWindow):
         self.stats_timer.timeout.connect(self.refresh_stats)
         self.stats_timer.start(3000)
         self.refresh_stats()
+
+        self.hotkey = GlobalHotkey()
+        self.hotkey.triggered.connect(self._on_global_hotkey)
+        self.hotkey.start()
+
+    def _on_global_hotkey(self):
+        btn = self.toggle_buttons.get("文字雨")
+        if btn is not None:
+            btn.setChecked(not btn.isChecked())
 
     def refresh_stats(self):
         cpu_pct, mem_pct, used_gb, total_gb = get_system_stats()
@@ -10988,6 +11466,11 @@ class ToolboxWindow(QMainWindow):
                 self._rain_overlay.stop()
         except Exception:
             pass
+        if self._screen_pick_overlay is not None:
+            ov = self._screen_pick_overlay
+            self._screen_pick_overlay = None
+            ov.closed.disconnect(self._on_screen_pick_closed)
+            ov.close()
 
         # 托盘可用且非强制退出：隐藏到托盘，保持进程存活
         if self.tray_icon and not getattr(self, "_force_quit", False):
@@ -11090,6 +11573,37 @@ class ToolboxWindow(QMainWindow):
             self.color_window = ColorWindow()
         self.color_window.show()
         self.color_window.activateWindow()
+
+    def show_screen_pick(self):
+        if self._screen_pick_overlay is not None:
+            self._screen_pick_overlay.close()
+        self._screen_pick_prev_pid = _mac_frontmost_pid()
+        self.hide()
+        ov = ScreenPickOverlay()
+        ov.setAttribute(Qt.WA_DeleteOnClose)
+        ov.copied.connect(self._on_screen_copied)
+        ov.closed.connect(self._on_screen_pick_closed)
+        self._screen_pick_overlay = ov
+        ov.start()
+
+    def _on_screen_copied(self, color):
+        # 复制即退出：静默回填已存在的颜色窗口，不创建/不显示/不激活（复制不弹窗）
+        self._screen_pick_silent_exit = True
+        if self.color_window is not None:
+            hexval = color.name().upper()
+            self.color_window.color_edit.setText(hexval)
+            self.color_window.set_status(f"屏幕取色 {hexval}，已复制到剪贴板", ok=True)
+
+    def _on_screen_pick_closed(self, *_):
+        self._screen_pick_overlay = None
+        prev = self._screen_pick_prev_pid
+        self._screen_pick_prev_pid = None
+        silent = self._screen_pick_silent_exit
+        self._screen_pick_silent_exit = False
+        if not silent:
+            self.show()
+        if prev:
+            _mac_reactivate(prev)
 
     def show_json_yaml(self):
         if self.json_yaml_window is None:
@@ -11286,6 +11800,7 @@ class ToolboxWindow(QMainWindow):
             ('UUID', self.show_uuid),
             ('格式转换', self.show_convert),
             ('颜色', self.show_color),
+            ('屏幕取色', self.show_screen_pick),
             ('JSON-YAML', self.show_json_yaml),
             ('文本统计', self.show_textstat),
             ('Cron 表达式', self.show_cron),
@@ -11382,6 +11897,7 @@ class ToolboxWindow(QMainWindow):
             'UUID': self.show_uuid,
             '格式转换': self.show_convert,
             '颜色': self.show_color,
+            '屏幕取色': self.show_screen_pick,
             'JSON-YAML': self.show_json_yaml,
             '文本统计': self.show_textstat,
             'Cron 表达式': self.show_cron,
@@ -11475,6 +11991,13 @@ class ToolboxWindow(QMainWindow):
         self.section_order_window.show()
         self.section_order_window.raise_()
         self.section_order_window.activateWindow()
+
+    def show_settings(self):
+        if self.settings_window is None:
+            self.settings_window = SettingsWindow(self)
+        self.settings_window.show()
+        self.settings_window.raise_()
+        self.settings_window.activateWindow()
 
     def _open_cache_dir(self):
         """打开缓存目录。"""

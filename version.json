@@ -1,6 +1,6 @@
 {
-  "version": "1.0.19",
-  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.19/Toolbox-macos.zip",
-  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.19/Toolbox-windows.zip",
-  "changelog": "- feat: v1.0.19 - 最近使用单行稳定展示，大类/工具拖动排序支持跨类移动\n- chore: update version.json for v1.0.18 [skip ci]"
+  "version": "1.0.20",
+  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.20/Toolbox-macos.zip",
+  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.20/Toolbox-windows.zip",
+  "changelog": "- feat: v1.0.20 - 屏幕取色/全局热键/设置窗口\n- chore: update version.json for v1.0.19 [skip ci]"
 }

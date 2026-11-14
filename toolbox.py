@@ -3933,7 +3933,7 @@ class CaptureOverlay(QWidget):
     LOUPE_SOURCE = 15
     LOUPE_ZOOM = 10
 
-    def __init__(self, desktop, geometry, auto_copy=False, selection=None):
+    def __init__(self, desktop, geometry, auto_copy=False):
         super().__init__(None, Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.setGeometry(geometry)
@@ -3956,7 +3956,7 @@ class CaptureOverlay(QWidget):
         self._text_anchor = QPointF(0.0, 0.0)  # 输入框对应的落字位置（相对选区）
         self._text_drag = None     # 拖动中的文字标注：{"index", "start_point", "start_rel"}
         self._auto_copy = auto_copy
-        self._selection = selection.intersected(self.rect()) if selection is not None else QRect()
+        self._selection = QRect()
         self._accepted = False
         self._origin = None
         self._drag = None
@@ -4771,57 +4771,6 @@ class CaptureOverlay(QWidget):
         super().closeEvent(event)
 
 
-class CustomCaptureDialog(QDialog):
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.setWindowTitle("自定义截屏")
-        self.resize(360, 260)
-        layout = QVBoxLayout(self)
-        hint = QLabel("按屏幕内的逻辑坐标指定截图区域，自动适配显示缩放。")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #697386; font-size: 12px;")
-        layout.addWidget(hint)
-        form = QFormLayout()
-        self.screen_combo = QComboBox()
-        self.screens = QApplication.screens()
-        for screen in self.screens:
-            geo = screen.geometry()
-            self.screen_combo.addItem("%s  (%s × %s)" % (screen.name(), geo.width(), geo.height()))
-        self.x_edit, self.y_edit, self.width_edit, self.height_edit = (QSpinBox() for _ in range(4))
-        for label, field in (("屏幕", self.screen_combo), ("左侧 X", self.x_edit), ("顶部 Y", self.y_edit),
-                             ("宽度", self.width_edit), ("高度", self.height_edit)):
-            form.addRow(label, field)
-        layout.addLayout(form)
-        self.screen_combo.currentIndexChanged.connect(self._update_limits)
-        self.x_edit.valueChanged.connect(self._update_size_limits)
-        self.y_edit.valueChanged.connect(self._update_size_limits)
-        self._update_limits()
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("截屏")
-        buttons.button(QDialogButtonBox.Cancel).setText("取消")
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def _update_limits(self, *_):
-        geo = self.screens[self.screen_combo.currentIndex()].geometry()
-        self.x_edit.setRange(0, geo.width() - 1)
-        self.y_edit.setRange(0, geo.height() - 1)
-        self._update_size_limits()
-        self.width_edit.setValue(min(640, self.width_edit.maximum()))
-        self.height_edit.setValue(min(480, self.height_edit.maximum()))
-
-    def _update_size_limits(self, *_):
-        geo = self.screens[self.screen_combo.currentIndex()].geometry()
-        self.width_edit.setRange(1, geo.width() - self.x_edit.value())
-        self.height_edit.setRange(1, geo.height() - self.y_edit.value())
-
-    def capture_rect(self):
-        geo = self.screens[self.screen_combo.currentIndex()].geometry()
-        return QRect(geo.x() + self.x_edit.value(), geo.y() + self.y_edit.value(),
-                     self.width_edit.value(), self.height_edit.value())
-
-
 class PinnedImageWindow(QWidget):
     closed = pyqtSignal(object)
 
@@ -4989,7 +4938,6 @@ class ScreenshotTool(QObject):
         self._ocr_workers = []
         self._restore_windows = []
         self._auto_copy = False
-        self._rectangle = None
         self._prev_pid = None
         self._prev_hwnd = None
         self._quitting = False
@@ -5004,14 +4952,7 @@ class ScreenshotTool(QObject):
     def capture_copy(self):
         self._begin_capture(True)
 
-    def custom_capture(self):
-        if self.overlay is not None or self._timer.isActive():
-            return
-        dialog = CustomCaptureDialog(self.main)
-        if dialog.exec_() == QDialog.Accepted:
-            self._begin_capture(False, dialog.capture_rect())
-
-    def _begin_capture(self, auto_copy, rectangle=None):
+    def _begin_capture(self, auto_copy):
         if self.overlay is not None:
             self.overlay.close()
             return
@@ -5022,7 +4963,6 @@ class ScreenshotTool(QObject):
             ctypes.windll.user32.GetForegroundWindow.restype = ctypes.c_void_p
             self._prev_hwnd = ctypes.windll.user32.GetForegroundWindow()
         self._auto_copy = auto_copy
-        self._rectangle = rectangle
         self._restore_windows = [self.main] if self.main.isVisible() else []
         for window in self._restore_windows:
             window.hide()
@@ -5035,8 +4975,7 @@ class ScreenshotTool(QObject):
             self._restore()
             QMessageBox.warning(self.main, "截图失败", str(exc))
             return
-        selection = self._rectangle.translated(-geometry.topLeft()) if self._rectangle is not None else None
-        self.overlay = CaptureOverlay(desktop, geometry, self._auto_copy, selection)
+        self.overlay = CaptureOverlay(desktop, geometry, self._auto_copy)
         self.overlay.captured.connect(self._finish_capture)
         self.overlay.cancelled.connect(self._cancel_capture)
         self.overlay.ocr_requested.connect(self._recognize_text)
@@ -12197,7 +12136,7 @@ TOOL_TIPS = {
     "生成器": "页签：二维码 / 条形码 / UUID / 随机数",
     "颜色": "功能：颜色选择器 · HEX / RGB / HSL 互转",
     "取色器": "功能：屏幕取色 · 全屏放大镜 · C 复制并退出 · X 切换 HEX/RGB · 左键/ESC 退出",
-    "截图贴图": "功能：区域截屏 · 识别文字 · 识别后框内拖选即复制 · 像素放大镜 · HEX / RGB 取色 · 复制颜色 · 调整选区 · 矩形 / 箭头 / 画笔 / 文字标注 · 截图自动复制 · 自定义截屏 · 剪贴板贴图 · 桌面置顶 · 缩放 / 透明度 · 隐藏显示全部贴图",
+    "截图贴图": "功能：区域截屏 · 识别文字 · 识别后框内拖选即复制 · 像素放大镜 · HEX / RGB 取色 · 复制颜色 · 调整选区 · 矩形 / 箭头 / 画笔 / 文字标注 · 截图自动复制 · 剪贴板贴图 · 桌面置顶 · 缩放 / 透明度 · 隐藏显示全部贴图",
     "文本工具": "页签：处理与统计（排序 · 去重 · uniq -c · 命名风格 · 合并拆分 · SQL IN · 选区实时统计 · 编码字节 · 不可见字符）/ 文本对比（行内高亮 · 忽略空白/大小写 · 差异跳转 · unified diff）",
     "Cron 表达式": "页签：执行计划 / 书写规范",
     "哈希计算": "页签：文本哈希 / 文件哈希（MD5 / SHA1 / SHA256 / SHA512）",
@@ -12747,14 +12686,14 @@ _CARBON_HANDLER = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_void_p, ctypes.c_voi
 
 
 SHORTCUT_ACTIONS = {"rain": "文字雨", "picker": "取色器", "capture": "截屏",
-                    "capture_copy": "截屏并自动复制", "custom_capture": "自定义截屏",
+                    "capture_copy": "截屏并自动复制",
                     "paste_image": "贴图", "toggle_pins": "隐藏 / 显示所有贴图"}
 
 
 def default_shortcuts():
     modifier = "Meta+Alt+" if platform.system() == "Darwin" else "Ctrl+Alt+"
     return {"rain": modifier + "O", "picker": modifier + "C", "capture": modifier + "S",
-            "capture_copy": modifier + "Shift+S", "custom_capture": modifier + "A",
+            "capture_copy": modifier + "Shift+S",
             "paste_image": modifier + "V", "toggle_pins": modifier + "H"}
 
 
@@ -13785,7 +13724,6 @@ class SettingsWindow(QMainWindow):
                         "picker": "启动 / 关闭屏幕放大镜，快速获取颜色",
                         "capture": "像素取色与本地 OCR，框选后调整与标注，直接复制、保存或贴图",
                         "capture_copy": "框选完成后直接复制，不弹出预览",
-                        "custom_capture": "按屏幕、坐标及尺寸截取指定区域",
                         "paste_image": "把剪贴板中的图片固定到桌面",
                         "toggle_pins": "统一隐藏或显示全部桌面贴图"}
         for action, name in SHORTCUT_ACTIONS.items():
@@ -14378,11 +14316,11 @@ class ToolboxWindow(QMainWindow):
                 self._screen_pick_overlay.close()
             else:
                 self._record_usage_and_call(self.show_screen_pick)
-        elif action in ("capture", "capture_copy", "custom_capture", "paste_image", "toggle_pins"):
+        elif action in ("capture", "capture_copy", "paste_image", "toggle_pins"):
             self._add_to_history("截图贴图")
             tool = self._get_screenshot_tool()
             callbacks = {"capture": tool.capture, "capture_copy": tool.capture_copy,
-                         "custom_capture": tool.custom_capture, "paste_image": tool.paste,
+                         "paste_image": tool.paste,
                          "toggle_pins": tool.toggle_pins}
             callbacks[action]()
 

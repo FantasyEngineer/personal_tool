@@ -1,6 +1,6 @@
 {
-  "version": "1.0.24",
-  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.24/Toolbox-macos.zip",
-  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.24/Toolbox-windows.zip",
-  "changelog": "- refactor: 移除自定义截屏功能"
+  "version": "1.0.25",
+  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.25/Toolbox-macos.zip",
+  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.25/Toolbox-windows.zip",
+  "changelog": "- feat: 更新入口集中到底栏，macOS 安装到应用程序目录"
 }

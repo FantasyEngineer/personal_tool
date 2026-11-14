@@ -32,15 +32,44 @@ ICON_ASSETS = [(os.path.join("assets", f), "assets")
 
 # 本地 OCR（RapidOCR + onnxruntime）按需收集：未安装时构建仍可成功，程序会自动跳过本地引擎。
 OCR_BINARIES, OCR_DATAS, OCR_HIDDEN = [], [], []
+# 这些子包只在训练/模型转换时用，运行时不需要。PyInstaller 分析它们会在隔离子进程里
+# 导入 onnxruntime，与 PyQt5 自带的 CRT 冲突而崩溃（exit 3221225477），必须排除。
+OCR_SKIP = (
+    "onnxruntime.quantization", "onnxruntime.transformers", "onnxruntime.tools",
+    "onnxruntime.datasets", "onnxruntime.training",
+    "rapidocr.inference_engine.tensorrt", "rapidocr.inference_engine.pytorch",
+    "rapidocr.inference_engine.paddle", "rapidocr.inference_engine.mnn",
+    "rapidocr.inference_engine.openvino",
+)
 try:
     from PyInstaller.utils.hooks import collect_all
     for package in ("rapidocr", "onnxruntime"):
         binaries, datas, hiddenimports = collect_all(package)
         OCR_BINARIES += binaries
         OCR_DATAS += datas
-        OCR_HIDDEN += hiddenimports
+        OCR_HIDDEN += [name for name in hiddenimports
+                       if not any(name == skip or name.startswith(skip + ".") for skip in OCR_SKIP)]
 except Exception as exc:  # noqa: BLE001
     print("skip local OCR collection:", exc)
+
+# PyInstaller 的二进制依赖扫描会把 Qt 绑定放在最前面导入，之后再导入 onnxruntime 就会因
+# Qt5/bin 自带的旧版 msvcp140 冲突而崩溃（0xC0000005，导致 Windows 打包失败）。
+# onnxruntime 的 DLL 已由 collect_all 完整收集，无需再让扫描步骤导入它，这里直接跳过。
+import PyInstaller.building.build_main as _build_main
+
+_original_find_binary_dependencies = _build_main.find_binary_dependencies
+
+
+def _find_binary_dependencies(binaries, import_packages, symlink_suppression_patterns):
+    # onnxruntime 及其上层封装在 PyQt5 之后导入都会崩溃，两者都不参与扫描；
+    # 它们的 DLL 由上面的 collect_all 完整收集，运行时直接从包里加载。
+    skip = ("onnxruntime", "rapidocr")
+    safe_packages = [name for name in import_packages
+                     if not any(name == root or name.startswith(root + ".") for root in skip)]
+    return _original_find_binary_dependencies(binaries, safe_packages, symlink_suppression_patterns)
+
+
+_build_main.find_binary_dependencies = _find_binary_dependencies
 
 a = Analysis(
     ["toolbox.py"],
@@ -49,11 +78,11 @@ a = Analysis(
     datas=ICON_ASSETS + OCR_DATAS,
     # qrcode picks its PIL image backend lazily; make sure it is bundled.
     # cryptography's Rust binding is an extension module the 加解密 pages need at runtime.
-    hiddenimports=["qrcode.pil", "qrcode.image.pil", "cryptography.hazmat.bindings._rust"] + OCR_HIDDEN,
+    hiddenimports=["qrcode.image.pil", "cryptography.hazmat.bindings._rust"] + OCR_HIDDEN,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["tkinter", "matplotlib", "PyQt5.QtWebEngine", "PyQt5.QtQml"],
+    excludes=["tkinter", "matplotlib", "PyQt5.QtWebEngine", "PyQt5.QtQml"] + list(OCR_SKIP),
     win_no_prefer_redirects=False,
     noarchive=False,
 )

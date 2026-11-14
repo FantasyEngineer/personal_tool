@@ -61,7 +61,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QStyledItemDelegate, QStyle, QGraphicsOpacityEffect,
                               QDialog, QFormLayout, QDialogButtonBox,
                               QDateEdit, QDateTimeEdit, QGroupBox, QTimeEdit,
-                              QAbstractItemView, QKeySequenceEdit, QProgressBar, QSizePolicy)
+                              QAbstractItemView, QKeySequenceEdit, QProgressBar, QSizePolicy,
+                              QStyleOptionComboBox)
 from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QThread, QObject, pyqtSignal, QTimer, QUrl, QLockFile, QDate, QDateTime, QTime, QAbstractNativeEventFilter, QEvent, QSize, QStandardPaths
 from PyQt5.QtGui import (QFont, QCursor, QTextCursor, QColor, QPen, QPixmap, QPainter, QIcon,
                          QImage, QLinearGradient, QBrush, QDesktopServices, QPalette, QKeySequence,
@@ -863,12 +864,7 @@ class JsonFormatterWindow(QMainWindow):
         history_layout.addWidget(history_label)
 
         self.history_combo = QComboBox()
-        self.history_combo.setStyleSheet("""
-            QComboBox { border: 1px solid #D0D0D0; border-radius: 4px; padding: 3px 8px;
-                font-size: 12px; background: #FFFFFF; color: #333333; }
-            QComboBox:focus { border-color: #1A73E8; }
-            QComboBox::drop-down { border: none; width: 20px; }
-        """)
+        self.history_combo.setStyleSheet(_combo_style())
         self.history_combo.activated.connect(self.load_history_entry)
         history_layout.addWidget(self.history_combo, 1)
         layout.addLayout(history_layout)
@@ -2472,7 +2468,7 @@ class ImageToolWindow(QMainWindow):
         grid.addWidget(self._lab("目标格式"), 0, 0)
         self.conv_fmt = QComboBox()
         self.conv_fmt.addItems(self.SAVE_FORMATS)
-        self.conv_fmt.setStyleSheet("QComboBox { %s }" % self.FIELD)
+        self.conv_fmt.setStyleSheet(_combo_style(size=13, mono=True))
         self.conv_fmt.currentIndexChanged.connect(lambda i: self._toggle_quality(self.conv_fmt.currentText(), self.conv_quality))
         grid.addWidget(self.conv_fmt, 0, 1)
 
@@ -2527,7 +2523,7 @@ class ImageToolWindow(QMainWindow):
         grid.addWidget(self._lab("格式"), 1, 2)
         self.r_fmt = QComboBox()
         self.r_fmt.addItems(self.SAVE_FORMATS)
-        self.r_fmt.setStyleSheet("QComboBox { %s }" % self.FIELD)
+        self.r_fmt.setStyleSheet(_combo_style(size=13, mono=True))
         self.r_fmt.currentIndexChanged.connect(lambda i: self._toggle_quality(self.r_fmt.currentText(), self.r_quality))
         grid.addWidget(self.r_fmt, 1, 3)
 
@@ -2555,7 +2551,7 @@ class ImageToolWindow(QMainWindow):
             self.r_preset.model().item(header).setFlags(Qt.NoItemFlags)
             for label, pw, ph in sizes:
                 self.r_preset.addItem(label, (pw, ph))
-        self.r_preset.setStyleSheet("QComboBox { %s }" % self.FIELD)
+        self.r_preset.setStyleSheet(_combo_style(size=13, mono=True))
         self.r_preset.currentIndexChanged.connect(self._apply_preset)
         grid.addWidget(self.r_preset, 3, 1, 1, 2)
 
@@ -5116,12 +5112,7 @@ class CronWindow(QMainWindow):
         for expr, desc in self.CRON_EXAMPLES:
             self.preset_combo.addItem(f"{desc}   ·   {expr}", expr)
         self.preset_combo.currentIndexChanged.connect(self.on_preset_selected)
-        self.preset_combo.setStyleSheet("""
-            QComboBox { border: 1px solid #D0D0D0; border-radius: 4px; padding: 4px 8px;
-                font-family: "Menlo", "Consolas", "PingFang SC", monospace; font-size: 13px; background: #FFFFFF; }
-            QComboBox:focus { border-color: #1A73E8; }
-            QComboBox::drop-down { border: none; width: 20px; }
-        """)
+        self.preset_combo.setStyleSheet(_combo_style(size=13, mono=True))
         form.addWidget(self.preset_combo, 2, 1, 1, 3)
 
         layout.addLayout(form)
@@ -6626,10 +6617,7 @@ class UuidWindow(QMainWindow):
         self.version_combo = QComboBox()
         self.version_combo.addItems(["v4 (随机)", "v1 (时间)"])
         self.version_combo.setFixedWidth(120)
-        self.version_combo.setStyleSheet("""
-            QComboBox { border: 1px solid #D0D0D0; border-radius: 4px; padding: 4px 8px; font-size: 12px; background: #FFFFFF; }
-            QComboBox::drop-down { border: none; }
-        """)
+        self.version_combo.setStyleSheet(_combo_style())
         opt_layout.addWidget(self.version_combo)
 
         opt_layout.addWidget(QLabel("数量:"))
@@ -7041,11 +7029,7 @@ class RegexWindow(QMainWindow):
         for label, pattern in self.COMMON_PATTERNS:
             self.preset_combo.addItem(label)
         self.preset_combo.setFixedWidth(160)
-        self.preset_combo.setStyleSheet("""
-            QComboBox { border: 1px solid #D0D0D0; border-radius: 4px; padding: 4px 8px; font-size: 12px; background: #FFFFFF; }
-            QComboBox:focus { border-color: #1A73E8; }
-            QComboBox::drop-down { border: none; }
-        """)
+        self.preset_combo.setStyleSheet(_combo_style())
         self.preset_combo.currentIndexChanged.connect(self.on_preset_selected)
         preset_layout.addWidget(self.preset_combo)
         preset_layout.addStretch()
@@ -7691,7 +7675,7 @@ class BaseConvertWindow(QMainWindow):
         for label, _ in self.BASES:
             self.src_combo.addItem(label)
         self.src_combo.currentIndexChanged.connect(self.do_convert)
-        self.src_combo.setStyleSheet(self._combo_style())
+        self.src_combo.setStyleSheet(_combo_style())
         combo_layout.addWidget(self.src_combo)
 
         self.swap_btn = QPushButton("⇄ 交换格式")
@@ -7707,7 +7691,7 @@ class BaseConvertWindow(QMainWindow):
             self.dst_combo.addItem(label)
         self.dst_combo.setCurrentText("二进制")
         self.dst_combo.currentIndexChanged.connect(self.do_convert)
-        self.dst_combo.setStyleSheet(self._combo_style())
+        self.dst_combo.setStyleSheet(_combo_style())
         combo_layout.addWidget(self.dst_combo)
         layout.addLayout(combo_layout)
 
@@ -7736,13 +7720,6 @@ class BaseConvertWindow(QMainWindow):
         self.output_text.setReadOnly(True)
         self.output_text.setStyleSheet(self._input_style() + "QLineEdit { background: #FAFAFA; }")
         layout.addWidget(self.output_text)
-
-    def _combo_style(self):
-        return """
-            QComboBox { border: 1px solid #D0D0D0; border-radius: 4px; padding: 4px 8px;
-                font-size: 12px; background: #FFFFFF; }
-            QComboBox::drop-down { border: none; }
-        """
 
     def _input_style(self):
         return """
@@ -8890,12 +8867,77 @@ def _lineedit_style():
     """
 
 
-def _combo_style():
+_COMBO_ARROW_PATH = None
+
+
+def _combo_arrow_path():
+    """下拉箭头的 png。样式表里一旦声明了 ::drop-down，Qt 就不再画系统箭头，
+    必须自带 image，否则整条下拉框只剩一个空白框（看不出是下拉，也只能点到右侧窄条）。"""
+    global _COMBO_ARROW_PATH
+    if _COMBO_ARROW_PATH is not None:
+        return _COMBO_ARROW_PATH
+    folder = os.path.join(os.path.expanduser("~"), ".personal_toolbox")
+    path = os.path.join(folder, "combo_arrow.png")
+    try:
+        os.makedirs(folder, exist_ok=True)
+        pm = QPixmap(32, 32)
+        pm.fill(Qt.transparent)
+        painter = QPainter(pm)
+        pen = QPen(QColor("#5F6368"))
+        pen.setWidth(3)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(pen)
+        painter.drawPolyline(QPolygonF([QPointF(9, 13), QPointF(16, 20), QPointF(23, 13)]))
+        painter.end()
+        _COMBO_ARROW_PATH = path if pm.save(path, "PNG") else ""
+    except (OSError, RuntimeError):
+        _COMBO_ARROW_PATH = ""
+    return _COMBO_ARROW_PATH
+
+
+def _combo_style(size=12, mono=False):
+    family = ('"Menlo", "Consolas", monospace' if mono
+              else '"PingFang SC", "Microsoft YaHei", sans-serif')
+    arrow = _combo_arrow_path()
+    # 取不到 png 时（只读目录等）退回系统箭头：不写 ::drop-down，Qt 仍会画出原生箭头
+    drop = (u'''
+        QComboBox::drop-down { border: none; width: 22px; subcontrol-position: center right; }
+        QComboBox::down-arrow { image: url("%s"); width: 11px; height: 11px; }
+        QComboBox::down-arrow:pressed { top: 1px; }''' % arrow.replace("\\", "/")) if arrow else ""
     return """
         QComboBox { border: 1px solid #D0D0D0; border-radius: 4px; padding: 4px 8px;
-            font-size: 12px; background: #FFFFFF; }
-        QComboBox::drop-down { border: none; }
-    """
+            font-family: %s; font-size: %dpx; background: #FFFFFF; color: #333333; }
+        QComboBox:hover { border-color: #A8A8A8; }
+        QComboBox:focus { border-color: #1A73E8; }
+        QComboBox:disabled { background: #F5F5F5; color: #A0A0A0; }%s
+    """ % (family, size, drop)
+
+
+class _ComboClickFilter(QObject):
+    """让整个下拉框都能点开。Qt 默认只有右侧箭头那一条会展开弹层，文字区点了没反应，
+    看起来就像"要点空白处才有效"。可编辑框例外：文字区要留给输入光标。"""
+
+    def eventFilter(self, obj, event):
+        if (not isinstance(obj, QComboBox) or event.type() != QEvent.MouseButtonPress
+                or event.button() != Qt.LeftButton):
+            return False
+        if not obj.isEnabled() or obj.count() == 0 or obj.view().isVisible():
+            return False
+        if obj.isEditable() and not self._on_arrow(obj, event.pos()):
+            return False
+        obj.setFocus(Qt.MouseFocusReason)  # 吃掉按下事件后，点击获得焦点这一步要自己补上
+        obj.showPopup()
+        return True
+
+    @staticmethod
+    def _on_arrow(combo, pos):
+        opt = QStyleOptionComboBox()
+        combo.initStyleOption(opt)
+        rect = combo.style().subControlRect(QStyle.CC_ComboBox, opt, QStyle.SC_ComboBoxArrow, combo)
+        return rect.contains(pos)
+
 
 
 def _primary_btn():
@@ -15214,6 +15256,9 @@ if __name__ == "__main__":
     try:
         app = QApplication(sys.argv)
         app.setWindowIcon(app_icon())
+        # 下拉框整框可点（挂在 app 上，覆盖之后新建的所有 QComboBox）
+        combo_click_filter = _ComboClickFilter(app)
+        app.installEventFilter(combo_click_filter)
         # 有托盘时隐藏主窗口不应退出程序（由托盘"退出"显式结束）
         app.setQuitOnLastWindowClosed(not QSystemTrayIcon.isSystemTrayAvailable())
         window = ToolboxWindow()

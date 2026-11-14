@@ -7,6 +7,7 @@ import faulthandler
 import re
 import socket
 import json
+import ast
 import base64
 import urllib.parse
 import hashlib
@@ -18,6 +19,8 @@ import io
 import qrcode
 import random
 import datetime
+import zoneinfo
+import email.utils
 import colorsys
 import decimal
 import shutil
@@ -29,6 +32,12 @@ import secrets
 import string
 import threading
 import ctypes
+import tempfile
+import zipfile
+import posixpath
+import ntpath
+import stat
+import plistlib
 import yaml
 from PIL import Image
 from cryptography.hazmat.primitives import hashes, serialization
@@ -52,14 +61,15 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QStyledItemDelegate, QStyle, QGraphicsOpacityEffect,
                               QDialog, QFormLayout, QDialogButtonBox,
                               QDateEdit, QDateTimeEdit, QGroupBox, QTimeEdit,
-                              QAbstractItemView)
-from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QThread, QObject, pyqtSignal, QTimer, QUrl, QLockFile, QDate, QDateTime, QTime
-from PyQt5.QtGui import (QFont, QCursor, QColor, QPen, QPixmap, QPainter, QIcon,
-                         QImage, QLinearGradient, QBrush, QDesktopServices, QPalette)
+                              QAbstractItemView, QKeySequenceEdit, QProgressBar, QSizePolicy)
+from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QThread, QObject, pyqtSignal, QTimer, QUrl, QLockFile, QDate, QDateTime, QTime, QAbstractNativeEventFilter, QEvent, QSize, QStandardPaths
+from PyQt5.QtGui import (QFont, QCursor, QTextCursor, QColor, QPen, QPixmap, QPainter, QIcon,
+                         QImage, QLinearGradient, QBrush, QDesktopServices, QPalette, QKeySequence,
+                         QPainterPath, QPolygonF)
 
 
 APP_VERSION = "1.0.19"
-UPDATE_CHECK_URL = "https://gitee.com/jimmy_hou/personal_tool/raw/main/version.json"
+UPDATE_CHECK_URL = "https://gitee.com/api/v5/repos/jimmy_hou/personal_tool/contents/version.json?ref=main"
 
 
 def ui_font(pt_mac, px_win, bold=False, family_mac="PingFang SC"):
@@ -399,8 +409,10 @@ def app_icon():
 HISTORY_LIMIT = 50
 JSON_HISTORY_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "json_history.json")
 TOOL_USAGE_HISTORY_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "tool_usage_history.json")
+SEARCH_HISTORY_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "search_history.json")
 SECTION_ORDER_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "section_order.json")
 TOOL_ORDER_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "tool_order.json")
+SHORTCUTS_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "shortcuts.json")
 
 
 def load_history(path):
@@ -427,13 +439,39 @@ def append_history(path, entry):
     return items
 
 
+TOOL_RENAMES = {
+    "屏幕取色": "取色器", "打卡提醒": "提醒事项", "时间戳": "日期时间",
+    "文本对比": "文本工具", "文本统计": "文本工具",
+    "二维码": "生成器", "条形码": "生成器", "UUID": "生成器", "随机数": "生成器",
+    "Ping 测试": "网络诊断", "DNS 查询": "网络诊断", "路由追踪": "网络诊断",
+    "端口扫描": "网络诊断", "网络测速": "网络诊断",
+    "JSON/XML": "数据格式", "JSON-YAML": "数据格式", "格式转换": "数据格式",
+    "进制转换": "数字转换", "罗马数字": "数字转换", "金额大写": "数字转换",
+    "命令速查": "开发速查", "HTTP 状态码": "开发速查",
+}
+SECTION_RENAMES = {
+    "系统工具": "系统与桌面", "加解密/编解码": "编码与安全", "文本处理": "文本与数据",
+    "时间工具": "时间与日程", "数学工具": "数值计算", "开发工具": "开发辅助",
+    "其他": "系统与桌面", "网络诊断": "系统与桌面",
+}
+
+
 def load_section_order():
     try:
         with open(SECTION_ORDER_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
         return []
-    return [t for t in data if isinstance(t, str)] if isinstance(data, list) else []
+    if not isinstance(data, list):
+        return []
+    order = []
+    for title in data:
+        if not isinstance(title, str):
+            continue
+        name = SECTION_RENAMES.get(title, title)
+        if name not in order:
+            order.append(name)
+    return order
 
 
 def save_section_order(order):
@@ -453,9 +491,24 @@ def load_tool_order():
         return {}
     if not isinstance(data, dict):
         return {}
-    return {k: [t for t in v if isinstance(t, str)]
-            for k, v in data.items()
-            if isinstance(k, str) and isinstance(v, list)}
+    moved = {
+        ("开发工具", "Cron 表达式"): "时间与日程",
+        ("开发工具", "取色器"): "系统与桌面",
+        ("其他", "房贷计算器"): "数值计算",
+    }
+    order = {}
+    for category, names in data.items():
+        if not isinstance(category, str) or not isinstance(names, list):
+            continue
+        for name in names:
+            if not isinstance(name, str):
+                continue
+            name = TOOL_RENAMES.get(name, name)
+            target = moved.get((category, name), SECTION_RENAMES.get(category, category))
+            tools = order.setdefault(target, [])
+            if name not in tools:
+                tools.append(name)
+    return order
 
 
 def save_tool_order(order):
@@ -1374,29 +1427,57 @@ class CodecWindow(TabbedToolWindow):
         ))
 
 
-class MarkupWindow(TabbedToolWindow):
+class DataFormatWindow(TabbedToolWindow):
     def __init__(self):
-        super().__init__("JSON / XML", (
+        super().__init__("数据格式", (
             (JsonFormatterWindow, "JSON"),
             (XmlFormatterWindow, "XML"),
+            (JsonYamlWindow, "JSON ↔ YAML"),
         ))
 
 
 class GeneratorWindow(TabbedToolWindow):
     def __init__(self):
-        super().__init__("二维码/条形码/UUID", (
+        super().__init__("生成器", (
             (QrCodeWindow, "二维码"),
             (BarcodeWindow, "条形码"),
             (UuidWindow, "UUID"),
+            (RandomWindow, "随机数"),
         ))
 
 
-class ConvertWindow(TabbedToolWindow):
+class NumberConvertWindow(TabbedToolWindow):
     def __init__(self):
-        super().__init__("格式转换", (
-            (ColorWindow, "颜色"),
-            (JsonYamlWindow, "JSON-YAML"),
+        super().__init__("数字转换", (
+            (BaseConvertWindow, "进制"),
+            (RomanNumeralWindow, "罗马数字"),
+            (RmbUppercaseWindow, "金额大写"),
         ))
+
+
+class NetworkDiagnosticsWindow(TabbedToolWindow):
+    def __init__(self):
+        super().__init__("网络诊断", (
+            (PingWindow, "Ping"),
+            (TracerouteWindow, "路由追踪"),
+            (DNSWindow, "DNS"),
+            (PortScanWindow, "端口扫描"),
+            (SpeedTestWindow, "测速"),
+        ))
+        ping, trace, dns, ports, _speed = self._owners
+        self._target_inputs = [ping.target_input, trace.target_input, dns.domain_input, ports.target_input]
+        for edit in self._target_inputs:
+            edit.setToolTip("目标地址在 Ping、路由追踪、DNS、端口扫描间同步")
+            edit.textEdited.connect(self._sync_target)
+
+    def _sync_target(self, text):
+        for edit in self._target_inputs:
+            if edit.text() != text:
+                edit.setText(text)
+
+    def closeEvent(self, event):
+        self._owners[-1].close()
+        super().closeEvent(event)
 
 
 DIFF_AUTO_LIMIT = 4000
@@ -1530,6 +1611,7 @@ class DiffWindow(QMainWindow):
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self.run_diff)
+        self._hunks = []
         self.init_ui()
 
     def init_ui(self):
@@ -1560,6 +1642,15 @@ class DiffWindow(QMainWindow):
         self.only_check.toggled.connect(lambda _c: self.run_diff())
         options.addWidget(self.only_check)
         options.addStretch()
+
+        for text, tip, step in (("↑", "上一处差异", -1), ("↓", "下一处差异", 1)):
+            nav_btn = QPushButton(text)
+            nav_btn.setFixedSize(30, 28)
+            nav_btn.setToolTip(tip)
+            nav_btn.setCursor(QCursor(Qt.PointingHandCursor))
+            nav_btn.setStyleSheet(_secondary_btn())
+            nav_btn.clicked.connect(lambda _c=False, s=step: self.jump_hunk(s))
+            options.addWidget(nav_btn)
 
         swap_btn = QPushButton("交换左右")
         swap_btn.setFixedSize(74, 28)
@@ -1694,13 +1785,18 @@ class DiffWindow(QMainWindow):
         counts = {kind: 0 for kind in DIFF_LABELS}
         for row in rows:
             counts[row[0]] += 1
+        starts = {i for i, row in enumerate(rows)
+                  if row[0] != "equal" and (i == 0 or rows[i - 1][0] == "equal")}
         if self.only_check.isChecked():
-            shown = [row for row in rows if row[0] != "equal"]
+            shown = [(i, row) for i, row in enumerate(rows) if row[0] != "equal"]
         else:
-            shown = rows
+            shown = list(enumerate(rows))
         self.result_tree.clear()
+        self._hunks = []
         limit = min(len(shown), DIFF_ROW_LIMIT)
-        for kind, l_no, l_text, r_no, r_text in shown[:limit]:
+        for index, (kind, l_no, l_text, r_no, r_text) in shown[:limit]:
+            if index in starts:
+                self._hunks.append(self.result_tree.topLevelItemCount())
             item = QTreeWidgetItem(["" if l_no is None else str(l_no), l_text,
                                    "" if r_no is None else str(r_no), r_text])
             color = DIFF_COLORS.get(kind)
@@ -1721,13 +1817,27 @@ class DiffWindow(QMainWindow):
             self.status_label.setStyleSheet("color: #188038; font-family: 'PingFang SC'; font-size: 11px;")
             return
         self.status_label.setStyleSheet("color: #999999; font-family: 'PingFang SC'; font-size: 11px;")
-        text = ("差异：修改 %d · 新增 %d · 删除 %d · 相同 %d 行"
-                % (counts["replace"], counts["insert"], counts["delete"], counts["equal"]))
+        text = ("差异 %d 处：修改 %d · 新增 %d · 删除 %d · 相同 %d 行 · ↑↓ 跳转"
+                % (len(self._hunks), counts["replace"], counts["insert"], counts["delete"], counts["equal"]))
         if len(shown) > limit:
             text += "（仅显示前 %d 行）" % limit
         if self.only_check.isChecked():
             text += " · 已过滤相同行"
         self.status_label.setText(text)
+
+    def jump_hunk(self, step):
+        count = self.result_tree.topLevelItemCount()
+        hunks = [h for h in self._hunks if h < count]
+        if not hunks:
+            return
+        current = self.result_tree.currentItem()
+        pos = self.result_tree.indexOfTopLevelItem(current) if current else (-1 if step > 0 else count)
+        later = [h for h in hunks if h > pos] if step > 0 else [h for h in hunks if h < pos]
+        target = (later[0] if step > 0 else later[-1]) if later else (hunks[0] if step > 0 else hunks[-1])
+        item = self.result_tree.topLevelItem(target)
+        self.result_tree.setCurrentItem(item)
+        self.result_tree.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+        self.result_tree.setFocus()
 
     def copy_unified(self):
         left = self.left_edit.toPlainText().splitlines()
@@ -1744,97 +1854,449 @@ class DiffWindow(QMainWindow):
             self.close()
 
 
-class TextStatWindow(QMainWindow):
+TEXT_INVISIBLE_RE = re.compile("[\u00a0\u00ad\u200b-\u200f\u2028-\u202e\u2060-\u2064\ufeff"
+                               "\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+TEXT_CJK_RE = re.compile("[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+TEXT_WORD_RE = re.compile(r"[A-Za-z0-9_]+(?:['’-][A-Za-z0-9_]+)*")
+_TEXT_CASE_WORD_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|\d+|[^\W\d_A-Za-z]+")
+
+
+def text_natural_key(line):
+    return [int(t) if i % 2 else t.lower() for i, t in enumerate(re.split(r"(\d+)", line))]
+
+
+def text_case(line, style):
+    """单行按 camelCase / snake_case 等命名风格改写，保留首尾空白。"""
+    m = re.match(r"(\s*)(.*?)(\s*)$", line, re.S)
+    lead, body, trail = m.groups()
+    words = _TEXT_CASE_WORD_RE.findall(body)
+    if not words:
+        return line
+    cap = [w[:1].upper() + w[1:].lower() for w in words]
+    out = {
+        "camel": words[0].lower() + "".join(cap[1:]),
+        "pascal": "".join(cap),
+        "snake": "_".join(w.lower() for w in words),
+        "kebab": "-".join(w.lower() for w in words),
+        "constant": "_".join(w.upper() for w in words),
+        "dot": ".".join(w.lower() for w in words),
+    }[style]
+    return lead + out + trail
+
+
+def text_fullwidth_to_half(text):
+    out = []
+    for ch in text:
+        code = ord(ch)
+        if code == 0x3000:
+            code = 0x20
+        elif 0xFF01 <= code <= 0xFF5E:
+            code -= 0xFEE0
+        out.append(chr(code))
+    return "".join(out)
+
+
+def text_count_lines(lines):
+    """等同 sort | uniq -c | sort -rn：按出现次数降序，同次数保持首次出现顺序。"""
+    counts = {}
+    for line in lines:
+        counts[line] = counts.get(line, 0) + 1
+    width = len(str(max(counts.values()))) if counts else 1
+    return [f"{n:>{width}}  {line}" for line, n in sorted(counts.items(), key=lambda kv: -kv[1])]
+
+
+def text_sql_in(lines):
+    items = ["'" + line.strip().replace("'", "''") + "'" for line in lines if line.strip()]
+    return "(" + ", ".join(items) + ")"
+
+
+def text_unquote_literal(text):
+    s = text.strip()
+    if len(s) >= 2 and s[0] == s[-1] == "'":
+        value = ast.literal_eval(s)
+    else:
+        if not (len(s) >= 2 and s[0] == s[-1] == '"'):
+            s = '"' + re.sub(r'(?<!\\)((?:\\\\)*)"', r'\1\\"', s) + '"'
+        value = json.loads(s, strict=False)
+    if not isinstance(value, str):
+        raise ValueError("不是字符串字面量")
+    return value
+
+
+def text_stats(text):
+    lines = text.split("\n") if text else []
+    longest = max(range(len(lines)), key=lambda i: len(lines[i])) if lines else None
+    tab_indent = sum(1 for l in lines if l.startswith("\t"))
+    space_indent = sum(1 for l in lines if l.startswith(" "))
+    if tab_indent and space_indent:
+        indent = f"混合（Tab {tab_indent} / 空格 {space_indent} 行）"
+    elif tab_indent:
+        indent = "Tab"
+    elif space_indent:
+        widths = [len(l) - len(l.lstrip(" ")) for l in lines if l.startswith(" ") and l.strip()]
+        unit = min((w for w in widths if w), default=0)
+        indent = f"空格（最小 {unit} 格）" if unit else "空格"
+    else:
+        indent = "—"
+    try:
+        gbk = f"{len(text.encode('gbk')):,}"
+    except UnicodeEncodeError:
+        gbk = "含无法编码字符"
+    non_space = len(re.sub(r"\s", "", text))
+    return [
+        ("字符", f"{len(text):,}"),
+        ("不含空白", f"{non_space:,}"),
+        ("中文字", f"{len(TEXT_CJK_RE.findall(text)):,}"),
+        ("英文单词", f"{len(TEXT_WORD_RE.findall(text)):,}"),
+        ("行数", f"{len(lines):,}"),
+        ("非空行", f"{sum(1 for l in lines if l.strip()):,}"),
+        ("唯一行", f"{len(set(lines)):,}"),
+        ("最长行", f"{len(lines[longest]):,}（第 {longest + 1} 行）" if lines else "—"),
+        ("UTF-8", f"{len(text.encode('utf-8', 'surrogatepass')):,} B"),
+        ("UTF-16", f"{len(text.encode('utf-16-le', 'surrogatepass')):,} B"),
+        ("GBK", gbk if gbk.startswith("含") else gbk + " B"),
+        ("非 ASCII", f"{sum(1 for ch in text if ord(ch) > 127):,}"),
+        ("缩进", indent),
+        ("行尾空白", f"{sum(1 for l in lines if l != l.rstrip()):,} 行"),
+        ("不可见字符", f"{len(TEXT_INVISIBLE_RE.findall(text)):,}"),
+    ]
+
+
+def _line_op(fn):
+    """按行处理；末尾换行原样保留。"""
+    def run(text, params):
+        trailing = text.endswith("\n")
+        lines = text[:-1].split("\n") if trailing else text.split("\n")
+        return "\n".join(fn(lines, params)) + ("\n" if trailing else "")
+    return run
+
+
+def _dedupe(lines, _p):
+    return list(dict.fromkeys(lines))
+
+
+def _only_dupes(lines, _p):
+    seen = {}
+    for line in lines:
+        seen[line] = seen.get(line, 0) + 1
+    return [line for line in dict.fromkeys(lines) if seen[line] > 1]
+
+
+def _only_unique(lines, _p):
+    seen = {}
+    for line in lines:
+        seen[line] = seen.get(line, 0) + 1
+    return [line for line in lines if seen[line] == 1]
+
+
+def _squeeze_blank(lines, _p):
+    out = []
+    for line in lines:
+        if line.strip() or not (out and not out[-1].strip()):
+            out.append(line)
+    return out
+
+
+def _shuffled(lines, _p):
+    lines = list(lines)
+    random.shuffle(lines)
+    return lines
+
+
+def _number_lines(lines, _p):
+    width = len(str(len(lines)))
+    return [f"{i:>{width}}  {line}" for i, line in enumerate(lines, 1)]
+
+
+TEXT_OPS = {
+    "行操作": [
+        ("升序排序", _line_op(lambda ls, p: sorted(ls))),
+        ("降序排序", _line_op(lambda ls, p: sorted(ls, reverse=True))),
+        ("自然排序（file2 < file10）", _line_op(lambda ls, p: sorted(ls, key=text_natural_key))),
+        ("忽略大小写排序", _line_op(lambda ls, p: sorted(ls, key=str.lower))),
+        ("按长度排序", _line_op(lambda ls, p: sorted(ls, key=len))),
+        ("反转行序", _line_op(lambda ls, p: ls[::-1])),
+        ("随机打乱", _line_op(_shuffled)),
+        None,
+        ("去重（保留首次出现）", _line_op(_dedupe)),
+        ("只保留重复行", _line_op(_only_dupes)),
+        ("只保留唯一行", _line_op(_only_unique)),
+        ("统计重复次数（uniq -c）", _line_op(lambda ls, p: text_count_lines(ls))),
+        None,
+        ("删除空行", _line_op(lambda ls, p: [l for l in ls if l.strip()])),
+        ("合并连续空行", _line_op(_squeeze_blank)),
+        ("去除首尾空白", _line_op(lambda ls, p: [l.strip() for l in ls])),
+        ("去除行尾空白", _line_op(lambda ls, p: [l.rstrip() for l in ls])),
+        ("添加行号", _line_op(_number_lines)),
+        ("删除行首行号", _line_op(lambda ls, p: [re.sub(r"^\s*\d+(?:[.:)、]\s?|\s+)", "", l) for l in ls])),
+    ],
+    "转换": [
+        ("全部大写", lambda t, p: t.upper()),
+        ("全部小写", lambda t, p: t.lower()),
+        ("单词首字母大写", lambda t, p: re.sub(r"[A-Za-z]+", lambda m: m.group().capitalize(), t)),
+        ("大小写互换", lambda t, p: t.swapcase()),
+        None,
+        ("camelCase", _line_op(lambda ls, p: [text_case(l, "camel") for l in ls])),
+        ("PascalCase", _line_op(lambda ls, p: [text_case(l, "pascal") for l in ls])),
+        ("snake_case", _line_op(lambda ls, p: [text_case(l, "snake") for l in ls])),
+        ("kebab-case", _line_op(lambda ls, p: [text_case(l, "kebab") for l in ls])),
+        ("CONSTANT_CASE", _line_op(lambda ls, p: [text_case(l, "constant") for l in ls])),
+        ("dot.case", _line_op(lambda ls, p: [text_case(l, "dot") for l in ls])),
+        None,
+        ("全角转半角", lambda t, p: text_fullwidth_to_half(t)),
+        ("Tab 转 4 空格", lambda t, p: t.replace("\t", "    ")),
+        ("4 空格转 Tab", _line_op(lambda ls, p: [re.sub(r"^(?: {4})+", lambda m: "\t" * (len(m.group()) // 4), l) for l in ls])),
+        ("清除不可见字符（NBSP 转空格）", lambda t, p: TEXT_INVISIBLE_RE.sub(
+            lambda m: " " if m.group() == "\u00a0" else "", t)),
+        None,
+        ("转为字符串字面量", lambda t, p: json.dumps(t, ensure_ascii=False)),
+        ("还原字符串字面量", lambda t, p: text_unquote_literal(t)),
+    ],
+    "合并拆分": [
+        ("多行合并为一行（用分隔符）", _line_op(lambda ls, p: [p["sep"].join(ls)])),
+        ("按分隔符拆分为多行", lambda t, p: t.replace(p["sep"], "\n") if p["sep"] else t),
+        ("每行加前缀 / 后缀", _line_op(lambda ls, p: [p["prefix"] + l + p["suffix"] for l in ls])),
+        None,
+        ("生成 SQL IN 列表", _line_op(lambda ls, p: [text_sql_in(ls)])),
+        ("生成 JSON 数组", _line_op(lambda ls, p: [json.dumps([l for l in ls if l.strip()], ensure_ascii=False)])),
+        ("生成带引号逗号列表", _line_op(lambda ls, p: [", ".join(json.dumps(l, ensure_ascii=False) for l in ls if l.strip())])),
+    ],
+}
+
+
+def _text_escape_param(value):
+    return value.replace("\\n", "\n").replace("\\t", "\t")
+
+
+class TextProcessWindow(QMainWindow):
+    """文本处理：行操作 / 转换 / 合并拆分（作用于选区或全文，可撤销）+ 实时统计。"""
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("文本统计")
+        self.setWindowTitle("文本处理")
         self.setGeometry(*tool_win_geometry())
         self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
+        self._stat_timer = QTimer(self)
+        self._stat_timer.setSingleShot(True)
+        self._stat_timer.timeout.connect(self.refresh_stats)
         self.init_ui()
 
     def init_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(15, 15, 15, 10)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 12, 12, 8)
+        layout.setSpacing(8)
 
-        header = QHBoxLayout()
-        title = QLabel("输入内容")
-        title.setFont(QFont("PingFang SC", 12, QFont.Bold))
-        title.setStyleSheet("color: #333333;")
-        header.addWidget(title)
-        header.addStretch()
+        menu_style = """
+            QMenu { background: #FFFFFF; border: 1px solid #D0D0D0; padding: 4px; font-size: 12px; }
+            QMenu::item { padding: 5px 22px 5px 14px; }
+            QMenu::item:selected { background: #E8F0FE; color: #1A73E8; }
+            QMenu::separator { height: 1px; background: #E8EAED; margin: 4px 6px; }
+        """
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        for name, ops in TEXT_OPS.items():
+            btn = QPushButton(name + " ▾")
+            btn.setFixedHeight(28)
+            btn.setCursor(QCursor(Qt.PointingHandCursor))
+            btn.setStyleSheet(_primary_btn() + "QPushButton::menu-indicator { width: 0; }")
+            menu = QMenu(btn)
+            menu.setStyleSheet(menu_style)
+            for op in ops:
+                if op is None:
+                    menu.addSeparator()
+                    continue
+                label, fn = op
+                menu.addAction(label).triggered.connect(lambda _c=False, l=label, f=fn: self.apply_op(l, f))
+            btn.setMenu(menu)
+            bar.addWidget(btn)
+        bar.addStretch()
+        self.wrap_check = QCheckBox("自动换行")
+        self.wrap_check.setStyleSheet("QCheckBox { font-size: 12px; }")
+        self.wrap_check.toggled.connect(lambda on: self.editor.setLineWrapMode(
+            QPlainTextEdit.WidgetWidth if on else QPlainTextEdit.NoWrap))
+        bar.addWidget(self.wrap_check)
+        for text, slot in (("打开", self.open_file), ("复制", self.copy_all), ("清空", self.do_clear)):
+            btn = QPushButton(text)
+            btn.setFixedHeight(28)
+            btn.setCursor(QCursor(Qt.PointingHandCursor))
+            btn.setStyleSheet(_secondary_btn())
+            btn.clicked.connect(slot)
+            bar.addWidget(btn)
+            if text == "复制":
+                self.copy_btn = btn
+        layout.addLayout(bar)
 
-        clear_btn = QPushButton("清空")
-        clear_btn.setFixedSize(60, 28)
-        clear_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        clear_btn.setStyleSheet("""
-            QPushButton { color: #333333; background: #F0F0F0; border: 1px solid #D0D0D0; border-radius: 4px; font-size: 12px; }
-            QPushButton:hover { background: #E0E0E0; }
-        """)
-        clear_btn.clicked.connect(self.do_clear)
-        header.addWidget(clear_btn)
-        layout.addLayout(header)
+        params = QHBoxLayout()
+        params.setSpacing(6)
+        self.param_edits = {}
+        for key, label, default, width in (("sep", "分隔符", ",", 60), ("prefix", "前缀", "", 90),
+                                           ("suffix", "后缀", "", 90)):
+            tip = QLabel(label)
+            tip.setStyleSheet("color: #5F6368; font-size: 12px;")
+            params.addWidget(tip)
+            edit = QLineEdit(default)
+            edit.setFixedWidth(width)
+            edit.setStyleSheet(_lineedit_style())
+            edit.setToolTip("支持 \\n 换行、\\t 制表符")
+            params.addWidget(edit)
+            self.param_edits[key] = edit
+        params.addStretch()
+        hint = QLabel("有选区时只处理选中部分 · Ctrl+Z 撤销")
+        hint.setStyleSheet("color: #9AA0A6; font-size: 11px;")
+        params.addWidget(hint)
+        layout.addLayout(params)
 
-        self.input_text = QPlainTextEdit()
-        self.input_text.setStyleSheet("""
-            QPlainTextEdit { border: 1px solid #D0D0D0; border-radius: 4px; padding: 8px;
-                font-family: "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13px; }
-        """)
-        self.input_text.textChanged.connect(self.refresh_stats)
-        layout.addWidget(self.input_text, 1)
+        body = QSplitter(Qt.Horizontal)
+        self.editor = QPlainTextEdit()
+        self.editor.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.editor.setFont(QFont("Consolas", 10) if platform.system() == "Windows" else QFont("Menlo", 12))
+        self.editor.setStyleSheet("QPlainTextEdit { border: 1px solid #D0D0D0; border-radius: 4px; padding: 6px; }")
+        self.editor.setPlaceholderText("粘贴或输入文本，用上方菜单排序、去重、转换命名风格、生成 SQL IN 列表等")
+        self.editor.textChanged.connect(lambda: self._stat_timer.start(150))
+        self.editor.cursorPositionChanged.connect(self.refresh_cursor)
+        self.editor.selectionChanged.connect(lambda: self._stat_timer.start(150))
+        body.addWidget(self.editor)
 
-        stats = QGridLayout()
-        stats.setHorizontalSpacing(12)
-        stats.setVerticalSpacing(8)
-        self.stat_labels = {}
-        items = [
-            ("字符数", "chars"),
-            ("行数", "lines"),
-            ("词数", "words"),
-            ("字节数 (UTF-8)", "bytes"),
-            ("字符数 (不含空白)", "chars_ns"),
-            ("中文字数", "cjk"),
-        ]
-        for idx, (label, key) in enumerate(items):
-            row = idx // 3
-            col = (idx % 3) * 2
-            name = QLabel(label)
-            name.setFont(QFont("PingFang SC", 11))
-            name.setStyleSheet("color: #999999;")
+        panel = QWidget()
+        panel.setObjectName("textStatPanel")
+        panel.setStyleSheet("#textStatPanel { background: #F8F9FA; border: 1px solid #E3E6EA; border-radius: 4px; }")
+        grid = QGridLayout(panel)
+        grid.setContentsMargins(10, 8, 10, 8)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(3)
+        self.stat_scope = QLabel("全文")
+        self.stat_scope.setStyleSheet("color: #1A73E8; font-size: 12px; font-weight: bold; background: transparent;")
+        grid.addWidget(self.stat_scope, 0, 0, 1, 2)
+        self.stat_values = []
+        for r, (name, _) in enumerate(text_stats(""), 1):
+            key = QLabel(name)
+            key.setStyleSheet("color: #5F6368; font-size: 12px; background: transparent;")
             value = QLabel("0")
-            vf = QFont("PingFang SC", 15, QFont.Bold)
-            value.setFont(vf)
-            value.setStyleSheet("color: #1A73E8;")
-            stats.addWidget(name, row, col)
-            stats.addWidget(value, row, col + 1)
-            self.stat_labels[key] = value
-        layout.addLayout(stats)
+            value.setStyleSheet("color: #202124; font-size: 12px; font-weight: bold; background: transparent;")
+            value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            grid.addWidget(key, r, 0)
+            grid.addWidget(value, r, 1)
+            self.stat_values.append(value)
+        grid.setRowStretch(len(self.stat_values) + 1, 1)
+        panel.setMinimumWidth(200)
+        body.addWidget(panel)
+        body.setStretchFactor(0, 1)
+        body.setSizes([480, 210])
+        layout.addWidget(body, 1)
 
+        status = QHBoxLayout()
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #5F6368; font-size: 11px;")
+        status.addWidget(self.status_label, 1)
+        self.cursor_label = QLabel("")
+        self.cursor_label.setStyleSheet("color: #9AA0A6; font-size: 11px;")
+        status.addWidget(self.cursor_label)
+        layout.addLayout(status)
         self.refresh_stats()
+        self.refresh_cursor()
 
-    def do_clear(self):
-        self.input_text.setPlainText("")
+    def _params(self):
+        return {k: _text_escape_param(e.text()) for k, e in self.param_edits.items()}
+
+    def _target(self):
+        cursor = self.editor.textCursor()
+        if cursor.hasSelection():
+            return cursor, cursor.selectedText().replace("\u2029", "\n"), True
+        cursor.select(QTextCursor.Document)
+        return cursor, self.editor.toPlainText(), False
+
+    def apply_op(self, label, fn):
+        self.editor.setFocus()
+        cursor, text, partial = self._target()
+        if not text:
+            self.status_label.setText("没有可处理的文本。")
+            return
+        try:
+            result = fn(text, self._params())
+        except (ValueError, TypeError, SyntaxError) as e:
+            self.status_label.setText(f"{label}失败：{e}")
+            return
+        if result == text:
+            self.status_label.setText(f"{label}：内容没有变化。")
+            return
+        start = cursor.selectionStart()
+        cursor.beginEditBlock()
+        cursor.insertText(result)
+        cursor.endEditBlock()
+        if partial:
+            cursor.setPosition(start)
+            cursor.setPosition(start + len(result), QTextCursor.KeepAnchor)
+            self.editor.setTextCursor(cursor)
+        before, after = text.count("\n") + 1, result.count("\n") + 1
+        delta = f"，{before} → {after} 行" if before != after else ""
+        scope = "选区" if partial else "全文"
+        self.status_label.setText(f"已对{scope}执行「{label}」{delta}（Ctrl+Z 撤销）")
 
     def refresh_stats(self):
-        text = self.input_text.toPlainText()
-        chars = len(text)
-        lines = len(text.splitlines()) if text else 0
-        words = len(re.findall(r"[A-Za-z0-9]+", text)) + len(re.findall(r"[一-鿿]", text))
-        byte_len = len(text.encode("utf-8"))
-        chars_no_space = len(re.sub(r"\s", "", text))
-        cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
-        self.stat_labels["chars"].setText(str(chars))
-        self.stat_labels["lines"].setText(str(lines))
-        self.stat_labels["words"].setText(str(words))
-        self.stat_labels["bytes"].setText(str(byte_len))
-        self.stat_labels["chars_ns"].setText(str(chars_no_space))
-        self.stat_labels["cjk"].setText(str(cjk))
+        cursor = self.editor.textCursor()
+        if cursor.hasSelection():
+            text = cursor.selectedText().replace("\u2029", "\n")
+            self.stat_scope.setText("选区")
+        else:
+            text = self.editor.toPlainText()
+            self.stat_scope.setText("全文")
+        for label, (_, value) in zip(self.stat_values, text_stats(text)):
+            label.setText(value)
+
+    def refresh_cursor(self):
+        cursor = self.editor.textCursor()
+        info = f"行 {cursor.blockNumber() + 1}，列 {cursor.positionInBlock() + 1}"
+        if cursor.hasSelection():
+            info += f"  ·  已选 {abs(cursor.position() - cursor.anchor())} 字符"
+        self.cursor_label.setText(info)
+
+    def open_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择文本文件", os.path.expanduser("~"),
+                                              "文本文件 (*.txt *.md *.csv *.log *.json *.yaml *.yml *.xml *.sql *.py);;所有文件 (*)")
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            text = load_text_file(path)
+        except OSError as e:
+            self.status_label.setText(f"读取失败：{e}")
+            return
+        crlf = raw.count(b"\r\n")
+        lf = raw.count(b"\n") - crlf
+        ending = "CRLF" if crlf and not lf else "LF" if lf and not crlf else "混合换行" if crlf else "无换行"
+        bom = " · 带 BOM" if raw.startswith(b"\xef\xbb\xbf") else ""
+        self.editor.setPlainText(text)
+        self.status_label.setText(f"已打开 {os.path.basename(path)} · {len(raw):,} B · {ending}{bom}")
+
+    def copy_all(self):
+        text = self.editor.toPlainText()
+        if not text:
+            return
+        QApplication.clipboard().setText(text)
+        self.copy_btn.setText("已复制")
+        QTimer.singleShot(900, lambda: self.copy_btn.setText("复制"))
+
+    def do_clear(self):
+        cursor = self.editor.textCursor()
+        cursor.select(QTextCursor.Document)
+        cursor.removeSelectedText()
+        self.editor.setFocus()
+        self.status_label.setText("已清空（Ctrl+Z 可恢复）")
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
             self.close()
+
+
+class TextToolWindow(TabbedToolWindow):
+    def __init__(self):
+        super().__init__("文本工具", (
+            (TextProcessWindow, "处理与统计"),
+            (DiffWindow, "文本对比"),
+        ))
 
 
 class ImageToolWindow(QMainWindow):
@@ -2747,7 +3209,7 @@ class ScreenPickOverlay(QWidget):
         self._hint = ""
         self._prev_pid = None
         self._format = "HEX"
-        self._key_prev = {"esc": False, "c": False, "x": False}
+        self._key_prev = {"esc": False, "c": False, "x": False, "lmb": False, "rmb": False}
         self._cg = None
         # 不抢焦点，故 ESC/C/X 用 HID 键态轮询读取（无需辅助功能权限）
         self._key_timer = QTimer(self)
@@ -2757,7 +3219,13 @@ class ScreenPickOverlay(QWidget):
     def start(self):
         self._pos = QCursor.pos()
         self._prev_pid = _mac_frontmost_pid()
-        self._key_prev = {"esc": False, "c": False, "x": False}
+        self._key_prev = {"esc": False, "c": False, "x": False, "lmb": False, "rmb": False}
+        if platform.system() == "Windows":
+            self._key_prev = {
+                key: bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+                for key, vk in (("esc", 0x1B), ("c", 0x43), ("x", 0x58),
+                                ("lmb", 0x01), ("rmb", 0x02))
+            }
         geo = QRect()
         for s in QApplication.screens():
             geo = geo.united(s.geometry())
@@ -2776,12 +3244,17 @@ class ScreenPickOverlay(QWidget):
         self.update()
 
     def _poll_keys(self):
+        # 半透明置顶窗在 Windows 上常收不到 hover 的 mouseMoveEvent，
+        # 这里借定时器主动读取光标位置，保证放大镜始终跟随鼠标移动。
+        pos = QCursor.pos()
+        if pos != self._pos:
+            self._pos = pos
+            self.update()
         try:
             if platform.system() == "Darwin":
                 if self._cg is None:
-                    import ctypes.util
-                    self._cg = ctypes.cdll.LoadLibrary(
-                        ctypes.util.find_library("CoreGraphics"))
+                    from ctypes.util import find_library
+                    self._cg = ctypes.cdll.LoadLibrary(find_library("CoreGraphics"))
                     self._cg.CGEventSourceKeyState.restype = ctypes.c_bool
                     self._cg.CGEventSourceKeyState.argtypes = [
                         ctypes.c_int, ctypes.c_uint16]
@@ -2793,7 +3266,9 @@ class ScreenPickOverlay(QWidget):
                 g = ctypes.windll.user32.GetAsyncKeyState
                 state = {"esc": bool(g(0x1B) & 0x8000),
                          "c": bool(g(0x43) & 0x8000),
-                         "x": bool(g(0x58) & 0x8000)}
+                         "x": bool(g(0x58) & 0x8000),
+                         "lmb": bool(g(0x01) & 0x8000),
+                         "rmb": bool(g(0x02) & 0x8000)}
             else:
                 return
             for key, pressed in state.items():
@@ -2809,8 +3284,12 @@ class ScreenPickOverlay(QWidget):
                     return
                 elif key == "x":
                     self._toggle_format()
+                elif key in ("lmb", "rmb"):
+                    self.close()
+                    return
         except Exception:
-            pass
+            write_startup_log("屏幕取色输入读取失败：\n" + traceback.format_exc())
+            self.close()
 
     def _format_value(self, fmt):
         r, g, b, _ = self._center.getRgb()
@@ -2862,8 +3341,15 @@ class ScreenPickOverlay(QWidget):
         screen = QApplication.screenAt(self._pos) or QApplication.primaryScreen()
         geo = screen.geometry()
         half = self.SRC // 2
-        grab = screen.grabWindow(0, self._pos.x() - half, self._pos.y() - half,
-                                 self.SRC, self.SRC)
+        # QCursor.pos() 是逻辑坐标，而 grabWindow 按物理像素取图；
+        # Windows 显示缩放≠100% 时两者错位，需换算到该屏内的物理像素坐标，
+        # 同时减去屏幕原点以支持多显示器（副屏原点可能非 0,0）。
+        dpr = screen.devicePixelRatio()
+        local = self._pos - geo.topLeft()
+        px = int(round(local.x() * dpr))
+        py = int(round(local.y() * dpr))
+        grab = screen.grabWindow(0, px - half, py - half, self.SRC, self.SRC)
+        grab.setDevicePixelRatio(1.0)
         loupe = self.SRC * self.ZOOM
         # loupe 位置：光标右下，夹在屏幕内
         lx = min(max(self._pos.x() + self.OFFSET, geo.x()), geo.right() - loupe - 8)
@@ -2926,6 +3412,1331 @@ class ScreenPickOverlay(QWidget):
         painter.end()
 
 
+def capture_desktop():
+    if platform.system() == "Darwin":
+        from ctypes.util import find_library
+        cg = ctypes.cdll.LoadLibrary(find_library("CoreGraphics"))
+        if hasattr(cg, "CGPreflightScreenCaptureAccess"):
+            cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
+            if not cg.CGPreflightScreenCaptureAccess():
+                raise ValueError("请在系统设置 → 隐私与安全性 → 屏幕录制中授权工具箱，然后重新启动")
+    screens = QApplication.screens()
+    geometry = QRect()
+    for screen in screens:
+        geometry = geometry.united(screen.geometry())
+    dpr = max(screen.devicePixelRatio() for screen in screens)
+    desktop = QPixmap(round(geometry.width() * dpr), round(geometry.height() * dpr))
+    desktop.setDevicePixelRatio(dpr)
+    desktop.fill(Qt.black)
+    painter = QPainter(desktop)
+    try:
+        for screen in screens:
+            image = screen.grabWindow(0)
+            if image.isNull():
+                raise ValueError("无法读取屏幕，请检查系统的屏幕录制权限")
+            painter.drawPixmap(screen.geometry().translated(-geometry.topLeft()), image)
+    finally:
+        painter.end()
+    return desktop, geometry
+
+
+def crop_desktop(desktop, rectangle):
+    dpr = desktop.devicePixelRatio()
+    left, top = round(rectangle.x() * dpr), round(rectangle.y() * dpr)
+    right, bottom = round((rectangle.x() + rectangle.width()) * dpr), round((rectangle.y() + rectangle.height()) * dpr)
+    image = desktop.copy(left, top, right - left, bottom - top)
+    image.setDevicePixelRatio(dpr)
+    return image
+
+
+def save_screenshot(parent, image):
+    name = "截图_%s.png" % datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path, _ = QFileDialog.getSaveFileName(parent, "保存截图", name, "PNG 图片 (*.png)")
+    if not path:
+        return False
+    if not image.save(path, "PNG"):
+        QMessageBox.warning(parent, "保存失败", "无法写入图片，请检查文件路径与权限")
+        return False
+    return True
+
+
+def screenshot_ocr_command(image_path):
+    env = os.environ.copy()
+    if platform.system() == "Windows":
+        script = r'''
+$ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$stream = $null
+$bitmap = $null
+try {
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    $awaitMethod = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+        $_.Name -eq "AsTask" -and $_.IsGenericMethod -and
+        $_.GetGenericArguments().Count -eq 1 -and $_.GetParameters().Count -eq 1
+    } | Select-Object -First 1
+    function Await($operation, [Type]$resultType) {
+        $task = $awaitMethod.MakeGenericMethod($resultType).Invoke($null, @($operation))
+        $task.GetAwaiter().GetResult()
+    }
+    $ocr = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
+    $language = $ocr::AvailableRecognizerLanguages | Where-Object {
+        $_.LanguageTag -like "zh-Hans*"
+    } | Select-Object -First 1
+    if ($null -ne $language) {
+        $engine = $ocr::TryCreateFromLanguage($language)
+    } else {
+        $engine = $ocr::TryCreateFromUserProfileLanguages()
+    }
+    if ($null -eq $engine) {
+        throw "系统没有可用的 OCR 语言包，请在 Windows 设置的语言选项中安装中文或英文语言包。"
+    }
+    $file = Await ([Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]::GetFileFromPathAsync($env:PERSONAL_TOOLBOX_OCR_IMAGE)) ([Windows.Storage.StorageFile])
+    $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+    $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation, ContentType = WindowsRuntime]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+    $transform = [Windows.Graphics.Imaging.BitmapTransform, Windows.Foundation, ContentType = WindowsRuntime]::new()
+    $ratio = [Math]::Min(1.0, [double]$ocr::MaxImageDimension / [Math]::Max($decoder.PixelWidth, $decoder.PixelHeight))
+    $transform.ScaledWidth = [uint32][Math]::Max(1, [Math]::Floor($decoder.PixelWidth * $ratio))
+    $transform.ScaledHeight = [uint32][Math]::Max(1, [Math]::Floor($decoder.PixelHeight * $ratio))
+    $bitmap = Await ($decoder.GetSoftwareBitmapAsync(
+        [Windows.Graphics.Imaging.BitmapPixelFormat]::Bgra8,
+        [Windows.Graphics.Imaging.BitmapAlphaMode]::Ignore,
+        $transform,
+        [Windows.Graphics.Imaging.ExifOrientationMode]::IgnoreExifOrientation,
+        [Windows.Graphics.Imaging.ColorManagementMode]::DoNotColorManage
+    )) ([Windows.Graphics.Imaging.SoftwareBitmap])
+    $result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+    $englishWords = @()
+    if ($engine.RecognizerLanguage.LanguageTag -like "zh-*") {
+        $englishLanguage = $ocr::AvailableRecognizerLanguages | Where-Object {
+            $_.LanguageTag -like "en-*"
+        } | Select-Object -First 1
+        if ($null -ne $englishLanguage) {
+            $englishEngine = $ocr::TryCreateFromLanguage($englishLanguage)
+            $englishResult = Await ($englishEngine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+            $englishWords = @($englishResult.Lines | ForEach-Object { $_.Words })
+        }
+    }
+    $lines = foreach ($line in $result.Lines) {
+        $words = @($line.Words)
+        $replacements = @{}
+        $skipped = @{}
+        foreach ($englishWord in $englishWords) {
+            $other = $englishWord.BoundingRect
+            $matches = @()
+            $compact = ""
+            for ($index = 0; $index -lt $words.Count; $index++) {
+                $rect = $words[$index].BoundingRect
+                $width = [Math]::Max(0, [Math]::Min($rect.X + $rect.Width, $other.X + $other.Width) - [Math]::Max($rect.X, $other.X))
+                $height = [Math]::Max(0, [Math]::Min($rect.Y + $rect.Height, $other.Y + $other.Height) - [Math]::Max($rect.Y, $other.Y))
+                if ($width / $rect.Width -gt 0.8 -and $height / [Math]::Min($rect.Height, $other.Height) -gt 0.5) {
+                    $matches += $index
+                    $compact += $words[$index].Text
+                }
+            }
+            if ($matches.Count -gt 0 -and [regex]::Matches($compact, "[\u3400-\u9FFF]").Count * 2 -lt $compact.Length) {
+                $replacements[$matches[0]] = $englishWord.Text
+                for ($index = 1; $index -lt $matches.Count; $index++) {
+                    $skipped[$matches[$index]] = $true
+                }
+            }
+        }
+        $parts = for ($index = 0; $index -lt $words.Count; $index++) {
+            if ($replacements.ContainsKey($index)) {
+                $replacements[$index]
+            } elseif (!$skipped.ContainsKey($index)) {
+                $words[$index].Text
+            }
+        }
+        [regex]::Replace(($parts -join " "), "(?<=[\u3400-\u9FFF])\s+(?=[\u3400-\u9FFF])", "")
+    }
+    $text = $lines -join "`n"
+    ConvertTo-Json -InputObject $text -Compress
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+} finally {
+    if ($null -ne $bitmap) { $bitmap.Dispose() }
+    if ($null -ne $stream) { $stream.Dispose() }
+}
+'''
+        env["PERSONAL_TOOLBOX_OCR_IMAGE"] = image_path
+        powershell = os.path.join(os.environ["SystemRoot"], "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        return [powershell, "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], env
+    if platform.system() == "Darwin":
+        script = r'''
+ObjC.import('Vision');
+ObjC.import('Foundation');
+function run(argv) {
+    var request = $.VNRecognizeTextRequest.alloc.init;
+    request.recognitionLevel = $.VNRequestTextRecognitionLevelAccurate;
+    request.usesLanguageCorrection = true;
+    var error = Ref();
+    var supported = ObjC.deepUnwrap($.VNRecognizeTextRequest.supportedRecognitionLanguagesForRecognitionLevelRevisionError(
+        request.recognitionLevel, request.revision, error));
+    request.recognitionLanguages = supported.filter(function(language) {
+        return language === 'zh-Hans' || language === 'en-US';
+    });
+    var handler = $.VNImageRequestHandler.alloc.initWithURLOptions(
+        $.NSURL.fileURLWithPath(argv[0]), $.NSDictionary.dictionary);
+    if (!handler.performRequestsError([request], error)) {
+        throw new Error(ObjC.unwrap(error[0].localizedDescription));
+    }
+    var lines = [];
+    var results = request.results;
+    for (var index = 0; index < results.count; index++) {
+        var candidate = results.objectAtIndex(index).topCandidates(1).firstObject;
+        lines.push(ObjC.unwrap(candidate.string));
+    }
+    return JSON.stringify(lines.join('\n'));
+}
+'''
+        return ["/usr/bin/osascript", "-l", "JavaScript", "-e", script, image_path], env
+    raise RuntimeError("文字识别需要 Windows 10 及以上或 macOS 10.15 及以上的系统 OCR 引擎。")
+
+
+class ScreenshotOcrWorker(QThread):
+    result_ready = pyqtSignal(str, str)
+
+    def __init__(self, image, parent):
+        super().__init__(parent)
+        self.image = image.toImage()
+        self._cancelled = threading.Event()
+        self._process = None
+
+    def cancel(self):
+        self._cancelled.set()
+        process = self._process
+        if process is not None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+    def run(self):
+        text, error = "", ""
+        try:
+            with tempfile.TemporaryDirectory(prefix="toolbox_ocr_") as directory:
+                image_path = os.path.join(directory, "selection.png")
+                if not self.image.save(image_path, "PNG"):
+                    raise RuntimeError("无法写入识别图片，请检查系统临时目录的写入权限。")
+                if self._cancelled.is_set():
+                    return
+                command, env = screenshot_ocr_command(image_path)
+                process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                           env=env, **win_no_console())
+                self._process = process
+                if self._cancelled.is_set():
+                    process.kill()
+                try:
+                    stdout, stderr = process.communicate(timeout=45)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate()
+                    raise RuntimeError("识别超过 45 秒，请缩小选区后重试。")
+                if self._cancelled.is_set():
+                    return
+                if process.returncode:
+                    raise RuntimeError(stderr.decode("utf-8", errors="replace").strip()[:200] or "系统 OCR 识别失败。")
+                text = json.loads(stdout.decode("utf-8-sig")).strip()
+        except (OSError, RuntimeError, ValueError) as exc:
+            error = str(exc)
+        finally:
+            self._process = None
+        if not self._cancelled.is_set():
+            self.result_ready.emit(text, error)
+
+
+class ScreenshotTextWindow(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent, Qt.Tool | Qt.WindowStaysOnTopHint)
+        self.setWindowTitle("识别文字")
+        self.resize(380, 340)
+        self.setMinimumSize(280, 220)
+        self.setCursor(Qt.ArrowCursor)
+        self.setStyleSheet("QDialog { background: #F6F8FC; }")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(10)
+        hint = QLabel("可编辑文字，选中后按 Ctrl+C 复制；关闭此窗保留截图。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #697386; font-size: 12px;")
+        layout.addWidget(hint)
+        self.editor = QPlainTextEdit()
+        self.editor.setFont(ui_font(12, 14))
+        self.editor.setStyleSheet("QPlainTextEdit { background: white; color: #263449; border: 1px solid #DAE2ED; border-radius: 6px; padding: 8px; }")
+        layout.addWidget(self.editor, 1)
+        footer = QHBoxLayout()
+        self.status = QLabel()
+        self.status.setStyleSheet("color: #697386; font-size: 12px;")
+        footer.addWidget(self.status, 1)
+        self.copy_button = QPushButton("复制全部")
+        self.copy_button.setFixedSize(96, 32)
+        self.copy_button.setAutoDefault(False)
+        self.copy_button.setFocusPolicy(Qt.NoFocus)
+        self.copy_button.setCursor(Qt.PointingHandCursor)
+        self.copy_button.setStyleSheet(_primary_btn())
+        self.copy_button.clicked.connect(self._copy)
+        footer.addWidget(self.copy_button)
+        layout.addLayout(footer)
+        self.editor.selectionChanged.connect(self._update_copy)
+        self.editor.textChanged.connect(self._update_copy)
+
+    def _update_copy(self):
+        selected = self.editor.textCursor().hasSelection()
+        self.copy_button.setText("复制选中" if selected else "复制全部")
+        self.copy_button.setEnabled(bool(self.editor.toPlainText()))
+        self.status.setText("选中后可单独复制" if selected else "%d 个字符" % len(self.editor.toPlainText()))
+
+    def _copy(self):
+        if self.editor.textCursor().hasSelection():
+            self.editor.copy()
+            self.status.setText("已复制选中文字")
+        else:
+            QApplication.clipboard().setText(self.editor.toPlainText())
+            self.status.setText("已复制全部文字")
+
+    def show_result(self, text, selection, toolbar):
+        self.editor.setPlainText(text)
+        self.show()
+        screen = QApplication.screenAt(selection.center()) or QApplication.primaryScreen()
+        area = screen.availableGeometry().adjusted(8, 8, -8, -8)
+        size = self.frameGeometry().size()
+        x = max(area.left(), min(selection.left(), area.right() - size.width() + 1))
+        y = max(area.top(), min(selection.top(), area.bottom() - size.height() + 1))
+        candidates = [QPoint(selection.right() + 13, y),
+                      QPoint(selection.left() - size.width() - 12, y),
+                      QPoint(x, selection.bottom() + 13),
+                      QPoint(x, selection.top() - size.height() - 12)]
+        position = next((point for point in candidates
+                         if area.contains(QRect(point, size)) and not toolbar.intersects(QRect(point, size))),
+                        QPoint(area.right() - size.width() + 1, y))
+        self.move(position)
+        self.raise_()
+        self.activateWindow()
+        self.editor.setFocus()
+
+
+class CaptureOverlay(QWidget):
+    captured = pyqtSignal(QPixmap, str, QRect)
+    cancelled = pyqtSignal()
+    ocr_requested = pyqtSignal(QPixmap)
+    LOUPE_SOURCE = 15
+    LOUPE_ZOOM = 10
+
+    def __init__(self, desktop, geometry, auto_copy=False, selection=None):
+        super().__init__(None, Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setGeometry(geometry)
+        self.setCursor(Qt.CrossCursor)
+        self.setMouseTracking(True)
+        self.desktop = desktop
+        self._desktop_image = desktop.toImage()
+        self._desktop_image.setDevicePixelRatio(1.0)
+        self._pixel_pos = None
+        self._pixel_point = QPoint()
+        self._pixel_color = QColor()
+        self._pixel_format = "HEX"
+        self._ocr_busy = False
+        self.ocr_result_window = None
+        self._auto_copy = auto_copy
+        self._selection = selection.intersected(self.rect()) if selection is not None else QRect()
+        self._accepted = False
+        self._origin = None
+        self._drag = None
+        self._start_rect = QRect()
+        self._mode = "select"
+        self._color = QColor("#F44336")
+        self._width = 2
+        self._annotations = []
+        self._redo = []
+        self._current = None
+        self.toolbar = QFrame(self)
+        self.toolbar.setObjectName("captureToolbar")
+        self.toolbar.setStyleSheet(
+            "QFrame#captureToolbar { background: #FFFFFF; border: 1px solid #D9E0EA; border-radius: 6px; }"
+            "QPushButton { background: transparent; border: none; border-radius: 4px; }"
+            "QPushButton:hover { background: #EDF4FF; }"
+            "QPushButton:checked { background: #DCEBFF; }")
+        layout = QVBoxLayout(self.toolbar)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+        buttons = QHBoxLayout()
+        buttons.setSpacing(2)
+        self.tool_buttons = {}
+        for name, tip in (("select", "移动 / 调整选区"), ("rectangle", "矩形"), ("arrow", "箭头"),
+                          ("pen", "画笔"), ("text", "文字"), ("undo", "撤销 · Ctrl+Z"),
+                          ("redo", "重做 · Ctrl+Shift+Z"), ("ocr", "识别文字 · Ctrl+O · 本地识别，旁窗查看并手动复制"),
+                          ("save", "保存 PNG · Ctrl+S"), ("pin", "贴到桌面 · Ctrl+T"),
+                          ("copy", "复制并完成 · Enter / Ctrl+C"), ("cancel", "取消 · Esc")):
+            button = QPushButton()
+            button.setFixedSize(30, 30)
+            button.setIcon(self._icon(name))
+            button.setIconSize(QSize(20, 20))
+            button.setToolTip(tip)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setCursor(Qt.PointingHandCursor)
+            if name in ("select", "rectangle", "arrow", "pen", "text"):
+                button.setCheckable(True)
+                button.clicked.connect(lambda checked, mode=name: self._set_mode(mode))
+            elif name == "undo":
+                button.clicked.connect(self._undo)
+            elif name == "redo":
+                button.clicked.connect(self._redo_annotation)
+            elif name == "ocr":
+                button.clicked.connect(self._start_ocr)
+            elif name == "cancel":
+                button.clicked.connect(self.close)
+            else:
+                button.clicked.connect(lambda checked, action=name: self._complete(action))
+            self.tool_buttons[name] = button
+            buttons.addWidget(button)
+            if name in ("text", "redo"):
+                separator = QFrame()
+                separator.setFrameShape(QFrame.VLine)
+                separator.setStyleSheet("color: #E3E8EF;")
+                buttons.addWidget(separator)
+        layout.addLayout(buttons)
+        self.ocr_status = QLabel()
+        self.ocr_status.setWordWrap(True)
+        self.ocr_status.setMaximumWidth(380)
+        self.ocr_status.setStyleSheet("color: #697386; font-size: 12px; padding: 2px 4px;")
+        layout.addWidget(self.ocr_status)
+        self.ocr_status.hide()
+        self.palette_row = QWidget()
+        palette_layout = QHBoxLayout(self.palette_row)
+        palette_layout.setContentsMargins(2, 0, 2, 0)
+        palette_layout.setSpacing(7)
+        self.color_buttons = {}
+        for value in ("#F44336", "#FFB020", "#27AE60", "#2684FF", "#FFFFFF", "#202B3D"):
+            button = QPushButton()
+            button.setFixedSize(18, 18)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setToolTip(value)
+            button.clicked.connect(lambda checked, color=value: self._set_color(color))
+            self.color_buttons[value] = button
+            palette_layout.addWidget(button)
+        palette_layout.addStretch()
+        self.width_buttons = {}
+        for width in (2, 4, 6):
+            button = QPushButton()
+            button.setFixedSize(24, 22)
+            button.setCheckable(True)
+            button.setChecked(width == self._width)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setToolTip("%s px" % width)
+            icon = QPixmap(16, 16)
+            icon.fill(Qt.transparent)
+            painter = QPainter(icon)
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#344054"))
+            painter.drawEllipse(QPointF(8, 8), width / 2 + 1, width / 2 + 1)
+            painter.end()
+            button.setIcon(QIcon(icon))
+            button.clicked.connect(lambda checked, value=width: self._set_width(value))
+            self.width_buttons[width] = button
+            palette_layout.addWidget(button)
+        layout.addWidget(self.palette_row)
+        self._set_color(self._color.name().upper())
+        self._set_mode("select")
+        self.toolbar.hide()
+        if not self._selection.isEmpty():
+            self._position_toolbar()
+        self._update_pixel()
+        self._pixel_timer = QTimer(self)
+        self._pixel_timer.setInterval(40)
+        self._pixel_timer.timeout.connect(self._update_pixel)
+        self._pixel_timer.start()
+
+    def _update_pixel(self, point=None):
+        point = self.mapFromGlobal(QCursor.pos()) if point is None else point
+        point = QPoint(min(max(point.x(), 0), self.width() - 1),
+                       min(max(point.y(), 0), self.height() - 1))
+        if point == self._pixel_pos:
+            return
+        self._pixel_pos = point
+        dpr = self.desktop.devicePixelRatio()
+        self._pixel_point = QPoint(min(round(point.x() * dpr), self._desktop_image.width() - 1),
+                                   min(round(point.y() * dpr), self._desktop_image.height() - 1))
+        self._pixel_color = self._desktop_image.pixelColor(self._pixel_point)
+        self.update()
+
+    def _pixel_value(self, fmt):
+        if fmt == "HEX":
+            return self._pixel_color.name().upper()
+        return "rgb(%s, %s, %s)" % (self._pixel_color.red(), self._pixel_color.green(), self._pixel_color.blue())
+
+    def _loupe_rect(self):
+        if self.ocr_result_window is not None and self.ocr_result_window.isVisible():
+            return QRect()
+        if self._ocr_busy or self._mode != "select" or (self.toolbar.isVisible() and self.toolbar.geometry().contains(self._pixel_pos)):
+            return QRect()
+        screen = QApplication.screenAt(self.mapToGlobal(self._pixel_pos)) or QApplication.primaryScreen()
+        area = screen.geometry().translated(-self.geometry().topLeft()).intersected(self.rect())
+        width, height = 224, 254
+        x, y = self._pixel_pos.x() + 24, self._pixel_pos.y() + 24
+        if x + width > area.x() + area.width() - 8:
+            x = self._pixel_pos.x() - width - 24
+        if y + height > area.y() + area.height() - 8:
+            y = self._pixel_pos.y() - height - 24
+        x = max(area.x() + 8, min(x, area.x() + area.width() - width - 8))
+        y = max(area.y() + 8, min(y, area.y() + area.height() - height - 8))
+        box = QRect(x, y, width, height)
+        if self.toolbar.isVisible() and box.intersects(self.toolbar.geometry()):
+            above = self.toolbar.y() - height - 8
+            below = self.toolbar.y() + self.toolbar.height() + 8
+            if above >= area.y() + 8:
+                box.moveTop(above)
+            elif below + height <= area.y() + area.height() - 8:
+                box.moveTop(below)
+        return box
+
+    def _draw_loupe(self, painter):
+        box = self._loupe_rect()
+        if box.isEmpty():
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(QColor("#CBD5E1"), 1))
+        painter.setBrush(Qt.white)
+        painter.drawRoundedRect(box.adjusted(0, 0, -1, -1), 6, 6)
+        size = self.LOUPE_SOURCE * self.LOUPE_ZOOM
+        grid = QRect(box.x() + (box.width() - size) // 2, box.y() + 8, size, size)
+        half = self.LOUPE_SOURCE // 2
+        sample = self._desktop_image.copy(self._pixel_point.x() - half, self._pixel_point.y() - half,
+                                          self.LOUPE_SOURCE, self.LOUPE_SOURCE)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
+        painter.drawImage(grid, sample)
+        painter.setPen(QColor(255, 255, 255, 60))
+        for index in range(1, self.LOUPE_SOURCE):
+            painter.drawLine(grid.x() + index * self.LOUPE_ZOOM, grid.y(),
+                             grid.x() + index * self.LOUPE_ZOOM, grid.bottom())
+            painter.drawLine(grid.x(), grid.y() + index * self.LOUPE_ZOOM,
+                             grid.right(), grid.y() + index * self.LOUPE_ZOOM)
+        center = QRect(grid.x() + half * self.LOUPE_ZOOM, grid.y() + half * self.LOUPE_ZOOM,
+                       self.LOUPE_ZOOM, self.LOUPE_ZOOM)
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(Qt.black, 1))
+        painter.drawRect(center.adjusted(-1, -1, 0, 0))
+        painter.setPen(QPen(Qt.white, 1))
+        painter.drawRect(center.adjusted(0, 0, -1, -1))
+        painter.setPen(QPen(QColor("#CBD5E1"), 1))
+        painter.drawRect(grid.adjusted(0, 0, -1, -1))
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(self._pixel_color)
+        painter.drawRoundedRect(QRect(box.x() + 12, box.y() + 172, 28, 32), 3, 3)
+        painter.setPen(QColor("#202B3D"))
+        font = ui_font(11, 13)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(box.x() + 50, box.y() + 184, self._pixel_value(self._pixel_format))
+        painter.setFont(ui_font(10, 12))
+        painter.setPen(QColor("#697386"))
+        other = "RGB" if self._pixel_format == "HEX" else "HEX"
+        painter.drawText(box.x() + 50, box.y() + 202, self._pixel_value(other))
+        position = self.mapToGlobal(self._pixel_pos)
+        painter.setFont(ui_font(9, 11))
+        painter.drawText(box.x() + 12, box.y() + 224, "X: %s   Y: %s" % (position.x(), position.y()))
+        painter.drawText(box.x() + 12, box.y() + 244, "C 复制%s并退出 · X 切换" % self._pixel_format)
+        painter.restore()
+
+    def _icon(self, name):
+        image = QPixmap(20, 20)
+        image.fill(Qt.transparent)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(QColor("#2684FF" if name in ("pin", "copy") else "#344054"), 1.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        if name == "select":
+            painter.drawPolygon(QPolygonF([QPointF(4, 2), QPointF(15, 11), QPointF(10, 12), QPointF(8, 17)]))
+        elif name == "rectangle":
+            painter.drawRect(QRectF(3, 4, 14, 12))
+        elif name == "arrow":
+            painter.drawLine(3, 16, 16, 3)
+            painter.drawLine(9, 3, 16, 3)
+            painter.drawLine(16, 3, 16, 10)
+        elif name == "pen":
+            path = QPainterPath(QPointF(2, 15))
+            path.cubicTo(6, 2, 8, 19, 12, 8)
+            path.cubicTo(15, 1, 16, 5, 18, 4)
+            painter.drawPath(path)
+        elif name == "text":
+            painter.drawLine(3, 4, 17, 4)
+            painter.drawLine(10, 4, 10, 17)
+            painter.drawLine(6, 17, 14, 17)
+        elif name in ("undo", "redo"):
+            if name == "redo":
+                painter.translate(20, 0)
+                painter.scale(-1, 1)
+            painter.drawArc(QRectF(4, 5, 13, 12), -70 * 16, 230 * 16)
+            painter.drawLine(3, 4, 3, 10)
+            painter.drawLine(3, 10, 9, 10)
+        elif name == "ocr":
+            painter.drawLine(2, 6, 2, 2)
+            painter.drawLine(2, 2, 6, 2)
+            painter.drawLine(14, 2, 18, 2)
+            painter.drawLine(18, 2, 18, 6)
+            painter.drawLine(2, 14, 2, 18)
+            painter.drawLine(2, 18, 6, 18)
+            painter.drawLine(14, 18, 18, 18)
+            painter.drawLine(18, 18, 18, 14)
+            painter.setFont(ui_font(9, 11, True))
+            painter.drawText(QRect(3, 3, 14, 14), Qt.AlignCenter, "A")
+        elif name == "save":
+            painter.drawRect(QRectF(3, 3, 14, 14))
+            painter.drawRect(QRectF(6, 3, 8, 5))
+            painter.drawRect(QRectF(6, 12, 8, 5))
+        elif name == "pin":
+            painter.drawLine(6, 3, 14, 3)
+            painter.drawLine(7, 3, 7, 8)
+            painter.drawLine(13, 3, 13, 8)
+            painter.drawPolygon(QPolygonF([QPointF(7, 8), QPointF(4, 12), QPointF(16, 12), QPointF(13, 8)]))
+            painter.drawLine(10, 12, 10, 18)
+        elif name == "copy":
+            painter.drawRect(QRectF(3, 3, 10, 11))
+            painter.setBrush(Qt.white)
+            painter.drawRect(QRectF(7, 7, 10, 11))
+        elif name == "cancel":
+            painter.drawLine(5, 5, 15, 15)
+            painter.drawLine(5, 15, 15, 5)
+        painter.end()
+        return QIcon(image)
+
+    def _set_mode(self, mode):
+        self._mode = mode
+        for name, button in self.tool_buttons.items():
+            if button.isCheckable():
+                button.setChecked(name == mode)
+        self.palette_row.setVisible(mode != "select")
+        self.setCursor(Qt.SizeAllCursor if mode == "select" and not self._selection.isEmpty() else Qt.CrossCursor)
+        if not self._selection.isEmpty():
+            self._position_toolbar()
+        self.update()
+
+    def _set_color(self, color):
+        self._color = QColor(color)
+        for value, button in self.color_buttons.items():
+            border = "2px solid #2684FF" if value == color else "1px solid #CBD5E1"
+            button.setStyleSheet("QPushButton { background: %s; border: %s; border-radius: 9px; }" % (value, border))
+
+    def _set_width(self, width):
+        self._width = width
+        for value, button in self.width_buttons.items():
+            button.setChecked(value == width)
+
+    def _position_toolbar(self):
+        self.toolbar.adjustSize()
+        screen = QApplication.screenAt(self.mapToGlobal(self._selection.center())) or QApplication.primaryScreen()
+        area = screen.geometry().translated(-self.geometry().topLeft()).intersected(self.rect())
+        x = min(max(self._selection.x() + self._selection.width() - self.toolbar.width(), area.x() + 8),
+                area.x() + area.width() - self.toolbar.width() - 8)
+        y = self._selection.y() + self._selection.height() + 12
+        if y + self.toolbar.height() > area.y() + area.height() - 8:
+            y = self._selection.y() - self.toolbar.height() - 12
+        y = max(area.y() + 8, min(y, area.y() + area.height() - self.toolbar.height() - 8))
+        self.toolbar.move(x, y)
+        self.toolbar.show()
+        self.tool_buttons["undo"].setEnabled(bool(self._annotations) and not self._ocr_busy)
+        self.tool_buttons["redo"].setEnabled(bool(self._redo) and not self._ocr_busy)
+
+    def _set_ocr_busy(self, busy):
+        self._ocr_busy = busy
+        for name, button in self.tool_buttons.items():
+            button.setEnabled(name == "cancel" or not busy)
+        self.palette_row.setEnabled(not busy)
+        self.setCursor(Qt.WaitCursor if busy else Qt.CrossCursor)
+        self.update()
+
+    def _start_ocr(self):
+        if self._selection.isEmpty() or self._ocr_busy or self._origin is not None:
+            return
+        if self.ocr_result_window is not None:
+            self.ocr_result_window.hide()
+        self.ocr_status.setText("正在本地识别文字… · Esc 退出")
+        self.ocr_status.show()
+        self._set_ocr_busy(True)
+        self._position_toolbar()
+        self.ocr_requested.emit(crop_desktop(self.desktop, self._selection))
+
+    def set_ocr_result(self, text, error):
+        self._set_ocr_busy(False)
+        if error or not text:
+            self.ocr_status.setText("识别失败：" + error if error else "未识别到文字，请调整选区或放大原页面后重试。")
+            self._position_toolbar()
+            return
+        self.ocr_status.setText("识别完成 · 在旁窗选中文字复制 · 可调整选区后再次识别")
+        self._position_toolbar()
+        if self.ocr_result_window is None:
+            self.ocr_result_window = ScreenshotTextWindow(self)
+            self.ocr_result_window.finished.connect(lambda _: self.update())
+        self.ocr_result_window.show_result(
+            text, self._selection.translated(self.geometry().topLeft()),
+            QRect(self.toolbar.mapToGlobal(QPoint()), self.toolbar.size()))
+
+    def _handles(self):
+        rect = self._selection
+        left, top = rect.x(), rect.y()
+        right, bottom = left + rect.width(), top + rect.height()
+        cx, cy = left + rect.width() // 2, top + rect.height() // 2
+        return {"nw": QPoint(left, top), "n": QPoint(cx, top), "ne": QPoint(right, top),
+                "e": QPoint(right, cy), "se": QPoint(right, bottom), "s": QPoint(cx, bottom),
+                "sw": QPoint(left, bottom), "w": QPoint(left, cy)}
+
+    def _hit_handle(self, point):
+        if self._selection.isEmpty():
+            return None
+        distances = [(abs(point.x() - pos.x()) + abs(point.y() - pos.y()), name)
+                     for name, pos in self._handles().items()
+                     if abs(point.x() - pos.x()) <= 7 and abs(point.y() - pos.y()) <= 7]
+        return min(distances)[1] if distances else None
+
+    def _draw_annotations(self, painter):
+        painter.save()
+        painter.translate(self._selection.topLeft())
+        painter.setClipRect(QRect(0, 0, self._selection.width(), self._selection.height()))
+        painter.setRenderHint(QPainter.Antialiasing)
+        items = self._annotations + ([self._current] if self._current else [])
+        for item in items:
+            points = item["points"]
+            painter.setPen(QPen(item["color"], item["width"], Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.setBrush(Qt.NoBrush)
+            if item["tool"] == "rectangle":
+                painter.drawRect(QRectF(points[0], points[-1]).normalized())
+            elif item["tool"] == "arrow":
+                start, end = points[0], points[-1]
+                delta = end - start
+                length = (delta.x() ** 2 + delta.y() ** 2) ** 0.5
+                painter.drawLine(start, end)
+                if length > 1:
+                    tip = min(length, 10 + item["width"] * 2)
+                    base = end - delta * (tip / length)
+                    normal = QPointF(-delta.y(), delta.x()) * (tip * 0.45 / length)
+                    painter.setBrush(item["color"])
+                    painter.drawPolygon(QPolygonF([end, base + normal, base - normal]))
+            elif item["tool"] == "pen":
+                path = QPainterPath(points[0])
+                for point in points[1:]:
+                    path.lineTo(point)
+                if len(points) == 1:
+                    painter.drawPoint(points[0])
+                else:
+                    painter.drawPath(path)
+            elif item["tool"] == "text":
+                font = ui_font(14, 18)
+                font.setPixelSize(16 + item["width"] * 2)
+                painter.setFont(font)
+                painter.drawText(points[0] + QPointF(0, painter.fontMetrics().ascent()), item["text"])
+        painter.restore()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.drawPixmap(0, 0, self.desktop)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 105))
+        if not self._selection.isEmpty():
+            painter.save()
+            painter.setClipRect(self._selection)
+            painter.drawPixmap(0, 0, self.desktop)
+            painter.restore()
+            self._draw_annotations(painter)
+            painter.setPen(QPen(QColor("#2684FF"), 1))
+            painter.drawRect(self._selection.adjusted(0, 0, -1, -1))
+            if self._mode == "select" and not self._ocr_busy:
+                painter.setBrush(Qt.white)
+                for point in self._handles().values():
+                    painter.drawRect(QRect(point.x() - 3, point.y() - 3, 6, 6))
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        area = screen.geometry().translated(-self.geometry().topLeft())
+        painter.setFont(ui_font(11, 13))
+        text = "拖动框选 · C 复制颜色 · X 切换 · Esc 取消"
+        if self._ocr_busy:
+            text = "正在本地识别文字 · Esc 退出"
+        elif not self._selection.isEmpty():
+            dpr = self.desktop.devicePixelRatio()
+            text = "%s × %s px · 拖动调整 · Enter 复制 · Ctrl+O 识别文字 · Ctrl+T 贴图" % (
+                round(self._selection.width() * dpr), round(self._selection.height() * dpr))
+        width = painter.fontMetrics().horizontalAdvance(text) + 24
+        hint = QRect(area.x() + 16, area.y() + 16, width, 30)
+        painter.fillRect(hint, QColor("#202B3D"))
+        painter.setPen(Qt.white)
+        painter.drawText(hint, Qt.AlignCenter, text)
+        self._draw_loupe(painter)
+
+    def mousePressEvent(self, event):
+        if self._ocr_busy:
+            if event.button() == Qt.RightButton:
+                self.close()
+            return
+        if event.button() == Qt.RightButton:
+            if self._selection.isEmpty() or self._auto_copy:
+                self.close()
+            else:
+                self._selection = QRect()
+                self._annotations.clear()
+                self._redo.clear()
+                self._current = None
+                self._origin = self._drag = None
+                self._set_mode("select")
+                self.ocr_status.hide()
+                if self.ocr_result_window is not None:
+                    self.ocr_result_window.hide()
+                self.toolbar.hide()
+                self.update()
+            return
+        if event.button() != Qt.LeftButton:
+            return
+        point = event.pos()
+        self._origin = point
+        self._start_rect = QRect(self._selection)
+        if self._mode != "select" and self._selection.contains(point):
+            if self._mode == "text":
+                self._origin = None
+                text, ok = QInputDialog.getText(self, "添加文字", "文字内容：")
+                if ok and text.strip():
+                    self._annotations.append({"tool": "text", "points": [QPointF(point - self._selection.topLeft())],
+                                              "color": QColor(self._color), "width": self._width, "text": text})
+                    self._redo.clear()
+                    self._position_toolbar()
+                    self.update()
+                return
+            self._drag = "draw"
+            relative = QPointF(point - self._selection.topLeft())
+            self._current = {"tool": self._mode, "points": [relative], "color": QColor(self._color), "width": self._width}
+        else:
+            if self.ocr_result_window is not None:
+                self.ocr_result_window.hide()
+            self.ocr_status.hide()
+            handle = self._hit_handle(point)
+            if handle and self._mode == "select":
+                self._drag = handle
+            elif self._selection.contains(point):
+                self._drag = "move"
+            else:
+                self._drag = "new"
+                self._selection = QRect()
+                self.ocr_status.hide()
+                self._annotations.clear()
+                self._redo.clear()
+                self._set_mode("select")
+            self.toolbar.hide()
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        point = QPoint(min(max(event.pos().x(), 0), self.width()), min(max(event.pos().y(), 0), self.height()))
+        self._update_pixel(point)
+        if self._ocr_busy:
+            return
+        if self._origin is None:
+            handle = self._hit_handle(point) if self._mode == "select" else None
+            cursors = {"nw": Qt.SizeFDiagCursor, "se": Qt.SizeFDiagCursor, "ne": Qt.SizeBDiagCursor,
+                       "sw": Qt.SizeBDiagCursor, "n": Qt.SizeVerCursor, "s": Qt.SizeVerCursor,
+                       "w": Qt.SizeHorCursor, "e": Qt.SizeHorCursor}
+            cursor = cursors.get(handle, Qt.SizeAllCursor if self._mode == "select" and self._selection.contains(point) else Qt.CrossCursor)
+            self.setCursor(cursor)
+            return
+        if self._drag == "new":
+            self._selection = QRect(min(point.x(), self._origin.x()), min(point.y(), self._origin.y()),
+                                    abs(point.x() - self._origin.x()), abs(point.y() - self._origin.y())).intersected(self.rect())
+        elif self._drag == "move":
+            delta = point - self._origin
+            rect = self._start_rect
+            dx = min(max(delta.x(), -rect.x()), self.width() - rect.x() - rect.width())
+            dy = min(max(delta.y(), -rect.y()), self.height() - rect.y() - rect.height())
+            self._selection = rect.translated(dx, dy)
+        elif self._drag == "draw":
+            relative = QPointF(point - self._selection.topLeft())
+            if self._current["tool"] == "pen":
+                self._current["points"].append(relative)
+            else:
+                self._current["points"] = [self._current["points"][0], relative]
+        elif self._drag:
+            rect = self._start_rect
+            left, top, right, bottom = rect.x(), rect.y(), rect.x() + rect.width(), rect.y() + rect.height()
+            if "w" in self._drag:
+                left = min(point.x(), right - 2)
+            if "e" in self._drag:
+                right = max(point.x(), left + 2)
+            if "n" in self._drag:
+                top = min(point.y(), bottom - 2)
+            if "s" in self._drag:
+                bottom = max(point.y(), top + 2)
+            self._selection = QRect(left, top, right - left, bottom - top)
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.LeftButton or self._origin is None:
+            return
+        self.mouseMoveEvent(event)
+        self._origin = None
+        if self._drag == "draw":
+            self._annotations.append(self._current)
+            self._current = None
+            self._redo.clear()
+        self._drag = None
+        if self._selection.width() < 2 or self._selection.height() < 2:
+            self._selection = QRect()
+            self.update()
+            return
+        if self._auto_copy:
+            self._complete("copy")
+        else:
+            self._position_toolbar()
+            self.update()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton and self._mode == "select" and self._selection.contains(event.pos()):
+            self._origin = self._drag = None
+            self._complete("copy")
+        else:
+            self.mousePressEvent(event)
+
+    def _undo(self):
+        if self._annotations:
+            self._redo.append(self._annotations.pop())
+            self._position_toolbar()
+            self.update()
+
+    def _redo_annotation(self):
+        if self._redo:
+            self._annotations.append(self._redo.pop())
+            self._position_toolbar()
+            self.update()
+
+    def result_image(self):
+        image = crop_desktop(self.desktop, self._selection)
+        painter = QPainter(image)
+        painter.translate(-self._selection.topLeft())
+        self._draw_annotations(painter)
+        painter.end()
+        return image
+
+    def _complete(self, action):
+        if self._ocr_busy or self._selection.isEmpty():
+            return
+        image = self.result_image()
+        if action == "save" and not save_screenshot(self, image):
+            return
+        self._accepted = True
+        self.captured.emit(image, action, self._selection.translated(self.geometry().topLeft()))
+        self.close()
+
+    def keyPressEvent(self, event):
+        key, mods = event.key(), event.modifiers()
+        if key == Qt.Key_Escape:
+            self.close()
+        elif self._ocr_busy:
+            return
+        elif mods & Qt.ControlModifier and key == Qt.Key_O:
+            self._start_ocr()
+        elif key in (Qt.Key_Return, Qt.Key_Enter):
+            self._complete("copy")
+        elif mods & Qt.ControlModifier and key in (Qt.Key_C, Qt.Key_S, Qt.Key_T):
+            self._complete({Qt.Key_C: "copy", Qt.Key_S: "save", Qt.Key_T: "pin"}[key])
+        elif mods & Qt.ControlModifier and key == Qt.Key_Z:
+            self._redo_annotation() if mods & Qt.ShiftModifier else self._undo()
+        elif key == Qt.Key_C and mods == Qt.NoModifier:
+            self._update_pixel()
+            QApplication.clipboard().setText(self._pixel_value(self._pixel_format))
+            self.close()
+        elif key == Qt.Key_X and mods == Qt.NoModifier:
+            self._pixel_format = "RGB" if self._pixel_format == "HEX" else "HEX"
+            self.update()
+        elif key in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down) and not self._selection.isEmpty():
+            if self.ocr_result_window is not None:
+                self.ocr_result_window.hide()
+            self.ocr_status.hide()
+            step = 10 if mods & Qt.ShiftModifier else 1
+            dx = {Qt.Key_Left: -step, Qt.Key_Right: step}.get(key, 0)
+            dy = {Qt.Key_Up: -step, Qt.Key_Down: step}.get(key, 0)
+            rect = self._selection
+            dx = min(max(dx, -rect.x()), self.width() - rect.x() - rect.width())
+            dy = min(max(dy, -rect.y()), self.height() - rect.y() - rect.height())
+            self._selection.translate(dx, dy)
+            self._position_toolbar()
+            self.update()
+        else:
+            super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        self._pixel_timer.stop()
+        if self.ocr_result_window is not None:
+            self.ocr_result_window.close()
+        if not self._accepted:
+            self.cancelled.emit()
+        super().closeEvent(event)
+
+
+class CustomCaptureDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("自定义截屏")
+        self.resize(360, 260)
+        layout = QVBoxLayout(self)
+        hint = QLabel("按屏幕内的逻辑坐标指定截图区域，自动适配显示缩放。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #697386; font-size: 12px;")
+        layout.addWidget(hint)
+        form = QFormLayout()
+        self.screen_combo = QComboBox()
+        self.screens = QApplication.screens()
+        for screen in self.screens:
+            geo = screen.geometry()
+            self.screen_combo.addItem("%s  (%s × %s)" % (screen.name(), geo.width(), geo.height()))
+        self.x_edit, self.y_edit, self.width_edit, self.height_edit = (QSpinBox() for _ in range(4))
+        for label, field in (("屏幕", self.screen_combo), ("左侧 X", self.x_edit), ("顶部 Y", self.y_edit),
+                             ("宽度", self.width_edit), ("高度", self.height_edit)):
+            form.addRow(label, field)
+        layout.addLayout(form)
+        self.screen_combo.currentIndexChanged.connect(self._update_limits)
+        self.x_edit.valueChanged.connect(self._update_size_limits)
+        self.y_edit.valueChanged.connect(self._update_size_limits)
+        self._update_limits()
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("截屏")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _update_limits(self, *_):
+        geo = self.screens[self.screen_combo.currentIndex()].geometry()
+        self.x_edit.setRange(0, geo.width() - 1)
+        self.y_edit.setRange(0, geo.height() - 1)
+        self._update_size_limits()
+        self.width_edit.setValue(min(640, self.width_edit.maximum()))
+        self.height_edit.setValue(min(480, self.height_edit.maximum()))
+
+    def _update_size_limits(self, *_):
+        geo = self.screens[self.screen_combo.currentIndex()].geometry()
+        self.width_edit.setRange(1, geo.width() - self.x_edit.value())
+        self.height_edit.setRange(1, geo.height() - self.y_edit.value())
+
+    def capture_rect(self):
+        geo = self.screens[self.screen_combo.currentIndex()].geometry()
+        return QRect(geo.x() + self.x_edit.value(), geo.y() + self.y_edit.value(),
+                     self.width_edit.value(), self.height_edit.value())
+
+
+class PinnedImageWindow(QWidget):
+    closed = pyqtSignal(object)
+
+    def __init__(self, image, origin=None):
+        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setWindowTitle("桌面贴图")
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setAttribute(Qt.WA_StyledBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setMouseTracking(True)
+        self.image = image
+        self._drag_offset = None
+        self._scale = 1.0
+        self.preview = QLabel(self)
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setStyleSheet("PinnedImageWindow { background: #FFFFFF; border: 1px solid #82AFF0; }")
+        self.close_btn = QPushButton("×", self)
+        self.close_btn.setFixedSize(22, 22)
+        self.close_btn.setCursor(Qt.PointingHandCursor)
+        self.close_btn.setToolTip("关闭贴图 · 双击图片仅隐藏")
+        self.close_btn.setFocusPolicy(Qt.NoFocus)
+        self.close_btn.setStyleSheet("QPushButton { color: #344054; background: #FFFFFF; border: 1px solid #D9E0EA; border-radius: 3px; font-size: 18px; } QPushButton:hover { color: white; background: #E5484D; border-color: #E5484D; }")
+        self.close_btn.clicked.connect(self.close)
+        self.info = QLabel(self)
+        self.info.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.info.setStyleSheet("color: white; background: rgba(32, 43, 61, 190); border-radius: 3px; padding: 3px 6px; font-size: 11px;")
+        if origin is not None:
+            self._resize_image()
+            # 图片在窗口内有 2px 边框，向左上偏移使像素与原屏幕位置重合。
+            self.move(origin - QPoint(2, 2))
+        else:
+            screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+            area = screen.availableGeometry()
+            logical = image.size() / image.devicePixelRatio()
+            self._scale = min(1.0, area.width() * 0.75 / logical.width(), area.height() * 0.75 / logical.height())
+            self._resize_image()
+            position = QCursor.pos() + QPoint(18, 18)
+            self.move(min(max(position.x(), area.x()), area.x() + area.width() - self.width()),
+                      min(max(position.y(), area.y()), area.y() + area.height() - self.height()))
+        self.close_btn.hide()
+        self.info.hide()
+
+    def _resize_image(self):
+        logical = self.image.size() / self.image.devicePixelRatio()
+        self.resize(max(32, round(logical.width() * self._scale)) + 4,
+                    max(32, round(logical.height() * self._scale)) + 4)
+        self._update_info()
+
+    def _update_info(self):
+        self.info.setText("%s%% · 透明度 %s%%" % (round(self._scale * 100), round((1 - self.windowOpacity()) * 100)))
+        self.info.adjustSize()
+        self.info.move(5, max(5, self.height() - self.info.height() - 5))
+
+    def resizeEvent(self, event):
+        self.preview.setGeometry(self.rect().adjusted(2, 2, -2, -2))
+        dpr = self.devicePixelRatioF()
+        pixmap = self.image.scaled(self.preview.size() * dpr, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        pixmap.setDevicePixelRatio(dpr)
+        self.preview.setPixmap(pixmap)
+        self.close_btn.move(self.width() - 26, 4)
+        self.close_btn.raise_()
+        self.info.raise_()
+        self._update_info()
+        super().resizeEvent(event)
+
+    def enterEvent(self, event):
+        self.close_btn.show()
+        self.info.show()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.close_btn.hide()
+        self.info.hide()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.setFocus()
+            self._drag_offset = event.globalPos() - self.pos()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_offset is not None and event.buttons() & Qt.LeftButton:
+            self.move(event.globalPos() - self._drag_offset)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_offset = None
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_offset = None
+            self.hide()
+
+    def _zoom(self, scale, anchor=None):
+        anchor = QPointF(anchor if anchor is not None else self.rect().center())
+        global_anchor = QPointF(self.pos()) + anchor
+        ratio_x, ratio_y = anchor.x() / self.width(), anchor.y() / self.height()
+        self._scale = min(5.0, max(0.1, scale))
+        self._resize_image()
+        self.move(round(global_anchor.x() - self.width() * ratio_x), round(global_anchor.y() - self.height() * ratio_y))
+
+    def _set_opacity(self, value):
+        self.setWindowOpacity(min(1.0, max(0.1, value)))
+        self._update_info()
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta:
+            if event.modifiers() & Qt.ControlModifier:
+                self._set_opacity(self.windowOpacity() + (0.1 if delta > 0 else -0.1))
+            else:
+                self._zoom(self._scale * (1.1 if delta > 0 else 1 / 1.1), event.pos())
+        event.accept()
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        menu.addAction("复制图片\tCtrl+C", lambda: QApplication.clipboard().setImage(self.image.toImage()))
+        menu.addAction("保存 PNG\tCtrl+S", lambda: save_screenshot(self, self.image))
+        menu.addAction("原始大小\t0", lambda: self._zoom(1.0))
+        opacity = menu.addMenu("不透明度 · Ctrl+滚轮")
+        for percent in (100, 75, 50, 25):
+            action = opacity.addAction("%s%%" % percent)
+            action.setCheckable(True)
+            action.setChecked(abs(self.windowOpacity() - percent / 100) < 0.01)
+            action.triggered.connect(lambda checked, value=percent: self._set_opacity(value / 100))
+        menu.addSeparator()
+        menu.addAction("隐藏贴图\t双击 / Esc", self.hide)
+        menu.addAction("关闭贴图\tDelete", self.close)
+        menu.exec_(event.globalPos())
+
+    def keyPressEvent(self, event):
+        key, mods = event.key(), event.modifiers()
+        if key == Qt.Key_Escape:
+            self.hide()
+        elif key == Qt.Key_Delete:
+            self.close()
+        elif key == Qt.Key_C and mods & Qt.ControlModifier:
+            QApplication.clipboard().setImage(self.image.toImage())
+        elif key == Qt.Key_S and mods & Qt.ControlModifier:
+            save_screenshot(self, self.image)
+        elif key == Qt.Key_0 and not mods:
+            self._zoom(1.0)
+        elif key in (Qt.Key_Plus, Qt.Key_Equal, Qt.Key_Minus):
+            increase = key != Qt.Key_Minus
+            if mods & Qt.ControlModifier:
+                self._set_opacity(self.windowOpacity() + (0.1 if increase else -0.1))
+            else:
+                self._zoom(self._scale * (1.1 if increase else 1 / 1.1))
+        else:
+            super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        self.closed.emit(self)
+        super().closeEvent(event)
+
+
+class ScreenshotTool(QObject):
+    def __init__(self, main):
+        super().__init__(main)
+        self.main = main
+        self.overlay = None
+        self.pins = []
+        self._ocr_worker = None
+        self._ocr_workers = []
+        self._restore_windows = []
+        self._auto_copy = False
+        self._rectangle = None
+        self._prev_pid = None
+        self._prev_hwnd = None
+        self._quitting = False
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._take_capture)
+        QApplication.instance().aboutToQuit.connect(self.stop)
+
+    def capture(self):
+        self._begin_capture(False)
+
+    def capture_copy(self):
+        self._begin_capture(True)
+
+    def custom_capture(self):
+        if self.overlay is not None or self._timer.isActive():
+            return
+        dialog = CustomCaptureDialog(self.main)
+        if dialog.exec_() == QDialog.Accepted:
+            self._begin_capture(False, dialog.capture_rect())
+
+    def _begin_capture(self, auto_copy, rectangle=None):
+        if self.overlay is not None:
+            self.overlay.close()
+            return
+        if self._timer.isActive():
+            return
+        self._prev_pid = _mac_frontmost_pid()
+        if platform.system() == "Windows":
+            ctypes.windll.user32.GetForegroundWindow.restype = ctypes.c_void_p
+            self._prev_hwnd = ctypes.windll.user32.GetForegroundWindow()
+        self._auto_copy = auto_copy
+        self._rectangle = rectangle
+        self._restore_windows = [self.main] if self.main.isVisible() else []
+        for window in self._restore_windows:
+            window.hide()
+        self._timer.start(180)
+
+    def _take_capture(self):
+        try:
+            desktop, geometry = capture_desktop()
+        except (OSError, ValueError) as exc:
+            self._restore()
+            QMessageBox.warning(self.main, "截图失败", str(exc))
+            return
+        selection = self._rectangle.translated(-geometry.topLeft()) if self._rectangle is not None else None
+        self.overlay = CaptureOverlay(desktop, geometry, self._auto_copy, selection)
+        self.overlay.captured.connect(self._finish_capture)
+        self.overlay.cancelled.connect(self._cancel_capture)
+        self.overlay.ocr_requested.connect(self._recognize_text)
+        self.overlay.show()
+        self.overlay.raise_()
+        self.overlay.activateWindow()
+        self.overlay.setFocus()
+
+    def _restore(self):
+        windows, self._restore_windows = self._restore_windows, []
+        if not self._quitting:
+            for window in windows:
+                nonactivating = window.testAttribute(Qt.WA_ShowWithoutActivating)
+                window.setAttribute(Qt.WA_ShowWithoutActivating)
+                window.show()
+                window.setAttribute(Qt.WA_ShowWithoutActivating, nonactivating)
+            if self._prev_pid:
+                _mac_reactivate(self._prev_pid)
+            if self._prev_hwnd:
+                user32 = ctypes.windll.user32
+                user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+                user32.SetForegroundWindow(self._prev_hwnd)
+        self._prev_pid = None
+        self._prev_hwnd = None
+
+    def _recognize_text(self, image):
+        worker = ScreenshotOcrWorker(image, self)
+        self._ocr_worker = worker
+        self._ocr_workers.append(worker)
+        worker.result_ready.connect(self._ocr_result)
+        worker.finished.connect(self._ocr_worker_finished)
+        worker.start()
+
+    def _ocr_result(self, text, error):
+        if self.sender() is self._ocr_worker and self.overlay is not None:
+            self._ocr_worker = None
+            self.overlay.set_ocr_result(text, error)
+
+    def _ocr_worker_finished(self):
+        worker = self.sender()
+        self._ocr_workers.remove(worker)
+        worker.deleteLater()
+
+    def _cancel_ocr(self):
+        worker, self._ocr_worker = self._ocr_worker, None
+        if worker is not None:
+            worker.cancel()
+
+    def _cancel_capture(self):
+        self._cancel_ocr()
+        self.overlay = None
+        self._restore()
+
+    def _finish_capture(self, image, action, rectangle):
+        self.overlay = None
+        self._restore()
+        if action in ("copy", "pin"):
+            QApplication.clipboard().setImage(image.toImage())
+        if action == "pin":
+            self.pin(image, rectangle.topLeft())
+
+    def paste(self):
+        clipboard = QApplication.clipboard().mimeData()
+        image = QApplication.clipboard().pixmap() if clipboard and clipboard.hasImage() else QPixmap()
+        if image.isNull() and clipboard and clipboard.hasUrls():
+            urls = clipboard.urls()
+            if len(urls) == 1 and urls[0].isLocalFile():
+                image = QPixmap(urls[0].toLocalFile())
+        if image.isNull():
+            QMessageBox.information(self.main, "贴图", "剪贴板中没有图片，请先复制一张图片或截屏")
+            return
+        self.pin(image)
+
+    def pin(self, image, origin=None):
+        pin = PinnedImageWindow(image, origin)
+        pin.closed.connect(self._remove_pin)
+        self.pins.append(pin)
+        pin.show()
+        pin.raise_()
+        return pin
+
+    def _remove_pin(self, pin):
+        self.pins.remove(pin)
+
+    def toggle_pins(self):
+        show = not any(pin.isVisible() for pin in self.pins)
+        for pin in self.pins:
+            pin.setVisible(show)
+
+    def stop(self):
+        self._quitting = True
+        self._timer.stop()
+        if self.overlay is not None:
+            self.overlay.close()
+            self.overlay = None
+        for pin in list(self.pins):
+            pin.close()
+        for worker in list(self._ocr_workers):
+            worker.cancel()
+        for worker in list(self._ocr_workers):
+            worker.wait()
+        self._restore_windows.clear()
+
+
 class ColorWindow(QMainWindow):
     FORMATS = ["HEX", "RGB", "RGBA", "HSL", "HSV", "CMYK"]
 
@@ -2936,9 +4747,6 @@ class ColorWindow(QMainWindow):
         self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
         self._rgb = None
         self._alpha = 255
-        self._pick_overlay = None
-        self._pick_prev_pid = None
-        self._pick_silent_exit = False
         self.init_ui()
 
     def init_ui(self):
@@ -2968,17 +4776,6 @@ class ColorWindow(QMainWindow):
         self.color_edit.textChanged.connect(self.convert)
         form.addWidget(self.color_edit, 0, 1, 1, 2)
 
-        screen_btn = QPushButton("屏幕取色")
-        screen_btn.setFixedSize(84, 30)
-        screen_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        screen_btn.setStyleSheet("""
-            QPushButton { color: #FFFFFF; background: #1A73E8; border: none; border-radius: 4px; font-size: 12px; }
-            QPushButton:hover { background: #1557B0; }
-        """)
-        screen_btn.setToolTip("全屏放大镜取色：移动鼠标放大像素，左键取色，右键/ESC 退出")
-        screen_btn.clicked.connect(self.start_screen_pick)
-        form.addWidget(screen_btn, 0, 3)
-
         pick_btn = QPushButton("调色板")
         pick_btn.setFixedSize(70, 30)
         pick_btn.setCursor(QCursor(Qt.PointingHandCursor))
@@ -2987,7 +4784,7 @@ class ColorWindow(QMainWindow):
             QPushButton:hover { background: #E0E0E0; }
         """)
         pick_btn.clicked.connect(self.do_pick)
-        form.addWidget(pick_btn, 0, 4)
+        form.addWidget(pick_btn, 0, 3)
 
         clear_btn = QPushButton("清空")
         clear_btn.setFixedSize(70, 30)
@@ -2997,7 +4794,7 @@ class ColorWindow(QMainWindow):
             QPushButton:hover { background: #E0E0E0; }
         """)
         clear_btn.clicked.connect(self.do_clear)
-        form.addWidget(clear_btn, 0, 5)
+        form.addWidget(clear_btn, 0, 4)
 
         layout.addLayout(form)
 
@@ -3069,44 +4866,6 @@ class ColorWindow(QMainWindow):
         color = QColorDialog.getColor(init, self, "选择颜色")
         if color.isValid():
             self.color_edit.setText(color.name().upper())
-
-    def start_screen_pick(self):
-        if self._pick_overlay is not None:
-            self._pick_overlay.close()
-        self._pick_prev_pid = _mac_frontmost_pid()
-        self.hide()
-        ov = ScreenPickOverlay()
-        ov.setAttribute(Qt.WA_DeleteOnClose)
-        ov.copied.connect(self._on_overlay_copied)
-        ov.closed.connect(self._on_overlay_gone)
-        self._pick_overlay = ov
-        ov.start()
-
-    def _on_overlay_copied(self, color):
-        # 复制即退出：静默回填，不显示/不激活窗口（复制不弹窗）
-        self._pick_silent_exit = True
-        hexval = color.name().upper()
-        self.color_edit.setText(hexval)
-        self.set_status(f"屏幕取色 {hexval}，已复制到剪贴板", ok=True)
-
-    def _on_overlay_gone(self, *_):
-        self._pick_overlay = None
-        prev = self._pick_prev_pid
-        self._pick_prev_pid = None
-        silent = self._pick_silent_exit
-        self._pick_silent_exit = False
-        if not silent:
-            self.show()
-        if prev:
-            _mac_reactivate(prev)
-
-    def closeEvent(self, event):
-        ov = self._pick_overlay
-        self._pick_overlay = None
-        if ov is not None:
-            ov.closed.disconnect(self._on_overlay_gone)
-            ov.close()
-        super().closeEvent(event)
 
     def copy_value(self, fmt):
         text = self.value_edits[fmt].text()
@@ -5377,9 +7136,9 @@ class PingWorker(QThread):
         system = platform.system()
         try:
             if system == "Windows":
-                output = subprocess.check_output(f"ping -n 4 {self.target}", shell=True, text=True, encoding="gbk", errors="ignore")
+                output = subprocess.check_output(["ping", "-n", "4", self.target], text=True, encoding="gbk", errors="ignore")
             else:
-                output = subprocess.check_output(f"ping -c 4 {self.target}", shell=True, text=True, errors="ignore")
+                output = subprocess.check_output(["ping", "-c", "4", self.target], text=True, errors="ignore")
             self.result_ready.emit(output)
         except subprocess.CalledProcessError as e:
             self.result_ready.emit(f"Ping 失败:\n{e.output}")
@@ -6221,197 +7980,6 @@ class JsonYamlWindow(QMainWindow):
     def do_clear(self):
         self.input_text.setPlainText("")
         self.output_text.setPlainText("")
-
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
-            self.close()
-
-
-class TimestampWindow(QMainWindow):
-    FORMATS = [
-        ("yyyy-MM-dd HH:mm:ss", "%Y-%m-%d %H:%M:%S"),
-        ("yyyy-MM-dd HH:mm:ss.SSS", "%Y-%m-%d %H:%M:%S.%f"),
-        ("yyyy-MM-dd HH:mm", "%Y-%m-%d %H:%M"),
-        ("yyyy-MM-dd", "%Y-%m-%d"),
-        ("yyyy-MM-dd'T'HH:mm:ss", "%Y-%m-%dT%H:%M:%S"),
-        ("yyyy/MM/dd HH:mm:ss", "%Y/%m/%d %H:%M:%S"),
-        ("yyyy/MM/dd", "%Y/%m/%d"),
-        ("yyyyMMddHHmmss", "%Y%m%d%H%M%S"),
-        ("yyyyMMdd", "%Y%m%d"),
-        ("MM/dd/yyyy HH:mm:ss", "%m/%d/%Y %H:%M:%S"),
-        ("dd-MM-yyyy HH:mm:ss", "%d-%m-%Y %H:%M:%S"),
-    ]
-
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("时间戳转换")
-        self.setGeometry(*tool_win_geometry())
-        self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
-        self.init_ui()
-
-    def init_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(15, 15, 15, 10)
-        layout.setSpacing(10)
-
-        layout.addWidget(QLabel("当前时间戳"))
-        cur_layout = QHBoxLayout()
-        self.now_label = QLabel("")
-        self.now_label.setStyleSheet("color: #1A73E8; font-size: 14px; font-weight: bold;")
-        cur_layout.addWidget(self.now_label)
-        copy_sec = QPushButton("复制秒级")
-        copy_sec.setFixedHeight(28)
-        copy_sec.setCursor(QCursor(Qt.PointingHandCursor))
-        copy_sec.setStyleSheet(_secondary_btn())
-        copy_sec.clicked.connect(lambda: QApplication.clipboard().setText(str(int(time.time()))))
-        cur_layout.addWidget(copy_sec)
-        copy_ms = QPushButton("复制毫秒级")
-        copy_ms.setFixedHeight(28)
-        copy_ms.setCursor(QCursor(Qt.PointingHandCursor))
-        copy_ms.setStyleSheet(_secondary_btn())
-        copy_ms.clicked.connect(lambda: QApplication.clipboard().setText(str(int(time.time() * 1000))))
-        cur_layout.addWidget(copy_ms)
-        cur_layout.addStretch()
-        layout.addLayout(cur_layout)
-        self._refresh_now()
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet("color: #E0E0E0;")
-        layout.addWidget(sep)
-
-        layout.addWidget(QLabel("时间戳 → 日期时间"))
-        t2d_layout = QHBoxLayout()
-        self.ts_input = QLineEdit()
-        self.ts_input.setPlaceholderText("输入秒或毫秒级时间戳")
-        self.ts_input.setStyleSheet(_lineedit_style())
-        self.ts_input.returnPressed.connect(self.ts_to_date)
-        t2d_layout.addWidget(self.ts_input)
-        t2d_btn = QPushButton("转换")
-        t2d_btn.setFixedHeight(30)
-        t2d_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        t2d_btn.setStyleSheet(_primary_btn())
-        t2d_btn.clicked.connect(self.ts_to_date)
-        t2d_layout.addWidget(t2d_btn)
-        layout.addLayout(t2d_layout)
-
-        t2d_fmt_layout = QHBoxLayout()
-        t2d_fmt_layout.addWidget(QLabel("输出格式:"))
-        self.t2d_combo = QComboBox()
-        for label, _ in self.FORMATS:
-            self.t2d_combo.addItem(label)
-        self.t2d_combo.setStyleSheet(_combo_style())
-        self.t2d_combo.currentIndexChanged.connect(self.ts_to_date)
-        t2d_fmt_layout.addWidget(self.t2d_combo)
-        t2d_fmt_layout.addStretch()
-        layout.addLayout(t2d_fmt_layout)
-
-        self.ts_result = QLabel("")
-        self.ts_result.setStyleSheet("color: #333333; font-size: 13px;")
-        self.ts_result.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        layout.addWidget(self.ts_result)
-
-        sep2 = QFrame()
-        sep2.setFrameShape(QFrame.HLine)
-        sep2.setStyleSheet("color: #E0E0E0;")
-        layout.addWidget(sep2)
-
-        layout.addWidget(QLabel("日期时间 → 时间戳"))
-        d2t_layout = QHBoxLayout()
-        self.date_input = QLineEdit()
-        self.date_input.setPlaceholderText("按所选格式输入日期，如 2026-10-30 12:00:00")
-        self.date_input.setStyleSheet(_lineedit_style())
-        self.date_input.returnPressed.connect(self.date_to_ts)
-        d2t_layout.addWidget(self.date_input)
-        d2t_btn = QPushButton("转换")
-        d2t_btn.setFixedHeight(30)
-        d2t_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        d2t_btn.setStyleSheet(_primary_btn())
-        d2t_btn.clicked.connect(self.date_to_ts)
-        d2t_layout.addWidget(d2t_btn)
-        layout.addLayout(d2t_layout)
-
-        d2t_fmt_layout = QHBoxLayout()
-        d2t_fmt_layout.addWidget(QLabel("输入格式:"))
-        self.d2t_combo = QComboBox()
-        self.d2t_combo.addItem("自动识别")
-        for label, _ in self.FORMATS:
-            self.d2t_combo.addItem(label)
-        self.d2t_combo.setStyleSheet(_combo_style())
-        self.d2t_combo.currentIndexChanged.connect(self.date_to_ts)
-        d2t_fmt_layout.addWidget(self.d2t_combo)
-        d2t_fmt_layout.addStretch()
-        layout.addLayout(d2t_fmt_layout)
-
-        self.date_result = QLabel("")
-        self.date_result.setStyleSheet("color: #333333; font-size: 13px;")
-        self.date_result.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        layout.addWidget(self.date_result)
-
-        clear_btn = QPushButton("清空")
-        clear_btn.setFixedSize(80, 30)
-        clear_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        clear_btn.setStyleSheet(_secondary_btn())
-        clear_btn.clicked.connect(self.do_clear)
-        layout.addWidget(clear_btn)
-        layout.addStretch()
-
-    def _refresh_now(self):
-        now = int(time.time())
-        self.now_label.setText(f"秒: {now}    毫秒: {now * 1000}")
-
-    def ts_to_date(self):
-        raw = self.ts_input.text().strip()
-        if not raw or not raw.isdigit():
-            self.ts_result.setText("请输入数字时间戳")
-            return
-        ts = int(raw)
-        if len(raw) >= 13:
-            ts = ts / 1000.0
-        fmt = self.FORMATS[self.t2d_combo.currentIndex()][1]
-        try:
-            dt = datetime.datetime.fromtimestamp(ts)
-            result = dt.strftime(fmt)
-            if 'SSS' in self.FORMATS[self.t2d_combo.currentIndex()][0]:
-                result = dt.strftime(fmt)[:-3]
-            self.ts_result.setText(result)
-        except Exception as e:
-            self.ts_result.setText(f"转换失败: {e}")
-
-    def date_to_ts(self):
-        raw = self.date_input.text().strip()
-        if not raw:
-            self.date_result.setText("")
-            return
-        idx = self.d2t_combo.currentIndex()
-        dt = None
-        if idx == 0:
-            for _, f in self.FORMATS:
-                try:
-                    dt = datetime.datetime.strptime(raw, f)
-                    break
-                except ValueError:
-                    continue
-        else:
-            f = self.FORMATS[idx - 1][1]
-            try:
-                dt = datetime.datetime.strptime(raw, f)
-            except ValueError:
-                dt = None
-        if dt is None:
-            self.date_result.setText("日期格式与所选不匹配")
-            return
-        ts = int(dt.timestamp())
-        ms = int(dt.timestamp() * 1000)
-        self.date_result.setText(f"秒: {ts}    毫秒: {ms}")
-
-    def do_clear(self):
-        self.ts_input.setText("")
-        self.date_input.setText("")
-        self.ts_result.setText("")
-        self.date_result.setText("")
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
@@ -7959,12 +9527,14 @@ class CommandRow(QWidget):
             self._on_copy(self._cmd)
 
 
-class CommandReferenceWindow(QMainWindow):
-    CATEGORIES = ["全部", "Docker", "Linux", "SSH", "Vim", "Windows", "Git"]
+class DeveloperReferenceWindow(QMainWindow):
+    CATEGORIES = ["全部", "Docker", "Linux", "SSH", "Vim", "Windows", "Git", "HTTP"]
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("命令速查")
+        self.setWindowTitle("开发速查")
+        self._items = COMMAND_ITEMS + [(f"{code} {en}", f"{zh} · {desc}", "HTTP")
+                                       for code, en, zh, desc in HTTP_STATUS_CODES]
         self.setGeometry(*tool_win_geometry())
         self._current_cat = "全部"
         self.setStyleSheet("""
@@ -7983,7 +9553,8 @@ class CommandReferenceWindow(QMainWindow):
         layout.setSpacing(10)
 
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("搜索命令或中文说明，例如 容器、端口、分支、log…")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.setPlaceholderText("搜索命令、HTTP 状态码或说明，例如 容器、分支、404、超时…")
         self.search_edit.setStyleSheet("""
             QLineEdit { border: 1px solid #D0D0D0; border-radius: 4px; padding: 7px 10px;
                 font-family: "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13px; }
@@ -8002,7 +9573,7 @@ class CommandReferenceWindow(QMainWindow):
             btn.setChecked(cat == "全部")
             btn.setStyleSheet("""
                 QPushButton { color: #222; background: #FFFFFF; border: 1px solid #CFCFCF;
-                    border-radius: 4px; padding: 6px 16px; font-size: 14px; font-weight: 500;
+                    border-radius: 4px; padding: 6px 12px; font-size: 12px; font-weight: 500;
                     font-family: "PingFang SC", "Microsoft YaHei", sans-serif; }
                 QPushButton:hover { border-color: #1A73E8; color: #1A73E8; }
                 QPushButton:checked { color: #FFFFFF; background: #1A73E8; border-color: #1A73E8; }
@@ -8047,22 +9618,22 @@ class CommandReferenceWindow(QMainWindow):
         query = self.search_edit.text().strip().lower()
         self._clear_results()
         count = 0
-        for cmd, desc, cat in COMMAND_ITEMS:
+        for cmd, desc, cat in self._items:
             if self._current_cat != "全部" and cat != self._current_cat:
                 continue
-            if query and query not in cmd.lower() and query not in desc.lower():
+            if query and query not in cmd.lower() and query not in desc.lower() and query not in cat.lower():
                 continue
             row = CommandRow(cmd, desc, cat, self.copy_command)
             self._results_layout.addWidget(row)
             count += 1
         if count == 0:
-            empty = QLabel("没有匹配的命令")
+            empty = QLabel("没有匹配的速查条目")
             empty.setFont(QFont("PingFang SC", 12))
             empty.setStyleSheet("color: #999999; padding: 30px;")
             empty.setAlignment(Qt.AlignCenter)
             self._results_layout.addWidget(empty)
         self._results_layout.addStretch()
-        self.status_label.setText("共 %d 条 · 点击任意命令即可复制" % count)
+        self.status_label.setText("共 %d 条 · 点击条目复制命令或状态码" % count)
 
     def copy_command(self, cmd):
         QApplication.clipboard().setText(cmd)
@@ -9335,144 +10906,34 @@ class MortgageWindow(QMainWindow):
             self.close()
 
 
-class HttpStatusWindow(QMainWindow):
-    """HTTP 状态码速查：按代码或关键词搜索，显示含义和常见场景。"""
-
-    STATUS_CODES = [
-        (100, "Continue", "继续", "客户端应继续发送请求主体"),
-        (101, "Switching Protocols", "切换协议", "服务器同意切换协议，如 WebSocket"),
-        (200, "OK", "成功", "请求成功，最常见的高效代码"),
-        (201, "Created", "已创建", "资源创建成功，常用于 POST 后"),
-        (202, "Accepted", "已接受", "请求已接受但未处理完成，异步任务"),
-        (204, "No Content", "无内容", "请求成功但无返回内容，常用于 DELETE"),
-        (301, "Moved Permanently", "永久重定向", "资源已永久移动到新 URL"),
-        (302, "Found", "临时重定向", "资源临时移动到新 URL"),
-        (304, "Not Modified", "未修改", "缓存有效，可使用本地缓存"),
-        (400, "Bad Request", "错误请求", "请求语法错误，服务器无法理解"),
-        (401, "Unauthorized", "未授权", "需要身份验证，如登录"),
-        (403, "Forbidden", "禁止访问", "已认证但无权限访问资源"),
-        (404, "Not Found", "未找到", "请求的资源不存在"),
-        (405, "Method Not Allowed", "方法不允许", "请求方法不支持，如用 POST 访问只支持 GET 的接口"),
-        (408, "Request Timeout", "请求超时", "服务器等待请求超时"),
-        (409, "Conflict", "冲突", "请求与资源状态冲突，如重复创建"),
-        (410, "Gone", "已删除", "资源已永久删除"),
-        (413, "Payload Too Large", "载荷过大", "请求主体超过服务器限制"),
-        (414, "URI Too Long", "URI 过长", "请求 URL 超过服务器限制"),
-        (415, "Unsupported Media Type", "不支持的媒体类型", "请求格式不支持"),
-        (429, "Too Many Requests", "请求过多", "触发限流，请稍后重试"),
-        (500, "Internal Server Error", "服务器内部错误", "服务器遇到未预期的错误"),
-        (501, "Not Implemented", "未实现", "服务器不支持请求的功能"),
-        (502, "Bad Gateway", "错误网关", "网关或代理服务器收到无效响应"),
-        (503, "Service Unavailable", "服务不可用", "服务器过载或维护中"),
-        (504, "Gateway Timeout", "网关超时", "网关或代理服务器未及时收到响应"),
-    ]
-
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("HTTP 状态码速查")
-        self.setGeometry(*tool_win_geometry())
-        self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
-        self.init_ui()
-        self.apply_filter()
-
-    def init_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(15, 15, 15, 10)
-        layout.setSpacing(10)
-
-        self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("搜索状态码或关键词，例如 404、重定向、超时…")
-        self.search_edit.setStyleSheet(_lineedit_style())
-        self.search_edit.textChanged.connect(self.apply_filter)
-        layout.addWidget(self.search_edit)
-
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameShape(QFrame.NoFrame)
-        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
-        self.scroll.viewport().setStyleSheet("background: #FFFFFF;")
-        layout.addWidget(self.scroll, 1)
-
-        self.container = QWidget()
-        self.container_layout = QVBoxLayout(self.container)
-        self.container_layout.setContentsMargins(0, 0, 0, 0)
-        self.container_layout.setSpacing(8)
-        self.container_layout.addStretch()
-        self.scroll.setWidget(self.container)
-
-    def apply_filter(self):
-        while self.container_layout.count() > 1:
-            item = self.container_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        keyword = self.search_edit.text().strip().lower()
-        count = 0
-        for code, en_name, zh_name, desc in self.STATUS_CODES:
-            if keyword:
-                if (keyword not in str(code) and
-                    keyword not in en_name.lower() and
-                    keyword not in zh_name and
-                    keyword not in desc):
-                    continue
-            row = self._make_row(code, en_name, zh_name, desc)
-            self.container_layout.insertWidget(count, row)
-            count += 1
-        if count == 0:
-            empty = QLabel("没有匹配的状态码")
-            empty.setAlignment(Qt.AlignCenter)
-            empty.setStyleSheet("color: #999999; padding: 20px; font-size: 13px;")
-            self.container_layout.insertWidget(0, empty)
-
-    def _make_row(self, code, en_name, zh_name, desc):
-        frame = QFrame()
-        frame.setStyleSheet("""
-            QFrame { background: #FAFAFA; border: 1px solid #E0E0E0; border-radius: 6px; }
-            QFrame:hover { background: #F0F7FF; border-color: #1A73E8; }
-        """)
-        layout = QHBoxLayout(frame)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(12)
-
-        code_label = QLabel(str(code))
-        code_font = QFont("Menlo", 16, QFont.Bold)
-        code_label.setFont(code_font)
-        color = self._code_color(code)
-        code_label.setStyleSheet(f"color: {color}; min-width: 50px;")
-        layout.addWidget(code_label)
-
-        text_box = QVBoxLayout()
-        text_box.setSpacing(4)
-        title = QLabel(f"{zh_name} ({en_name})")
-        title.setFont(QFont("PingFang SC", 13, QFont.Bold))
-        title.setStyleSheet("color: #333333;")
-        text_box.addWidget(title)
-        desc_label = QLabel(desc)
-        desc_label.setFont(QFont("PingFang SC", 12))
-        desc_label.setStyleSheet("color: #666666;")
-        desc_label.setWordWrap(True)
-        text_box.addWidget(desc_label)
-        layout.addLayout(text_box, 1)
-
-        return frame
-
-    @staticmethod
-    def _code_color(code):
-        if code < 200:
-            return "#6B7280"
-        if code < 300:
-            return "#188038"
-        if code < 400:
-            return "#1A73E8"
-        if code < 500:
-            return "#D93025"
-        return "#EA8600"
-
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
-            self.close()
+HTTP_STATUS_CODES = [
+    (100, "Continue", "继续", "客户端应继续发送请求主体"),
+    (101, "Switching Protocols", "切换协议", "服务器同意切换协议，如 WebSocket"),
+    (200, "OK", "成功", "请求成功，最常见的成功状态码"),
+    (201, "Created", "已创建", "资源创建成功，常用于 POST 后"),
+    (202, "Accepted", "已接受", "请求已接受但未处理完成，异步任务"),
+    (204, "No Content", "无内容", "请求成功但无返回内容，常用于 DELETE"),
+    (301, "Moved Permanently", "永久重定向", "资源已永久移动到新 URL"),
+    (302, "Found", "临时重定向", "资源临时移动到新 URL"),
+    (304, "Not Modified", "未修改", "缓存有效，可使用本地缓存"),
+    (400, "Bad Request", "错误请求", "请求语法错误，服务器无法理解"),
+    (401, "Unauthorized", "未授权", "需要身份验证，如登录"),
+    (403, "Forbidden", "禁止访问", "已认证但无权限访问资源"),
+    (404, "Not Found", "未找到", "请求的资源不存在"),
+    (405, "Method Not Allowed", "方法不允许", "请求方法不支持，如用 POST 访问只支持 GET 的接口"),
+    (408, "Request Timeout", "请求超时", "服务器等待请求超时"),
+    (409, "Conflict", "冲突", "请求与资源状态冲突，如重复创建"),
+    (410, "Gone", "已删除", "资源已永久删除"),
+    (413, "Payload Too Large", "载荷过大", "请求主体超过服务器限制"),
+    (414, "URI Too Long", "URI 过长", "请求 URL 超过服务器限制"),
+    (415, "Unsupported Media Type", "不支持的媒体类型", "请求格式不支持"),
+    (429, "Too Many Requests", "请求过多", "触发限流，请稍后重试"),
+    (500, "Internal Server Error", "服务器内部错误", "服务器遇到未预期的错误"),
+    (501, "Not Implemented", "未实现", "服务器不支持请求的功能"),
+    (502, "Bad Gateway", "错误网关", "网关或代理服务器收到无效响应"),
+    (503, "Service Unavailable", "服务不可用", "服务器过载或维护中"),
+    (504, "Gateway Timeout", "网关超时", "网关或代理服务器未及时收到响应"),
+]
 
 
 class ChmodWindow(QMainWindow):
@@ -9608,224 +11069,711 @@ class ChmodWindow(QMainWindow):
             self.close()
 
 
-class DateTimeWindow(QMainWindow):
-    """日期时间计算器：日期差、加减天数、时区转换。"""
+# 名称, IANA 时区, tzdata 不可用时退回的固定 UTC 偏移（小时）
+DT_ZONES = [
+    ("本地", None, None),
+    ("UTC", "UTC", 0),
+    ("北京", "Asia/Shanghai", 8),
+    ("香港", "Asia/Hong_Kong", 8),
+    ("新加坡", "Asia/Singapore", 8),
+    ("东京", "Asia/Tokyo", 9),
+    ("首尔", "Asia/Seoul", 9),
+    ("新德里", "Asia/Kolkata", 5.5),
+    ("迪拜", "Asia/Dubai", 4),
+    ("莫斯科", "Europe/Moscow", 3),
+    ("柏林", "Europe/Berlin", 1),
+    ("巴黎", "Europe/Paris", 1),
+    ("伦敦", "Europe/London", 0),
+    ("纽约", "America/New_York", -5),
+    ("芝加哥", "America/Chicago", -6),
+    ("丹佛", "America/Denver", -7),
+    ("洛杉矶", "America/Los_Angeles", -8),
+    ("悉尼", "Australia/Sydney", 10),
+]
+DT_UNITS = [("自动识别", None), ("秒", 10 ** 9), ("毫秒", 10 ** 6), ("微秒", 10 ** 3), ("纳秒", 1)]
+DT_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+DT_WEEKDAYS = "一二三四五六日"
+DT_PRESET_PATTERNS = [
+    "yyyy-MM-dd HH:mm:ss",
+    "yyyy-MM-dd HH:mm:ss.SSS",
+    "yyyy/MM/dd HH:mm:ss",
+    "yyyyMMddHHmmss",
+    "yyyyMMdd",
+    "yyyy年MM月dd日 HH:mm:ss",
+    "yyyy-MM-dd'T'HH:mm:ssZ",
+    "EEE MMM dd HH:mm:ss yyyy",
+    "dd/MMM/yyyy:HH:mm:ss Z",
+]
+DT_TEXT_FORMATS = [
+    ("%Y/%m/%d %H:%M:%S.%f", "yyyy/MM/dd HH:mm:ss.SSS"),
+    ("%Y/%m/%d %H:%M:%S", "yyyy/MM/dd HH:mm:ss"),
+    ("%Y/%m/%d %H:%M", "yyyy/MM/dd HH:mm"),
+    ("%Y/%m/%d", "yyyy/MM/dd"),
+    ("%Y年%m月%d日 %H:%M:%S", "yyyy年MM月dd日 HH:mm:ss"),
+    ("%Y年%m月%d日 %H时%M分%S秒", "yyyy年MM月dd日 HH时mm分ss秒"),
+    ("%Y年%m月%d日", "yyyy年MM月dd日"),
+    ("%m/%d/%Y %H:%M:%S", "MM/dd/yyyy HH:mm:ss"),
+    ("%m/%d/%Y", "MM/dd/yyyy"),
+    ("%d/%b/%Y:%H:%M:%S %z", "Nginx/Apache 日志"),
+    ("%a %b %d %H:%M:%S %Y", "ctime"),
+]
+_DT_MONTHS = ["January", "February", "March", "April", "May", "June", "July",
+              "August", "September", "October", "November", "December"]
+_DT_DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+_DT_TOKEN_RE = re.compile(r"'[^']*'|y+|M+|d+|H+|h+|m+|s+|S+|E+|a|Z+|X+")
 
-    TIMEZONES = [
-        ("UTC", 0),
-        ("北京 (UTC+8)", 8),
-        ("东京 (UTC+9)", 9),
-        ("首尔 (UTC+9)", 9),
-        ("悉尼 (UTC+10)", 10),
-        ("莫斯科 (UTC+3)", 3),
-        ("迪拜 (UTC+4)", 4),
-        ("柏林 (UTC+1)", 1),
-        ("巴黎 (UTC+1)", 1),
-        ("伦敦 (UTC+0)", 0),
-        ("纽约 (UTC-5)", -5),
-        ("芝加哥 (UTC-6)", -6),
-        ("丹佛 (UTC-7)", -7),
-        ("洛杉矶 (UTC-8)", -8),
-    ]
+
+def dt_zone(index):
+    """None 表示系统本地时区。"""
+    _, key, fallback = DT_ZONES[index]
+    if key is None:
+        return None
+    try:
+        return zoneinfo.ZoneInfo(key)
+    except Exception:
+        return datetime.timezone(datetime.timedelta(hours=fallback), key)
+
+
+def _dt_local_fixed():
+    return datetime.datetime.now().astimezone().tzinfo
+
+
+def dt_in_zone(dt, tz):
+    if tz is not None:
+        return dt.astimezone(tz)
+    try:
+        return dt.astimezone()
+    except (OSError, OverflowError, ValueError):
+        # Windows 的 localtime 不支持 1970 年之前，退回当前本地偏移
+        return dt.astimezone(_dt_local_fixed())
+
+
+def dt_localize(naive, tz):
+    if tz is not None:
+        return naive.replace(tzinfo=tz)
+    try:
+        return naive.astimezone()
+    except (OSError, OverflowError, ValueError):
+        return naive.replace(tzinfo=_dt_local_fixed())
+
+
+def dt_to_ns(aware):
+    delta = aware - DT_EPOCH
+    return (delta.days * 86400 + delta.seconds) * 10 ** 9 + delta.microseconds * 1000
+
+
+def dt_from_ns(ns):
+    try:
+        return DT_EPOCH + datetime.timedelta(microseconds=ns // 1000)
+    except OverflowError:
+        raise ValueError("超出可表示的时间范围（公元 1–9999 年）")
+
+
+def dt_parse(text, tz, unit_ns=None):
+    """解析时间戳或日期字符串，返回 (纳秒时间戳, 识别说明)。"""
+    s = text.strip()
+    if s.lower() in ("now", "现在", "当前"):
+        return time.time_ns(), "当前时间"
+    if re.fullmatch(r"[+-]?\d+(\.\d+)?", s):
+        if unit_ns is None and len(s) in (8, 14) and s[0] in "12":
+            fmt = "%Y%m%d" if len(s) == 8 else "%Y%m%d%H%M%S"
+            try:
+                naive = datetime.datetime.strptime(s, fmt)
+            except ValueError:
+                naive = None
+            if naive is not None and 1900 <= naive.year < 2200:
+                label = "yyyyMMdd" if len(s) == 8 else "yyyyMMddHHmmss"
+                return dt_to_ns(dt_localize(naive, tz)), f"日期 {label}（按时间戳解析请指定单位）"
+        value = decimal.Decimal(s)
+        name = None
+        if unit_ns is None:
+            mag = abs(value)
+            for limit, ns, unit_name in ((10 ** 11, 10 ** 9, "秒"), (10 ** 14, 10 ** 6, "毫秒"),
+                                         (10 ** 17, 10 ** 3, "微秒")):
+                if mag < limit:
+                    unit_ns, name = ns, unit_name
+                    break
+            else:
+                unit_ns, name = 1, "纳秒"
+        else:
+            name = next(n for n, u in DT_UNITS if u == unit_ns)
+        ns = int(value * unit_ns)
+        dt_from_ns(ns)
+        return ns, f"Unix 时间戳（{name}）"
+
+    dt, label = None, ""
+    iso = s[:-1] + "+00:00" if s[-1:] in ("Z", "z") else s
+    try:
+        dt = datetime.datetime.fromisoformat(iso)
+        label = "ISO 8601" if "T" in s.upper() else "日期时间"
+    except ValueError:
+        pass
+    if dt is None and re.search(r"[A-Za-z]{3}", s):
+        try:
+            dt = email.utils.parsedate_to_datetime(s)
+            label = "RFC 2822 / HTTP Date"
+        except (TypeError, ValueError, IndexError):
+            dt = None
+    if dt is None:
+        for fmt, fmt_label in DT_TEXT_FORMATS:
+            try:
+                dt = datetime.datetime.strptime(s, fmt)
+                label = fmt_label
+                break
+            except ValueError:
+                continue
+    if dt is None:
+        raise ValueError("无法识别，支持时间戳、ISO 8601、RFC 2822 及常见日期格式")
+    if dt.tzinfo is None:
+        dt = dt_localize(dt, tz)
+    else:
+        label += "（含时区）"
+    return dt_to_ns(dt), label
+
+
+def _dt_offset(dt, colon=True):
+    off = dt.utcoffset() or datetime.timedelta(0)
+    total = int(off.total_seconds())
+    sign = "+" if total >= 0 else "-"
+    h, m = divmod(abs(total) // 60, 60)
+    return f"{sign}{h:02d}:{m:02d}" if colon else f"{sign}{h:02d}{m:02d}"
+
+
+def dt_format(dt, pattern):
+    """按 Java/JS 常用的 yyyy-MM-dd HH:mm:ss.SSS 风格格式化（与系统语言无关）。"""
+    def rep(m):
+        t = m.group()
+        c, n = t[0], len(t)
+        if c == "'":
+            return t[1:-1] if n > 2 else "'"
+        if c == "y":
+            return f"{dt.year % 100:02d}" if n == 2 else f"{dt.year:0{n}d}"
+        if c == "M":
+            if n >= 4:
+                return _DT_MONTHS[dt.month - 1]
+            if n == 3:
+                return _DT_MONTHS[dt.month - 1][:3]
+            return f"{dt.month:0{n}d}"
+        if c == "d":
+            return f"{dt.day:0{n}d}"
+        if c == "H":
+            return f"{dt.hour:0{n}d}"
+        if c == "h":
+            return f"{dt.hour % 12 or 12:0{n}d}"
+        if c == "m":
+            return f"{dt.minute:0{n}d}"
+        if c == "s":
+            return f"{dt.second:0{n}d}"
+        if c == "S":
+            return f"{dt.microsecond:06d}"[:n].ljust(n, "0")
+        if c == "E":
+            return _DT_DAYS[dt.weekday()] if n >= 4 else _DT_DAYS[dt.weekday()][:3]
+        if c == "a":
+            return "AM" if dt.hour < 12 else "PM"
+        if c == "Z":
+            return _dt_offset(dt, colon=False)
+        if not dt.utcoffset():
+            return "Z"
+        return _dt_offset(dt)[:3] if n == 1 else _dt_offset(dt, colon=n >= 3)
+    return _DT_TOKEN_RE.sub(rep, pattern)
+
+
+def dt_relative(ns, now_ns=None):
+    diff = (ns - (time.time_ns() if now_ns is None else now_ns)) / 1e9
+    a = abs(diff)
+    if a < 1:
+        return "刚刚"
+    for unit_s, name in ((31536000, "年"), (2592000, "个月"), (86400, "天"),
+                         (3600, "小时"), (60, "分钟"), (1, "秒")):
+        if a >= unit_s:
+            return f"{int(a // unit_s)} {name}{'后' if diff > 0 else '前'}"
+
+
+def dt_workdays(d1, d2):
+    """[d1, d2) 内周一至周五的天数。"""
+    weeks, rem = divmod((d2 - d1).days, 7)
+    start = d1.weekday()
+    return weeks * 5 + sum(1 for i in range(rem) if (start + i) % 7 < 5)
+
+
+def dt_calendar_diff(d1, d2):
+    """d1 <= d2，返回自然的 (年, 月, 天)。"""
+    months = (d2.year - d1.year) * 12 + d2.month - d1.month
+    if d2.day < d1.day:
+        months -= 1
+    anchor = QDate(d1.year, d1.month, d1.day).addMonths(months)
+    days = anchor.daysTo(QDate(d2.year, d2.month, d2.day))
+    return months // 12, months % 12, days
+
+
+def _dt_zone_label(index, ref=None):
+    name = DT_ZONES[index][0]
+    dt = dt_in_zone(ref or datetime.datetime.now(datetime.timezone.utc), dt_zone(index))
+    return f"{name} (UTC{_dt_offset(dt)})"
+
+
+def _dt_mono():
+    return QFont("Consolas", 10) if platform.system() == "Windows" else QFont("Menlo", 13)
+
+
+class DateTimeWindow(QMainWindow):
+    """日期时间：时间戳转换、日期计算、时区转换。"""
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("日期时间计算器")
+        self.setWindowTitle("日期时间")
         self.setGeometry(*tool_win_geometry())
         self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
-        self.init_ui()
+        self._ns = None
+        self._clock = QTimer(self)
+        self._clock.timeout.connect(self._tick)
+        tabs = QTabWidget()
+        tabs.setStyleSheet(_tab_style())
+        tabs.addTab(self._build_convert_tab(), "时间戳转换")
+        tabs.addTab(self._build_calc_tab(), "日期计算")
+        tabs.addTab(self._build_zone_tab(), "时区转换")
+        container = QWidget()
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.addWidget(tabs)
+        self.setCentralWidget(container)
+        self.input_edit.setText(str(int(time.time())))
+        self._tick()
 
-    def init_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(15, 15, 15, 10)
-        layout.setSpacing(15)
+    # ---------- 通用 ----------
+    def _small_btn(self, text, slot, primary=False):
+        btn = QPushButton(text)
+        btn.setFixedHeight(26)
+        btn.setCursor(QCursor(Qt.PointingHandCursor))
+        btn.setStyleSheet(_primary_btn() if primary else _secondary_btn())
+        btn.clicked.connect(slot)
+        return btn
 
-        # 日期差计算
-        diff_group = QGroupBox("两个日期间的天数差")
-        diff_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #D0D0D0; border-radius: 6px; margin-top: 10px; padding-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
-        diff_layout = QVBoxLayout(diff_group)
-        diff_row = QHBoxLayout()
-        diff_row.addWidget(QLabel("开始:"))
-        self.date1 = QDateEdit()
-        self.date1.setCalendarPopup(True)
-        self.date1.setDate(QDate.currentDate())
-        self.date1.setDisplayFormat("yyyy-MM-dd")
-        self.date1.setStyleSheet(_lineedit_style())
-        diff_row.addWidget(self.date1)
-        diff_row.addWidget(QLabel("结束:"))
-        self.date2 = QDateEdit()
-        self.date2.setCalendarPopup(True)
-        self.date2.setDate(QDate.currentDate())
-        self.date2.setDisplayFormat("yyyy-MM-dd")
-        self.date2.setStyleSheet(_lineedit_style())
-        diff_row.addWidget(self.date2)
-        calc_diff_btn = QPushButton("计算")
-        calc_diff_btn.setFixedSize(60, 28)
-        calc_diff_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        calc_diff_btn.setStyleSheet(_primary_btn())
-        calc_diff_btn.clicked.connect(self.calc_diff)
-        diff_row.addWidget(calc_diff_btn)
-        diff_layout.addLayout(diff_row)
-        self.diff_result = QLabel("")
-        self.diff_result.setFont(QFont("PingFang SC", 13, QFont.Bold))
-        self.diff_result.setStyleSheet("color: #1A73E8; padding: 6px;")
-        diff_layout.addWidget(self.diff_result)
-        layout.addWidget(diff_group)
+    def _copy(self, btn, text):
+        if not text:
+            return
+        QApplication.clipboard().setText(text)
+        if btn is not None:
+            old = btn.text()
+            btn.setText("已复制")
+            QTimer.singleShot(900, lambda: btn.setText(old))
 
-        # 加减天数
-        add_group = QGroupBox("日期加减天数")
-        add_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #D0D0D0; border-radius: 6px; margin-top: 10px; padding-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
-        add_layout = QVBoxLayout(add_group)
-        add_row = QHBoxLayout()
-        add_row.addWidget(QLabel("基准日期:"))
-        self.base_date = QDateEdit()
-        self.base_date.setCalendarPopup(True)
-        self.base_date.setDate(QDate.currentDate())
-        self.base_date.setDisplayFormat("yyyy-MM-dd")
-        self.base_date.setStyleSheet(_lineedit_style())
-        add_row.addWidget(self.base_date)
-        add_row.addWidget(QLabel("天数:"))
-        self.days_spin = QSpinBox()
-        self.days_spin.setRange(-36500, 36500)
-        self.days_spin.setValue(30)
-        self.days_spin.setStyleSheet(_lineedit_style())
-        add_row.addWidget(self.days_spin)
-        calc_add_btn = QPushButton("计算")
-        calc_add_btn.setFixedSize(60, 28)
-        calc_add_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        calc_add_btn.setStyleSheet(_primary_btn())
-        calc_add_btn.clicked.connect(self.calc_add)
-        add_row.addWidget(calc_add_btn)
-        add_layout.addLayout(add_row)
-        self.add_result = QLabel("")
-        self.add_result.setFont(QFont("PingFang SC", 13, QFont.Bold))
-        self.add_result.setStyleSheet("color: #1A73E8; padding: 6px;")
-        add_layout.addWidget(self.add_result)
-        layout.addWidget(add_group)
+    def _value_field(self):
+        field = QLineEdit()
+        field.setReadOnly(True)
+        field.setFont(_dt_mono())
+        field.setStyleSheet("QLineEdit { border: 1px solid #E3E6EA; border-radius: 4px;"
+                            " padding: 3px 6px; background: #FAFBFC; color: #202124; }")
+        return field
 
-        # 时区转换
-        tz_group = QGroupBox("时区转换")
-        tz_group.setStyleSheet("QGroupBox { font-weight: bold; border: 1px solid #D0D0D0; border-radius: 6px; margin-top: 10px; padding-top: 10px; } QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }")
-        tz_layout = QVBoxLayout(tz_group)
-        tz_row = QHBoxLayout()
-        tz_row.addWidget(QLabel("时间:"))
-        self.time_input = QDateTimeEdit()
-        self.time_input.setCalendarPopup(True)
-        self.time_input.setDateTime(QDateTime.currentDateTime())
-        self.time_input.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
-        self.time_input.setStyleSheet(_lineedit_style())
-        tz_row.addWidget(self.time_input)
-        tz_row.addWidget(QLabel("从"))
-        self.tz_from = QComboBox()
-        for name, _ in self.TIMEZONES:
-            self.tz_from.addItem(name)
-        self.tz_from.setCurrentText("北京 (UTC+8)")
-        self.tz_from.setStyleSheet(_combo_style())
-        tz_row.addWidget(self.tz_from)
-        tz_row.addWidget(QLabel("到"))
-        self.tz_to = QComboBox()
-        for name, _ in self.TIMEZONES:
-            self.tz_to.addItem(name)
-        self.tz_to.setCurrentText("纽约 (UTC-5)")
-        self.tz_to.setStyleSheet(_combo_style())
-        tz_row.addWidget(self.tz_to)
-        calc_tz_btn = QPushButton("转换")
-        calc_tz_btn.setFixedSize(60, 28)
-        calc_tz_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        calc_tz_btn.setStyleSheet(_primary_btn())
-        calc_tz_btn.clicked.connect(self.calc_tz)
-        tz_row.addWidget(calc_tz_btn)
-        tz_layout.addLayout(tz_row)
-        self.tz_result = QLabel("")
-        self.tz_result.setFont(QFont("PingFang SC", 13, QFont.Bold))
-        self.tz_result.setStyleSheet("color: #1A73E8; padding: 6px;")
-        self.tz_result.setWordWrap(True)
-        tz_layout.addWidget(self.tz_result)
-        layout.addWidget(tz_group)
+    def _zone_combo(self, default_index=0):
+        combo = QComboBox()
+        for i in range(len(DT_ZONES)):
+            combo.addItem(_dt_zone_label(i))
+        combo.setCurrentIndex(default_index)
+        combo.setStyleSheet(_combo_style())
+        return combo
 
-        layout.addStretch()
+    def _dt_edit(self):
+        edit = QDateTimeEdit(QDateTime.currentDateTime())
+        edit.setCalendarPopup(True)
+        edit.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        edit.setStyleSheet("QDateTimeEdit { border: 1px solid #D0D0D0; border-radius: 4px;"
+                           " padding: 4px 6px; font-size: 13px; }")
+        return edit
 
-    def calc_diff(self):
-        d1 = self.date1.date()
-        d2 = self.date2.date()
-        days = d1.daysTo(d2)
-        self.diff_result.setText(f"相差 {abs(days)} 天" + ("（结束早于开始）" if days < 0 else ""))
+    @staticmethod
+    def _scroll_grid():
+        host = QWidget()
+        host.setObjectName("dtGrid")
+        host.setStyleSheet("#dtGrid { background: #FFFFFF; }")
+        grid = QGridLayout(host)
+        grid.setContentsMargins(0, 0, 6, 0)
+        grid.setAlignment(Qt.AlignTop)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: #FFFFFF; }")
+        scroll.setWidget(host)
+        return host, grid, scroll
 
-    def calc_add(self):
-        base = self.base_date.date()
-        days = self.days_spin.value()
-        result = base.addDays(days)
-        self.add_result.setText(f"结果：{result.toString('yyyy-MM-dd')}（{'+' if days >= 0 else ''}{days} 天）")
+    @staticmethod
+    def _section_title(text):
+        label = QLabel(text)
+        label.setStyleSheet("color: #5F6368; font-size: 12px; font-weight: bold;")
+        return label
 
-    def calc_tz(self):
-        dt = self.time_input.dateTime()
-        from_idx = self.tz_from.currentIndex()
-        to_idx = self.tz_to.currentIndex()
-        from_offset = self.TIMEZONES[from_idx][1]
-        to_offset = self.TIMEZONES[to_idx][1]
-        diff_hours = to_offset - from_offset
-        result_dt = dt.addSecs(diff_hours * 3600)
-        from_name = self.TIMEZONES[from_idx][0]
-        to_name = self.TIMEZONES[to_idx][0]
-        self.tz_result.setText(f"{from_name} {dt.toString('yyyy-MM-dd HH:mm:ss')}\n→ {to_name} {result_dt.toString('yyyy-MM-dd HH:mm:ss')}")
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._tick()
+        self._clock.start(1000)
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._clock.stop()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
             self.close()
 
+    # ---------- 时间戳转换 ----------
+    def _build_convert_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 8)
+        layout.setSpacing(8)
+
+        now_row = QHBoxLayout()
+        now_row.addWidget(self._section_title("当前"))
+        self.now_label = QLabel("")
+        self.now_label.setFont(_dt_mono())
+        self.now_label.setStyleSheet("color: #1A73E8;")
+        self.now_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        now_row.addWidget(self.now_label, 1)
+        self.copy_now_s = self._small_btn("复制秒", lambda: self._copy(self.copy_now_s, str(time.time_ns() // 10 ** 9)))
+        self.copy_now_ms = self._small_btn("复制毫秒", lambda: self._copy(self.copy_now_ms, str(time.time_ns() // 10 ** 6)))
+        now_row.addWidget(self.copy_now_s)
+        now_row.addWidget(self.copy_now_ms)
+        now_row.addWidget(self._small_btn("填入", lambda: self.input_edit.setText(str(int(time.time())))))
+        layout.addLayout(now_row)
+
+        in_row = QHBoxLayout()
+        self.input_edit = QLineEdit()
+        self.input_edit.setPlaceholderText("时间戳或日期，如 1731552000 / 1731552000123 / 2026-11-14 12:00:00 / 2026-11-14T04:00:00Z")
+        self.input_edit.setStyleSheet(_lineedit_style())
+        self.input_edit.setFont(_dt_mono())
+        self.input_edit.setClearButtonEnabled(True)
+        self.input_edit.textChanged.connect(self._convert)
+        in_row.addWidget(self.input_edit, 1)
+        self.unit_combo = QComboBox()
+        for name, _ in DT_UNITS:
+            self.unit_combo.addItem(name)
+        self.unit_combo.setStyleSheet(_combo_style())
+        self.unit_combo.setToolTip("时间戳单位：自动识别按数值大小判断秒 / 毫秒 / 微秒 / 纳秒")
+        self.unit_combo.currentIndexChanged.connect(self._convert)
+        in_row.addWidget(self.unit_combo)
+        self.zone_combo = self._zone_combo()
+        self.zone_combo.setToolTip("无时区的输入按此时区解析，结果也按此时区显示")
+        self.zone_combo.currentIndexChanged.connect(self._convert)
+        in_row.addWidget(self.zone_combo)
+        layout.addLayout(in_row)
+
+        self.hint_label = QLabel("")
+        self.hint_label.setStyleSheet("font-size: 12px;")
+        layout.addWidget(self.hint_label)
+
+        grid_host, grid, scroll = self._scroll_grid()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(5)
+        grid.setColumnStretch(1, 1)
+        self.out_fields = {}
+        rows = ["Unix 秒", "Unix 毫秒", "日期时间", "ISO 8601", "UTC", "自定义", "相对时间",
+                "日历", "RFC 2822", "HTTP Date", "Unix 微秒", "Unix 纳秒"]
+        for r, key in enumerate(rows):
+            if key == "自定义":
+                self.pattern_combo = QComboBox()
+                self.pattern_combo.setEditable(True)
+                self.pattern_combo.addItems(DT_PRESET_PATTERNS)
+                self.pattern_combo.setStyleSheet(_combo_style())
+                self.pattern_combo.setFixedWidth(150)
+                self.pattern_combo.setToolTip("yyyy 年 MM 月 dd 日 HH 时 mm 分 ss 秒 SSS 毫秒 "
+                                              "EEE 星期 a 上下午 Z/XXX 时区，'文字' 原样输出")
+                self.pattern_combo.currentTextChanged.connect(self._convert)
+                grid.addWidget(self.pattern_combo, r, 0)
+            else:
+                label = QLabel(key)
+                label.setStyleSheet("color: #5F6368; font-size: 12px;")
+                grid.addWidget(label, r, 0)
+            field = self._value_field()
+            grid.addWidget(field, r, 1)
+            btn = QPushButton("复制")
+            btn.setFixedSize(52, 24)
+            btn.setCursor(QCursor(Qt.PointingHandCursor))
+            btn.setStyleSheet(_secondary_btn())
+            btn.clicked.connect(lambda _=False, f=field, b=btn: self._copy(b, f.text()))
+            grid.addWidget(btn, r, 2)
+            self.out_fields[key] = field
+        layout.addWidget(scroll, 1)
+        return page
+
+    def _tick(self):
+        ns = time.time_ns()
+        local = dt_in_zone(dt_from_ns(ns), dt_zone(self.zone_combo.currentIndex()))
+        self.now_label.setText(f"{ns // 10 ** 9}   {ns // 10 ** 6}   {dt_format(local, 'yyyy-MM-dd HH:mm:ss')}")
+        if self._ns is not None:
+            self.out_fields["相对时间"].setText(dt_relative(self._ns, ns))
+
+    def _convert(self):
+        text = self.input_edit.text().strip()
+        tz = dt_zone(self.zone_combo.currentIndex())
+        if not text:
+            self._show_result(None, "", tz)
+            return
+        try:
+            ns, label = dt_parse(text, tz, DT_UNITS[self.unit_combo.currentIndex()][1])
+            self._show_result(ns, label, tz)
+        except (ValueError, ArithmeticError) as e:
+            self._show_result(None, str(e) or "无法识别", tz, error=True)
+
+    def _show_result(self, ns, label, tz, error=False):
+        self._ns = ns
+        color = "#D93025" if error else "#188038"
+        self.hint_label.setStyleSheet(f"color: {color}; font-size: 12px;")
+        self.hint_label.setText(("✗ " if error else "✓ 识别为 ") + label if label else "")
+        if ns is None:
+            for field in self.out_fields.values():
+                field.clear()
+            return
+        utc = dt_from_ns(ns)
+        local = dt_in_zone(utc, tz)
+        iso_frac = "" if ns % 10 ** 9 == 0 else ".SSS"
+        year = local.year
+        leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+        iso_year, iso_week, _ = local.isocalendar()
+        try:
+            rfc = email.utils.format_datetime(local)
+            http = email.utils.format_datetime(utc, usegmt=True)
+        except (ValueError, OverflowError):
+            rfc = http = ""
+        values = {
+            "Unix 秒": str(ns // 10 ** 9),
+            "Unix 毫秒": str(ns // 10 ** 6),
+            "Unix 微秒": str(ns // 10 ** 3),
+            "Unix 纳秒": str(ns),
+            "日期时间": dt_format(local, "yyyy-MM-dd HH:mm:ss" + iso_frac),
+            "ISO 8601": dt_format(local, f"yyyy-MM-dd'T'HH:mm:ss{iso_frac}XXX"),
+            "UTC": dt_format(utc, f"yyyy-MM-dd'T'HH:mm:ss{iso_frac}'Z'"),
+            "RFC 2822": rfc,
+            "HTTP Date": http,
+            "自定义": dt_format(local, self.pattern_combo.currentText()),
+            "相对时间": dt_relative(ns),
+            "日历": (f"星期{DT_WEEKDAYS[local.weekday()]} · 第 {local.timetuple().tm_yday} 天"
+                     f" · ISO {iso_year}-W{iso_week:02d} · 第 {(local.month - 1) // 3 + 1} 季度"
+                     f" · {'闰年' if leap else '平年'}"),
+        }
+        for key, value in values.items():
+            self.out_fields[key].setText(value)
+            self.out_fields[key].setCursorPosition(0)
+
+    # ---------- 日期计算 ----------
+    def _build_calc_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 8)
+        layout.setSpacing(8)
+
+        layout.addWidget(self._section_title("时间间隔"))
+        row = QHBoxLayout()
+        self.span_start = self._dt_edit()
+        self.span_end = self._dt_edit()
+        self.span_end.setDateTime(QDateTime.currentDateTime().addDays(30))
+        row.addWidget(QLabel("从"))
+        row.addWidget(self.span_start, 1)
+        row.addWidget(self._small_btn("⇄", self._swap_span))
+        row.addWidget(QLabel("到"))
+        row.addWidget(self.span_end, 1)
+        row.addWidget(self._small_btn("现在", lambda: self.span_start.setDateTime(QDateTime.currentDateTime())))
+        layout.addLayout(row)
+        self.span_result = QLabel("")
+        self.span_result.setFont(ui_font(14, 16, bold=True))
+        self.span_result.setStyleSheet("color: #1A73E8;")
+        self.span_result.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.span_result)
+        self.span_detail = QLabel("")
+        self.span_detail.setStyleSheet("color: #5F6368; font-size: 12px;")
+        self.span_detail.setWordWrap(True)
+        self.span_detail.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.span_detail)
+        self.span_start.dateTimeChanged.connect(self._calc_span)
+        self.span_end.dateTimeChanged.connect(self._calc_span)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color: #E0E0E0;")
+        layout.addWidget(sep)
+
+        layout.addWidget(self._section_title("时间加减"))
+        row2 = QHBoxLayout()
+        self.shift_base = self._dt_edit()
+        row2.addWidget(self.shift_base, 1)
+        row2.addWidget(self._small_btn("现在", lambda: self.shift_base.setDateTime(QDateTime.currentDateTime())))
+        self.shift_amount = QSpinBox()
+        self.shift_amount.setRange(-999999, 999999)
+        self.shift_amount.setValue(7)
+        self.shift_amount.setPrefix("+ ")
+        self.shift_amount.setFixedWidth(110)
+        self.shift_amount.setStyleSheet("QSpinBox { border: 1px solid #D0D0D0; border-radius: 4px;"
+                                        " padding: 4px 6px; font-size: 13px; }")
+        self.shift_amount.valueChanged.connect(
+            lambda v: self.shift_amount.setPrefix("+ " if v >= 0 else ""))
+        row2.addWidget(self.shift_amount)
+        self.shift_unit = QComboBox()
+        self.shift_unit.addItems(["秒", "分钟", "小时", "天", "周", "月", "年"])
+        self.shift_unit.setCurrentText("天")
+        self.shift_unit.setStyleSheet(_combo_style())
+        row2.addWidget(self.shift_unit)
+        layout.addLayout(row2)
+        res_row = QHBoxLayout()
+        self.shift_result = self._value_field()
+        res_row.addWidget(self.shift_result, 1)
+        self.shift_copy = self._small_btn("复制", lambda: self._copy(self.shift_copy, self.shift_result.text()))
+        res_row.addWidget(self.shift_copy)
+        layout.addLayout(res_row)
+        self.shift_detail = QLabel("")
+        self.shift_detail.setStyleSheet("color: #5F6368; font-size: 12px;")
+        self.shift_detail.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.shift_detail)
+        self.shift_base.dateTimeChanged.connect(self._calc_shift)
+        self.shift_amount.valueChanged.connect(self._calc_shift)
+        self.shift_unit.currentIndexChanged.connect(self._calc_shift)
+        layout.addStretch()
+
+        self._calc_span()
+        self._calc_shift()
+        return page
+
+    def _swap_span(self):
+        a, b = self.span_start.dateTime(), self.span_end.dateTime()
+        self.span_start.setDateTime(b)
+        self.span_end.setDateTime(a)
+
+    def _calc_span(self):
+        start = self.span_start.dateTime().toPyDateTime().replace(microsecond=0)
+        end = self.span_end.dateTime().toPyDateTime().replace(microsecond=0)
+        total = int((end - start).total_seconds())
+        lo, hi = (start, end) if total >= 0 else (end, start)
+        secs = abs(total)
+        d, rest = divmod(secs, 86400)
+        h, rest = divmod(rest, 3600)
+        m, s = divmod(rest, 60)
+        parts = [f"{v} {u}" for v, u in ((d, "天"), (h, "小时"), (m, "分"), (s, "秒")) if v]
+        text = "相差 " + (" ".join(parts) if parts else "0 秒")
+        if total < 0:
+            text += "（结束早于开始）"
+        self.span_result.setText(text)
+        y, mo, dd = dt_calendar_diff(lo.date(), hi.date())
+        cal = " ".join(f"{v} {u}" for v, u in ((y, "年"), (mo, "个月"), (dd, "天")) if v) or "0 天"
+        self.span_detail.setText(
+            f"按日历：{cal}  ·  共 {secs / 86400:,.2f} 天 / {secs / 3600:,.2f} 小时 / "
+            f"{secs // 60:,} 分钟 / {secs:,} 秒  ·  {secs / 604800:,.2f} 周  ·  "
+            f"工作日（周一至周五）{dt_workdays(lo.date(), hi.date())} 天")
+
+    def _calc_shift(self):
+        base = self.shift_base.dateTime()
+        n = self.shift_amount.value()
+        unit = self.shift_unit.currentText()
+        if unit == "月":
+            result = base.addMonths(n)
+        elif unit == "年":
+            result = base.addYears(n)
+        elif unit in ("天", "周"):
+            result = base.addDays(n * (7 if unit == "周" else 1))
+        else:
+            result = base.addSecs(n * {"秒": 1, "分钟": 60, "小时": 3600}[unit])
+        if not result.isValid():
+            self.shift_result.setText("超出范围")
+            self.shift_detail.setText("")
+            return
+        py = result.toPyDateTime()
+        self.shift_result.setText(result.toString("yyyy-MM-dd HH:mm:ss"))
+        ts = result.toSecsSinceEpoch()
+        self.shift_detail.setText(f"星期{DT_WEEKDAYS[py.weekday()]}  ·  Unix 秒 {ts}  ·  毫秒 {ts * 1000}"
+                                  f"  ·  {dt_relative(ts * 10 ** 9)}")
+
+    # ---------- 时区转换 ----------
+    def _build_zone_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 8)
+        layout.setSpacing(8)
+
+        row = QHBoxLayout()
+        self.zone_time = self._dt_edit()
+        row.addWidget(self.zone_time, 1)
+        row.addWidget(self._small_btn("现在", lambda: self.zone_time.setDateTime(QDateTime.currentDateTime())))
+        row.addWidget(QLabel("所在时区"))
+        self.zone_src = self._zone_combo(2)
+        row.addWidget(self.zone_src)
+        layout.addLayout(row)
+        note = QLabel("按真实时区规则换算，自动处理夏令时；“+1 天”表示与源时区不在同一天")
+        note.setStyleSheet("color: #9AA0A6; font-size: 11px;")
+        layout.addWidget(note)
+
+        grid_host, grid, scroll = self._scroll_grid()
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(4)
+        grid.setColumnStretch(4, 1)
+        self.zone_rows = []
+        for i, (name, _, _) in enumerate(DT_ZONES):
+            cells = [QLabel(name), QLabel(""), QLabel(""), QLabel("")]
+            for c, cell in enumerate(cells):
+                cell.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                if c in (1, 2):
+                    cell.setFont(_dt_mono())
+                grid.addWidget(cell, i, c)
+            self.zone_rows.append(cells)
+        layout.addWidget(scroll, 1)
+
+        self.zone_time.dateTimeChanged.connect(self._calc_zones)
+        self.zone_src.currentIndexChanged.connect(self._calc_zones)
+        self._calc_zones()
+        return page
+
+    def _calc_zones(self):
+        src_index = self.zone_src.currentIndex()
+        naive = self.zone_time.dateTime().toPyDateTime().replace(microsecond=0)
+        src = dt_localize(naive, dt_zone(src_index))
+        for i, cells in enumerate(self.zone_rows):
+            dt = dt_in_zone(src, dt_zone(i))
+            day_diff = (dt.date() - src.date()).days
+            cells[1].setText(dt_format(dt, "yyyy-MM-dd HH:mm:ss") + f"  周{DT_WEEKDAYS[dt.weekday()]}")
+            cells[2].setText("UTC" + _dt_offset(dt))
+            cells[3].setText(f"{day_diff:+d} 天" if day_diff else "")
+            style = "color: #1A73E8; font-weight: bold;" if i == src_index else "color: #202124;"
+            for cell in cells[:3]:
+                cell.setStyleSheet(style)
+            cells[3].setStyleSheet("color: #E37400; font-size: 12px;")
+
 
 # 首页按钮的悬停说明：直接列出工具内部的页签或主要功能，省得一个个点开找。
 TOOL_TIPS = {
+    "网络诊断": "页签：Ping 测试 / 路由追踪 / DNS 查询 / 端口扫描 / 网络测速 · 目标地址跨页签同步",
     "进程管理": "功能：进程列表 · 按名称/PID/窗口标题搜索 · 按端口过滤 · 结束进程",
-    "端口扫描": "功能：指定目标与端口范围 · 并发扫描开放端口",
-    "Ping 测试": "功能：测试主机连通性与往返延迟",
-    "DNS 查询": "功能：查询域名的解析记录",
-    "路由追踪": "功能：逐跳查看数据包到达目标的路径",
-    "网络测速": "功能：下载速度测试",
     "配置": "页签：环境变量 / 进程内变量 / Git 配置 / 镜像源 / SSH 密钥 / SSH 主机 / 显示开关",
-    "JSON/XML": "页签：JSON / XML",
+    "数据格式": "页签：JSON / XML / JSON ↔ YAML · 格式化 · 校验 · 转换",
     "编解码": "页签：Base64 / URL / Unicode 转义",
     "加解密": "页签：JWT / AES / RSA / HMAC / 口令哈希 / 随机密钥",
     "正则测试": "功能：常用正则预设 · 实时匹配与高亮",
-    "二维码": "功能：输入文字或链接生成二维码 · 支持保存为 PNG",
-    "条形码": "功能：输入文本生成 Code 128 条形码",
-    "UUID": "功能：生成 UUID v1 / v4 · 支持批量生成",
-    "格式转换": "页签：颜色 / 时间戳 / JSON-YAML",
+    "生成器": "页签：二维码 / 条形码 / UUID / 随机数",
     "颜色": "功能：颜色选择器 · HEX / RGB / HSL 互转",
-    "屏幕取色": "功能：全屏放大镜取色 · C 复制并退出 · X 切换 HEX/RGB · 左键/ESC 退出",
-    "JSON-YAML": "功能：JSON 与 YAML 格式互转",
-    "文本统计": "功能：字符数 / 行数 / 词数 / 字节数 / 中文字数",
-    "文本对比": "功能：逐行 diff · 忽略空白 / 大小写 · 只看差异 · 复制 diff",
+    "取色器": "功能：屏幕取色 · 全屏放大镜 · C 复制并退出 · X 切换 HEX/RGB · 左键/ESC 退出",
+    "截图贴图": "功能：区域截屏 · OCR 文字识别 · 本地识别 · 旁窗查看文字 · 选中复制 · 像素放大镜 · HEX / RGB 取色 · 复制颜色 · 调整选区 · 矩形 / 箭头 / 画笔 / 文字标注 · 截图自动复制 · 自定义截屏 · 剪贴板贴图 · 桌面置顶 · 缩放 / 透明度 · 隐藏显示全部贴图",
+    "文本工具": "页签：处理与统计（排序 · 去重 · uniq -c · 命名风格 · 合并拆分 · SQL IN · 选区实时统计 · 编码字节 · 不可见字符）/ 文本对比（行内高亮 · 忽略空白/大小写 · 差异跳转 · unified diff）",
     "Cron 表达式": "页签：执行计划 / 书写规范",
     "哈希计算": "页签：文本哈希 / 文件哈希（MD5 / SHA1 / SHA256 / SHA512）",
-    "命令速查": "分类：全部 / Docker / Linux / SSH / Vim / Windows / Git",
-    "HTTP 状态码": "功能：按代码或关键词搜索 HTTP 状态码，显示含义和常见场景",
+    "开发速查": "分类：Docker / Linux / SSH / Vim / Windows / Git 命令速查 / HTTP 状态码 · 统一搜索 · 点击复制",
     "chmod 权限": "功能：八进制 ↔ 符号表示互转，可视化 9 个权限位",
-    "日期时间": "功能：日期差计算、加减天数、时区转换",
-    "打卡提醒": "功能：定时弹框提醒（上班/下班打卡）· 工作日/每天/仅当天 · 稍后再提醒 · 提示音",
+    "日期时间": "页签：时间戳转换（秒/毫秒/微秒/纳秒自动识别 · ISO 8601 / RFC 2822 / 自定义格式）/ 日期计算（间隔 · 工作日 · 加减）/ 时区转换（夏令时）",
+    "提醒事项": "功能：定时弹框提醒（如上下班打卡）· 每天/工作日/仅一次 · 稍后再提醒 · 提示音",
     "房贷计算器": "功能：等额本息 / 等额本金",
     "图片处理": "页签：转 Base64 / 格式转换 / 缩放压缩",
     "文字雨": "功能：桌面字符雨特效，开启时自动防黑屏（开关）",
     "防黑屏": "功能：阻止系统休眠与屏幕关闭（开关）",
-    "进制转换": "格式：十进制 / 二进制 / 八进制 / 十六进制",
+    "数字转换": "页签：进制转换（二进制 / 八进制 / 十进制 / 十六进制）/ 罗马数字 / 金额大写",
     "商余计算": "功能：求整除的商和余数",
     "单位转换": "页签：字节 / 时间 / 长度 / 重量 / 面积 / 体积 / 速度 / 温度",
-    "随机数": "功能：范围内批量生成随机整数 · 可重复",
-    "金额大写": "功能：数字金额转人民币中文大写",
-    "罗马数字": "功能：阿拉伯数字 ↔ 罗马数字",
 }
 
 # 拼音搜索映射：支持输入拼音匹配工具（不增加依赖的轻量方案）
 PINYIN_MAP = {
     "jincheng": ["进程管理"],
-    "duankou": ["端口扫描"],
-    "ping": ["Ping 测试"],
-    "dns": ["DNS 查询"],
-    "luyou": ["路由追踪"],
-    "wangluo": ["网络测速"],
-    "cesu": ["网络测速"],
+    "duankou": ["网络诊断"],
+    "ping": ["网络诊断"],
+    "dns": ["网络诊断"],
+    "luyou": ["网络诊断"],
+    "wangluo": ["网络诊断"],
+    "zhenduan": ["网络诊断"],
+    "cesu": ["网络诊断"],
     "peizhi": ["配置"],
     "huanjing": ["配置"],
     "bianma": ["编解码"],
@@ -9839,42 +11787,64 @@ PINYIN_MAP = {
     "hmac": ["加解密"],
     "zhengze": ["正则测试"],
     "regex": ["正则测试"],
-    "erweima": ["二维码"],
-    "tiaoxingma": ["条形码"],
-    "uuid": ["UUID"],
-    "geshi": ["格式转换"],
+    "shengcheng": ["生成器"],
+    "erweima": ["生成器"],
+    "tiaoxingma": ["生成器"],
+    "uuid": ["生成器"],
+    "geshi": ["数据格式"],
+    "shuju": ["数据格式"],
     "yanse": ["颜色"],
-    "quse": ["屏幕取色"],
-    "pingmu": ["屏幕取色"],
-    "shijianchuo": ["格式转换"],
-    "json": ["JSON/XML", "格式转换"],
-    "xml": ["JSON/XML"],
-    "tongji": ["文本统计"],
-    "duibi": ["文本对比"],
-    "diff": ["文本对比"],
+    "quse": ["取色器", "截图贴图"],
+    "quseqi": ["取色器", "截图贴图"],
+    "fangdajing": ["取色器", "截图贴图"],
+    "xiangsu": ["截图贴图"],
+    "wenzishibie": ["截图贴图"],
+    "shibie": ["截图贴图"],
+    "pingmu": ["取色器", "截图贴图"],
+    "jietu": ["截图贴图"],
+    "jieping": ["截图贴图"],
+    "tietu": ["截图贴图"],
+    "jietutietu": ["截图贴图"],
+    "shijianchuo": ["日期时间"],
+    "timestamp": ["日期时间"],
+    "unix": ["日期时间"],
+    "json": ["数据格式"],
+    "xml": ["数据格式"],
+    "yaml": ["数据格式"],
+    "wenben": ["文本工具"],
+    "tongji": ["文本工具"],
+    "duibi": ["文本工具"],
+    "diff": ["文本工具"],
+    "paixu": ["文本工具"],
+    "quchong": ["文本工具"],
+    "zishu": ["文本工具"],
     "cron": ["Cron 表达式"],
     "hash": ["哈希计算"],
     "md5": ["哈希计算"],
     "sha": ["哈希计算"],
-    "mingling": ["命令速查"],
-    "docker": ["命令速查"],
-    "linux": ["命令速查"],
-    "ssh": ["命令速查"],
-    "vim": ["命令速查"],
-    "windows": ["命令速查"],
-    "git": ["命令速查", "配置"],
-    "http": ["HTTP 状态码"],
-    "zhuangtai": ["HTTP 状态码"],
+    "mingling": ["开发速查"],
+    "kaifa": ["开发速查"],
+    "sucha": ["开发速查"],
+    "docker": ["开发速查"],
+    "linux": ["开发速查"],
+    "ssh": ["开发速查", "配置"],
+    "vim": ["开发速查"],
+    "windows": ["开发速查"],
+    "git": ["开发速查", "配置"],
+    "http": ["开发速查"],
+    "zhuangtai": ["开发速查"],
     "chmod": ["chmod 权限"],
     "quanxian": ["chmod 权限"],
     "riqi": ["日期时间"],
-    "shijian": ["日期时间", "格式转换"],
+    "shijian": ["日期时间"],
     "shiqu": ["日期时间"],
     "shizhong": ["日期时间"],
-    "daka": ["打卡提醒"],
-    "tixing": ["打卡提醒"],
-    "shangban": ["打卡提醒"],
-    "xiaban": ["打卡提醒"],
+    "tixing": ["提醒事项"],
+    "tixingshixiang": ["提醒事项"],
+    "shixiang": ["提醒事项"],
+    "daka": ["提醒事项"],
+    "shangban": ["提醒事项"],
+    "xiaban": ["提醒事项"],
     "fangdai": ["房贷计算器"],
     "tupian": ["图片处理"],
     "wenziyu": ["文字雨"],
@@ -9882,27 +11852,30 @@ PINYIN_MAP = {
     "fangheiping": ["防黑屏"],
     "heiping": ["防黑屏"],
     "xiuxi": ["防黑屏"],
-    "jinzhi": ["进制转换"],
+    "jinzhi": ["数字转换"],
+    "shuzi": ["数字转换"],
     "eryuan": ["商余计算"],
     "shangyu": ["商余计算"],
     "danwei": ["单位转换"],
     "wendu": ["单位转换"],
     "changdu": ["单位转换"],
     "zhongliang": ["单位转换"],
-    "suijishu": ["随机数"],
-    "suiji": ["随机数"],
-    "jine": ["金额大写"],
-    "daxie": ["金额大写"],
-    "renminbi": ["金额大写"],
-    "luoma": ["罗马数字"],
+    "suijishu": ["生成器"],
+    "suiji": ["生成器"],
+    "jine": ["数字转换"],
+    "daxie": ["数字转换"],
+    "renminbi": ["数字转换"],
+    "luoma": ["数字转换"],
 }
 
 
-# ---- 打卡提醒 -------------------------------------------------------------
+# ---- 提醒事项 -------------------------------------------------------------
 REMINDERS_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "reminders.json")
 REPEAT_DAILY = "每天"
 REPEAT_WEEKDAY = "工作日"
-REPEAT_ONCE = "仅当天"
+REPEAT_ONCE = "仅一次"
+REPEAT_CHOICES = (REPEAT_DAILY, REPEAT_WEEKDAY, REPEAT_ONCE)
+WEEKDAY_NAMES = ("", "周一", "周二", "周三", "周四", "周五", "周六", "周日")
 SNOOZE_MINUTES = 10
 # 错过太久就不再弹，避免开机时把昨天的提醒一次性补出来；只登记为已触发。
 MISSED_QUIET_SECONDS = 3 * 3600
@@ -9930,6 +11903,11 @@ def load_reminders():
     rules = data.get("rules") if isinstance(data, dict) else None
     clean = [r for r in (rules or [])
              if isinstance(r, dict) and r.get("name") and _hhmm_valid(r.get("time"))]
+    for rule in clean:
+        if rule.get("repeat") == "仅当天":
+            rule["repeat"] = REPEAT_ONCE
+        elif rule.get("repeat") not in REPEAT_CHOICES:
+            rule["repeat"] = REPEAT_DAILY
     sound = data.get("sound", True) if isinstance(data, dict) else True
     return {"rules": clean, "sound": bool(sound)}
 
@@ -9997,6 +11975,14 @@ def next_reminder(rules, now):
         if when and (best_when is None or when < best_when):
             best_when, best_name = when, rule.get("name", "")
     return best_name, best_when
+
+
+def reminder_when_text(when, now):
+    days = now.date().daysTo(when.date())
+    day = {0: "今天", 1: "明天", 2: "后天"}.get(days)
+    if day is None:
+        day = "%s %s" % (when.toString("MM-dd"), WEEKDAY_NAMES[when.date().dayOfWeek()])
+    return "%s %s" % (day, when.toString("HH:mm"))
 
 
 def play_alert_sound():
@@ -10085,7 +12071,7 @@ def set_autostart(enable):
 
 
 class ReminderCard(QWidget):
-    """屏幕正中的置顶打卡卡片。
+    """屏幕正中的置顶提醒卡片。
 
     外层窗口透明，只为阴影留出空间；白底圆角画在内层 body 上。裸 QWidget 不加
     WA_StyledBackground 时样式表的 background 不会被绘制，整张卡片就是透明的。
@@ -10146,7 +12132,7 @@ class ReminderCard(QWidget):
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
-        done_btn = QPushButton("已打卡")
+        done_btn = QPushButton("完成")
         done_btn.setFixedSize(110, 34)
         done_btn.setCursor(QCursor(Qt.PointingHandCursor))
         done_btn.setStyleSheet(_primary_btn() + "QPushButton { font-size: 13px; }")
@@ -10204,10 +12190,13 @@ class ReminderCard(QWidget):
 class ReminderEngine(QObject):
     """20 秒轮询一次：到点弹框，顺带覆盖睡眠唤醒后错过的提醒。"""
 
+    changed = pyqtSignal()
+
     def __init__(self, state, parent=None):
         super().__init__(parent)
         self.state = state
         self.card = None
+        self.card_rule = None
         self.snoozes = []
         self._timer = QTimer(self)
         self._timer.setInterval(20000)
@@ -10217,6 +12206,18 @@ class ReminderEngine(QObject):
 
     def rules(self):
         return self.state["rules"]
+
+    def forget(self, rule):
+        # 稍后再提醒的队列持有规则对象本身，删除或停用规则时必须一起清掉，否则仍会再弹
+        self.snoozes = [s for s in self.snoozes if s[1] is not rule]
+        if self.card is not None and self.card_rule is rule:
+            self.card.close()
+
+    def remove_rule(self, rule):
+        self.forget(rule)
+        self.state["rules"] = [r for r in self.rules() if r is not rule]
+        save_reminders(self.state)
+        self.changed.emit()
 
     def tick(self):
         if self.card is not None:
@@ -10242,15 +12243,17 @@ class ReminderEngine(QObject):
                 continue
             elapsed = occ.secsTo(now)
             if elapsed > MISSED_QUIET_SECONDS:
-                # 太久以前：不打扰，也不写"上次触发"；仅当天规则顺手停用，避免悬着
+                # 太久以前：不打扰，也不写"上次触发"；仅一次的规则顺手停用，避免悬着
                 if rule.get("repeat") == REPEAT_ONCE:
                     rule["enabled"] = False
                     save_reminders(self.state)
+                    self.changed.emit()
                 continue
             rule["last_fired"] = key
             if rule.get("repeat") == REPEAT_ONCE:
                 rule["enabled"] = False
             save_reminders(self.state)
+            self.changed.emit()
             self._popup(rule, key, now, missed=elapsed > 120)
             return
 
@@ -10262,6 +12265,7 @@ class ReminderEngine(QObject):
         elif again:
             note = "上次提醒后你选择了稍后再提醒"
         self.card = ReminderCard(rule.get("name", "提醒"), subtitle, note)
+        self.card_rule = rule
         self.card.snoozed.connect(lambda: self._add_snooze(rule, key))
         self.card.dismissed.connect(self._clear_card)
         if self.state.get("sound", True):
@@ -10276,6 +12280,7 @@ class ReminderEngine(QObject):
         if self.card is not None:
             self.card.deleteLater()
             self.card = None
+            self.card_rule = None
 
 
 class _EventHotKeyID(ctypes.Structure):
@@ -10289,31 +12294,178 @@ class _EventTypeSpec(ctypes.Structure):
 _CARBON_HANDLER = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
 
 
-class GlobalHotkey(QObject):
-    """全局热键快速开关文字雨：Windows=Win+O，macOS=Control+Option+O。"""
+SHORTCUT_ACTIONS = {"rain": "文字雨", "picker": "取色器", "capture": "截屏",
+                    "capture_copy": "截屏并自动复制", "custom_capture": "自定义截屏",
+                    "paste_image": "贴图", "toggle_pins": "隐藏 / 显示所有贴图"}
 
-    triggered = pyqtSignal()
+
+def default_shortcuts():
+    modifier = "Meta+Alt+" if platform.system() == "Darwin" else "Ctrl+Alt+"
+    return {"rain": modifier + "O", "picker": modifier + "C", "capture": modifier + "S",
+            "capture_copy": modifier + "Shift+S", "custom_capture": modifier + "A",
+            "paste_image": modifier + "V", "toggle_pins": modifier + "H"}
+
+
+def shortcut_native(sequence, system=None):
+    system = system or platform.system()
+    seq = QKeySequence(sequence, QKeySequence.PortableText)
+    if seq.count() != 1:
+        raise ValueError("请设置单组快捷键，不支持连续多组按键")
+    chord = seq[0]
+    mods = chord & int(Qt.KeyboardModifierMask)
+    key = chord & ~int(Qt.KeyboardModifierMask)
+    allowed = int(Qt.ControlModifier | Qt.AltModifier | Qt.ShiftModifier | Qt.MetaModifier)
+    if mods & ~allowed or (not mods and not Qt.Key_F1 <= key <= Qt.Key_F12):
+        raise ValueError("F1～F12 可单独使用，其他按键请搭配修饰键（Ctrl、Alt、Shift 或 Win / Command）")
+    if system == "Windows":
+        keys = {Qt.Key_Space: 0x20, Qt.Key_Return: 0x0D, Qt.Key_Tab: 0x09,
+                Qt.Key_Backspace: 0x08, Qt.Key_Delete: 0x2E, Qt.Key_Insert: 0x2D,
+                Qt.Key_Home: 0x24, Qt.Key_End: 0x23, Qt.Key_PageUp: 0x21,
+                Qt.Key_PageDown: 0x22, Qt.Key_Left: 0x25, Qt.Key_Up: 0x26,
+                Qt.Key_Right: 0x27, Qt.Key_Down: 0x28}
+        keys.update({k: k for k in range(Qt.Key_A, Qt.Key_Z + 1)})
+        keys.update({k: k for k in range(Qt.Key_0, Qt.Key_9 + 1)})
+        keys.update({Qt.Key_F1 + i: 0x70 + i for i in range(12)})
+        flags = ((0x02 if mods & Qt.ControlModifier else 0) |
+                 (0x01 if mods & Qt.AltModifier else 0) |
+                 (0x04 if mods & Qt.ShiftModifier else 0) |
+                 (0x08 if mods & Qt.MetaModifier else 0))
+    elif system == "Darwin":
+        letters = [0, 11, 8, 2, 14, 3, 5, 4, 34, 38, 40, 37, 46,
+                   45, 31, 35, 12, 15, 1, 17, 32, 9, 13, 7, 16, 6]
+        digits = [29, 18, 19, 20, 21, 23, 22, 26, 28, 25]
+        functions = [122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111]
+        keys = {Qt.Key_Space: 49, Qt.Key_Return: 36, Qt.Key_Tab: 48,
+                Qt.Key_Backspace: 51, Qt.Key_Delete: 117, Qt.Key_Home: 115,
+                Qt.Key_End: 119, Qt.Key_PageUp: 116, Qt.Key_PageDown: 121,
+                Qt.Key_Left: 123, Qt.Key_Up: 126, Qt.Key_Right: 124, Qt.Key_Down: 125}
+        keys.update({Qt.Key_A + i: k for i, k in enumerate(letters)})
+        keys.update({Qt.Key_0 + i: k for i, k in enumerate(digits)})
+        keys.update({Qt.Key_F1 + i: k for i, k in enumerate(functions)})
+        # Qt 在 macOS 上把 Control 映射为 Command、Meta 映射为物理 Control。
+        flags = ((0x0100 if mods & Qt.ControlModifier else 0) |
+                 (0x0800 if mods & Qt.AltModifier else 0) |
+                 (0x0200 if mods & Qt.ShiftModifier else 0) |
+                 (0x1000 if mods & Qt.MetaModifier else 0))
+    else:
+        raise ValueError("当前系统暂不支持全局快捷键")
+    if key not in keys:
+        raise ValueError("支持字母、数字、F1–F12、空格、回车及方向 / 编辑键")
+    return flags, keys[key]
+
+
+def load_shortcuts():
+    result = default_shortcuts()
+    try:
+        with open(SHORTCUTS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        saved = data.get(platform.system(), {}) if isinstance(data, dict) else {}
+        for action in result:
+            value = saved.get(action) if isinstance(saved, dict) else None
+            if isinstance(value, str):
+                try:
+                    if value:
+                        shortcut_native(value)
+                    result[action] = value
+                except ValueError:
+                    continue
+    except (OSError, ValueError):
+        pass
+    return result
+
+
+def save_shortcuts(bindings):
+    try:
+        with open(SHORTCUTS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data[platform.system()] = bindings
+    os.makedirs(os.path.dirname(SHORTCUTS_PATH), exist_ok=True)
+    temporary = SHORTCUTS_PATH + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(temporary, SHORTCUTS_PATH)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+
+
+class _WindowsHotkeyFilter(QAbstractNativeEventFilter):
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+
+    def nativeEventFilter(self, event_type, message):
+        from ctypes import wintypes
+        if event_type in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
+            msg = wintypes.MSG.from_address(int(message))
+            action = self.owner._ids.get(msg.wParam)
+            if msg.message == 0x0312 and action is not None:
+                self.owner.triggered.emit(action)
+                return True, 0
+        return False, 0
+
+
+class GlobalHotkey(QObject):
+    triggered = pyqtSignal(str)
+    status_changed = pyqtSignal()
 
     def __init__(self):
         super().__init__()
+        self.bindings = load_shortcuts()
+        self.errors = {}
         self.error = ""
+        self.suspended = False
+        self._ids = {}
+        self._refs = {}
+        self._filter = None
         self._carbon = None
-        self._hotkey_ref = None
         self._handler_ref = None
         self._handler_cb = None
         self._pump = None
-        self._win_tid = None
 
     def start(self):
-        system = platform.system()
-        if system == "Windows":
-            threading.Thread(target=self._run_windows, daemon=True).start()
-        elif system == "Darwin":
-            self._start_mac()
+        if self.suspended or self._filter is not None or self._handler_ref is not None:
+            return
+        self.errors = {}
+        try:
+            if platform.system() == "Windows":
+                self._filter = _WindowsHotkeyFilter(self)
+                QApplication.instance().installNativeEventFilter(self._filter)
+            elif platform.system() == "Darwin":
+                self._start_mac()
+            for index, (action, value) in enumerate(self.bindings.items(), 1):
+                if not value:
+                    continue
+                try:
+                    mods, key = shortcut_native(value)
+                    hotkey_id = 0xB000 + index
+                    if platform.system() == "Windows":
+                        if not ctypes.windll.user32.RegisterHotKey(None, hotkey_id, mods | 0x4000, key):
+                            raise ValueError("被系统或其他程序占用，请换一个组合")
+                    else:
+                        ref = ctypes.c_void_p()
+                        status = self._carbon.RegisterEventHotKey(
+                            key, mods, _EventHotKeyID(0x68746B31, hotkey_id),
+                            self._carbon.GetApplicationEventTarget(), 0, ctypes.byref(ref))
+                        if status != 0:
+                            raise ValueError("注册失败（%s），可能被系统或其他程序占用" % status)
+                        self._refs[hotkey_id] = ref
+                    self._ids[hotkey_id] = action
+                except ValueError as exc:
+                    self.errors[action] = str(exc)
+        except (OSError, ValueError) as exc:
+            self.errors = {a: str(exc) for a, v in self.bindings.items() if v}
+            self.stop()
+        self.error = "；".join("%s：%s" % (SHORTCUT_ACTIONS[a], e) for a, e in self.errors.items())
+        self.status_changed.emit()
 
     def _start_mac(self):
-        carbon = ctypes.cdll.LoadLibrary(
-            "/System/Library/Frameworks/Carbon.framework/Carbon")
+        carbon = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/Carbon.framework/Carbon")
         carbon.GetApplicationEventTarget.restype = ctypes.c_void_p
         carbon.RegisterEventHotKey.argtypes = [
             ctypes.c_uint32, ctypes.c_uint32, _EventHotKeyID,
@@ -10324,193 +12476,290 @@ class GlobalHotkey(QObject):
             ctypes.POINTER(_EventTypeSpec), ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
         carbon.InstallEventHandler.restype = ctypes.c_int32
         carbon.RunCurrentEventLoop.argtypes = [ctypes.c_double]
-        carbon.RunCurrentEventLoop.restype = ctypes.c_int32
         carbon.UnregisterEventHotKey.argtypes = [ctypes.c_void_p]
-        carbon.UnregisterEventHotKey.restype = ctypes.c_int32
         carbon.RemoveEventHandler.argtypes = [ctypes.c_void_p]
-        carbon.RemoveEventHandler.restype = ctypes.c_int32
+        carbon.GetEventParameter.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+                                             ctypes.c_void_p, ctypes.c_uint32,
+                                             ctypes.c_void_p, ctypes.c_void_p]
+        carbon.GetEventParameter.restype = ctypes.c_int32
         self._carbon = carbon
-
-        target = carbon.GetApplicationEventTarget()
-        ref = ctypes.c_void_p()
-        # kVK_ANSI_O=0x1F；controlKey|optionKey
-        status = carbon.RegisterEventHotKey(0x1F, 0x1000 | 0x0800,
-                                            _EventHotKeyID(0x68746B31, 1),
-                                            target, 0, ctypes.byref(ref))
-        if status != 0:
-            self.error = "mac 热键注册失败 status=%s" % status
-            return
-        self._hotkey_ref = ref
-
-        spec = _EventTypeSpec(0x6B657962, 5)  # kEventClassKeyboard / kEventHotKeyPressed
+        spec = _EventTypeSpec(0x6B657962, 5)
         self._handler_cb = _CARBON_HANDLER(self._on_carbon_hotkey)
         href = ctypes.c_void_p()
         status = carbon.InstallEventHandler(
-            target, ctypes.cast(self._handler_cb, ctypes.c_void_p), 1,
-            ctypes.byref(spec), None, ctypes.byref(href))
+            carbon.GetApplicationEventTarget(), ctypes.cast(self._handler_cb, ctypes.c_void_p),
+            1, ctypes.byref(spec), None, ctypes.byref(href))
         if status != 0:
-            self.error = "mac 热键 handler 安装失败 status=%s" % status
-            carbon.UnregisterEventHotKey(ref)
-            self._hotkey_ref = None
-            return
+            raise ValueError("macOS 快捷键监听失败（%s）" % status)
         self._handler_ref = href
-        # Carbon 事件需在主线程派发：用定时器非阻塞泵事件循环
-        self._pump = QTimer(self)
-        self._pump.timeout.connect(lambda: carbon.RunCurrentEventLoop(0.0))
+        if self._pump is None:
+            self._pump = QTimer(self)
+            self._pump.timeout.connect(lambda: carbon.RunCurrentEventLoop(0.0))
         self._pump.start(50)
 
     def _on_carbon_hotkey(self, next_handler, event, user_data):
-        self.triggered.emit()
+        hotkey = _EventHotKeyID()
+        status = self._carbon.GetEventParameter(
+            event, 0x2D2D2D2D, 0x686B6964, None, ctypes.sizeof(hotkey), None, ctypes.byref(hotkey))
+        action = self._ids.get(hotkey.id)
+        if status == 0 and hotkey.signature == 0x68746B31 and action is not None:
+            self.triggered.emit(action)
         return 0
 
-    def _run_windows(self):
-        from ctypes import wintypes
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
-        MOD_WIN, VK_O, WM_HOTKEY = 0x0008, 0x4F, 0x0312
-        hotkey_id = 0xB001
-        self._win_tid = kernel32.GetCurrentThreadId()
-        if not user32.RegisterHotKey(None, hotkey_id, MOD_WIN, VK_O):
-            self.error = "Win+O 注册失败（可能被系统或其他程序占用）"
-            return
-        msg = wintypes.MSG()
-        while True:
-            r = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-            if r in (0, -1):
-                break
-            if msg.message == WM_HOTKEY and msg.wParam == hotkey_id:
-                self.triggered.emit()
-        user32.UnregisterHotKey(None, hotkey_id)
-
     def stop(self):
+        if self._filter is not None:
+            QApplication.instance().removeNativeEventFilter(self._filter)
+            for hotkey_id in self._ids:
+                ctypes.windll.user32.UnregisterHotKey(None, hotkey_id)
+            self._filter = None
         if self._pump is not None:
             self._pump.stop()
         if self._carbon is not None:
-            if self._hotkey_ref is not None:
-                self._carbon.UnregisterEventHotKey(self._hotkey_ref)
+            for ref in self._refs.values():
+                self._carbon.UnregisterEventHotKey(ref)
             if self._handler_ref is not None:
                 self._carbon.RemoveEventHandler(self._handler_ref)
-        if self._win_tid:
-            ctypes.windll.user32.PostThreadMessageW(self._win_tid, 0x0012, 0, 0)
+                self._handler_ref = None
+        self._ids.clear()
+        self._refs.clear()
+
+    def set_suspended(self, suspended):
+        if suspended == self.suspended:
+            return
+        self.suspended = suspended
+        if suspended:
+            self.stop()
+        else:
+            self.start()
+
+    def apply(self, bindings):
+        normalized = {}
+        seen = {}
+        for action in SHORTCUT_ACTIONS:
+            value = bindings[action]
+            if value:
+                native = shortcut_native(value)
+                if native in seen:
+                    raise ValueError("%s与%s不能使用相同的快捷键" % (SHORTCUT_ACTIONS[seen[native]], SHORTCUT_ACTIONS[action]))
+                seen[native] = action
+                value = QKeySequence(value, QKeySequence.PortableText).toString(QKeySequence.PortableText)
+            normalized[action] = value
+        previous = self.bindings
+        suspended = self.suspended
+        self.stop()
+        self.bindings = normalized
+        self.suspended = False
+        self.start()
+        try:
+            if self.errors:
+                raise ValueError(self.error)
+            save_shortcuts(normalized)
+        except (OSError, ValueError):
+            self.stop()
+            self.bindings = previous
+            self.start()
+            raise
+        finally:
+            self.set_suspended(suspended)
 
 
 class ReminderWindow(QMainWindow):
-    """打卡提醒设置：规则增删、提示音。"""
+    """提醒事项：新建、启用/停用、删除提醒，提示音开关。"""
+
+    PRESETS = (("上班打卡", 9, 0), ("午休", 12, 0), ("下班打卡", 18, 0))
 
     def __init__(self, engine):
         super().__init__()
         self.engine = engine
-        self.setWindowTitle("打卡提醒")
+        self.setWindowTitle("提醒事项")
         self.setGeometry(*tool_win_geometry())
-        self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
+        self.setStyleSheet("QMainWindow { background: #FFFFFF; }"
+                           ' QWidget { font-family: "PingFang SC", "Microsoft YaHei", sans-serif; }')
         self._loading = False
         self.init_ui()
-        self.reload_table()
+        self.engine.changed.connect(self.refresh)
+        self.refresh()
+
+    def _title(self, text):
+        label = QLabel(text)
+        label.setFont(ui_font(13, 14, bold=True))
+        label.setStyleSheet("color: #222222;")
+        return label
+
+    def _field_label(self, text):
+        label = QLabel(text)
+        label.setStyleSheet("color: #57606A; font-size: 12px;")
+        return label
 
     def init_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(15, 15, 15, 10)
-        layout.setSpacing(10)
+        layout.setContentsMargins(18, 16, 18, 12)
+        layout.setSpacing(12)
 
-        hint = QLabel("应用在运行（含最小化到托盘）时才会提醒；错过的提醒在 3 小时内补弹。")
-        hint.setStyleSheet("color: #57606A; font-size: 12px;")
-        layout.addWidget(hint)
+        form_card = QFrame()
+        form_card.setObjectName("reminderForm")
+        form_card.setStyleSheet("QFrame#reminderForm { background: #F8FAFC; border: 1px solid #E8EDF3; border-radius: 8px; }")
+        form = QVBoxLayout(form_card)
+        form.setContentsMargins(14, 12, 14, 12)
+        form.setSpacing(10)
 
-        form = QHBoxLayout()
-        form.setSpacing(8)
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        head.addWidget(self._title("新建提醒"))
+        head.addStretch()
+        head.addWidget(self._field_label("快速填写"))
+        chip_style = """
+            QPushButton { color: #1A73E8; background: #FFFFFF; border: 1px solid #D6E4FA;
+                border-radius: 13px; font-size: 12px; padding: 0 10px; }
+            QPushButton:hover { background: #EEF4FE; }
+        """
+        for name, hour, minute in self.PRESETS:
+            chip = QPushButton("%s %02d:%02d" % (name, hour, minute))
+            chip.setFixedHeight(26)
+            chip.setCursor(QCursor(Qt.PointingHandCursor))
+            chip.setStyleSheet(chip_style)
+            chip.clicked.connect(lambda _=False, n=name, h=hour, m=minute: self.fill_preset(n, h, m))
+            head.addWidget(chip)
+        form.addLayout(head)
+
         self.name_input = QLineEdit()
-        self.name_input.setPlaceholderText("提醒名称，如 上班打卡")
-        self.name_input.setFixedWidth(200)
+        self.name_input.setPlaceholderText("提醒内容，如 上班打卡、喝水、开会")
+        self.name_input.setMaxLength(40)
         self.name_input.setStyleSheet(_lineedit_style())
         self.name_input.returnPressed.connect(self.add_rule)
+        self.name_input.textChanged.connect(lambda _: self.form_message.hide())
         form.addWidget(self.name_input)
 
-        self.time_input = QTimeEdit()
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(self._field_label("时间"))
+        self.time_input = QTimeEdit(QTime(9, 0))
         self.time_input.setDisplayFormat("HH:mm")
-        self.time_input.setTime(QTime(9, 0))
-        self.time_input.setFixedWidth(90)
+        self.time_input.setFixedSize(84, 32)
         self.time_input.setStyleSheet(_lineedit_style().replace("QLineEdit", "QTimeEdit"))
-        form.addWidget(self.time_input)
-
+        row.addWidget(self.time_input)
+        row.addSpacing(8)
+        row.addWidget(self._field_label("重复"))
         self.repeat_input = QComboBox()
-        self.repeat_input.addItems([REPEAT_DAILY, REPEAT_WEEKDAY, REPEAT_ONCE])
-        self.repeat_input.setFixedWidth(110)
+        self.repeat_input.addItems(REPEAT_CHOICES)
+        self.repeat_input.setCurrentText(REPEAT_WEEKDAY)
+        self.repeat_input.setFixedSize(96, 32)
         self.repeat_input.setStyleSheet(_combo_style())
-        form.addWidget(self.repeat_input)
-
-        add_btn = QPushButton("添加")
-        add_btn.setFixedSize(90, 30)
+        row.addWidget(self.repeat_input)
+        row.addSpacing(8)
+        self.date_label = self._field_label("日期")
+        row.addWidget(self.date_label)
+        self.date_input = QDateEdit(QDate.currentDate())
+        self.date_input.setDisplayFormat("yyyy-MM-dd")
+        self.date_input.setCalendarPopup(True)
+        self.date_input.setMinimumDate(QDate.currentDate())
+        self.date_input.setFixedSize(124, 32)
+        self.date_input.setStyleSheet(_lineedit_style().replace("QLineEdit", "QDateEdit"))
+        row.addWidget(self.date_input)
+        row.addStretch()
+        add_btn = QPushButton("添加提醒")
+        add_btn.setFixedSize(96, 32)
         add_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        add_btn.setStyleSheet(_primary_btn())
+        add_btn.setStyleSheet(_primary_btn() + "QPushButton { font-size: 13px; }")
         add_btn.clicked.connect(self.add_rule)
-        form.addWidget(add_btn)
+        row.addWidget(add_btn)
+        form.addLayout(row)
+        self.repeat_input.currentTextChanged.connect(self._sync_date_field)
+        self._sync_date_field(self.repeat_input.currentText())
 
-        del_btn = QPushButton("删除选中")
-        del_btn.setFixedSize(90, 30)
-        del_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        del_btn.setStyleSheet(_secondary_btn())
-        del_btn.clicked.connect(self.delete_rule)
-        form.addWidget(del_btn)
-        form.addStretch()
-        layout.addLayout(form)
+        self.form_message = QLabel("")
+        self.form_message.setStyleSheet("color: #CF222E; font-size: 12px;")
+        self.form_message.hide()
+        form.addWidget(self.form_message)
+        layout.addWidget(form_card)
 
-        preset_row = QHBoxLayout()
-        preset_row.setSpacing(8)
-        for label, hour in (("上班 09:00", 9), ("下班 18:00", 18), ("午休 12:00", 12)):
-            btn = QPushButton(label)
-            btn.setFixedSize(110, 28)
-            btn.setCursor(QCursor(Qt.PointingHandCursor))
-            btn.setStyleSheet(_secondary_btn())
-            btn.clicked.connect(lambda _=False, h=hour, n=label: self.fill_preset(n, h))
-            preset_row.addWidget(btn)
-        preset_row.addStretch()
-        layout.addLayout(preset_row)
+        list_head = QHBoxLayout()
+        list_head.setSpacing(8)
+        list_head.addWidget(self._title("我的提醒"))
+        self.count_label = self._field_label("")
+        list_head.addWidget(self.count_label)
+        list_head.addStretch()
+        self.delete_btn = QPushButton("删除")
+        self.delete_btn.setFixedSize(72, 28)
+        self.delete_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.delete_btn.setToolTip("删除选中的提醒（Delete 键）")
+        self.delete_btn.setStyleSheet(_secondary_btn() + """
+            QPushButton:disabled { color: #A0A8B4; background: #F6F8FA; border-color: #E4E8EE; }
+        """)
+        self.delete_btn.clicked.connect(self.delete_rule)
+        list_head.addWidget(self.delete_btn)
+        layout.addLayout(list_head)
 
         self.table = QTreeWidget()
-        self.table.setHeaderLabels(["名称", "时间", "重复", "启用", "上次触发"])
+        self.table.setHeaderLabels(["提醒", "时间", "重复", "下次提醒"])
         self.table.setRootIsDecorated(False)
+        self.table.setUniformRowHeights(True)
         self.table.setSelectionMode(QTreeWidget.SingleSelection)
         self.table.setStyleSheet("""
-            QTreeWidget { border: 1px solid #D0D0D0; border-radius: 4px;
+            QTreeWidget { border: 1px solid #E4EAF2; border-radius: 6px; outline: none;
                 font-family: "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13px; }
-            QHeaderView::section { background: #FAFAFA; color: #57606A; border: none;
-                border-bottom: 1px solid #E0E0E0; padding: 6px; }
+            QTreeWidget::item { height: 34px; }
+            QTreeWidget::item:selected { background: #E8F0FE; color: #1F2328; }
+            QHeaderView::section { background: #FAFBFC; color: #697386; border: none;
+                border-bottom: 1px solid #E4EAF2; padding: 6px 8px; font-size: 12px; }
         """)
-        self.table.header().setStretchLastSection(True)
-        for i, width in enumerate((180, 80, 80, 70)):
-            self.table.setColumnWidth(i, width)
+        header = self.table.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        for column, width in ((1, 80), (2, 130), (3, 140)):
+            header.setSectionResizeMode(column, QHeaderView.Fixed)
+            self.table.setColumnWidth(column, width)
         self.table.itemChanged.connect(self.on_item_changed)
+        self.table.itemSelectionChanged.connect(self._sync_delete_btn)
         layout.addWidget(self.table, 1)
 
-        bottom = QHBoxLayout()
-        bottom.setSpacing(14)
-        self.sound_check = QCheckBox("提示音")
+        self.empty_label = QLabel("还没有提醒\n在上方填写内容和时间，点击“添加提醒”")
+        self.empty_label.setAlignment(Qt.AlignCenter)
+        self.empty_label.setStyleSheet("color: #8290A5; font-size: 13px; background: #FBFCFD;"
+                                       " border: 1px dashed #D6DEE8; border-radius: 6px;")
+        layout.addWidget(self.empty_label, 1)
+
+        footer = QHBoxLayout()
+        self.sound_check = QCheckBox("提醒时播放提示音")
         self.sound_check.setChecked(bool(self.engine.state.get("sound", True)))
         self.sound_check.toggled.connect(self.on_sound_toggled)
-        bottom.addWidget(self.sound_check)
-        bottom.addStretch()
-        layout.addLayout(bottom)
+        footer.addWidget(self.sound_check)
+        footer.addStretch()
+        self.next_label = QLabel("")
+        self.next_label.setStyleSheet("color: #1F2328; font-size: 12px;")
+        footer.addWidget(self.next_label)
+        layout.addLayout(footer)
 
-        self.status_label = QLabel("")
-        self.status_label.setWordWrap(True)
-        self.status_label.setStyleSheet("color: #57606A; font-size: 12px;")
-        layout.addWidget(self.status_label)
+        hint = QLabel("工具箱运行时（包括最小化到托盘）才会提醒，错过的提醒在 3 小时内补弹；"
+                      "提醒删除或停用后不会再弹出。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #8290A5; font-size: 11px;")
+        layout.addWidget(hint)
 
-        self.update_next_label()
+    def _sync_date_field(self, repeat):
+        once = repeat == REPEAT_ONCE
+        self.date_label.setVisible(once)
+        self.date_input.setVisible(once)
+        if once and QDateTime(self.date_input.date(), self.time_input.time()) <= QDateTime.currentDateTime():
+            self.date_input.setDate(QDate.currentDate().addDays(1))
 
-    def fill_preset(self, label, hour):
-        name = "上班打卡" if "上班" in label else ("下班打卡" if "下班" in label else "午休提醒")
+    def _form_error(self, text):
+        self.form_message.setText(text)
+        self.form_message.show()
+
+    def fill_preset(self, name, hour, minute):
         self.name_input.setText(name)
-        self.time_input.setTime(QTime(hour, 0))
+        self.time_input.setTime(QTime(hour, minute))
         self.repeat_input.setCurrentText(REPEAT_WEEKDAY)
+        self.form_message.hide()
         self.name_input.setFocus()
 
     def add_rule(self):
         name = self.name_input.text().strip()
         if not name:
-            self.status_label.setText("请填写提醒名称")
+            self._form_error("请填写提醒内容")
             self.name_input.setFocus()
             return
         rule = {"name": name,
@@ -10518,76 +12767,121 @@ class ReminderWindow(QMainWindow):
                 "repeat": self.repeat_input.currentText(),
                 "enabled": True}
         if rule["repeat"] == REPEAT_ONCE:
-            rule["date"] = QDate.currentDate().toString("yyyy-MM-dd")
+            rule["date"] = self.date_input.date().toString("yyyy-MM-dd")
+            if reminder_upcoming(rule, QDateTime.currentDateTime()) is None:
+                self._form_error("这个时间已经过去了，请选择之后的日期或时间")
+                return
+        same = ("name", "time", "repeat", "date")
+        if any(all(r.get(k) == rule.get(k) for k in same) for r in self.engine.rules()):
+            self._form_error("已经有一条相同的提醒")
+            return
         self.engine.rules().append(rule)
         save_reminders(self.engine.state)
         self.name_input.clear()
-        self.reload_table()
-        self.update_next_label()
+        self.form_message.hide()
+        self.refresh()
+        self.table.scrollToItem(self.table.topLevelItem(self.table.topLevelItemCount() - 1))
 
     def delete_rule(self):
-        item = self.table.currentItem()
-        if item is None:
-            self.status_label.setText("请先选中要删除的提醒")
+        items = self.table.selectedItems()
+        if not items:
             return
-        index = self.table.indexOfTopLevelItem(item)
-        if 0 <= index < len(self.engine.rules()):
-            self.engine.rules().pop(index)
-            save_reminders(self.engine.state)
-        self.reload_table()
-        self.update_next_label()
+        index = self.table.indexOfTopLevelItem(items[0])
+        rules = self.engine.rules()
+        if 0 <= index < len(rules):
+            self.table.clearSelection()
+            self.engine.remove_rule(rules[index])
 
-    def reload_table(self):
+    def _repeat_text(self, rule):
+        repeat = rule.get("repeat", REPEAT_DAILY)
+        if repeat == REPEAT_ONCE:
+            day = QDate.fromString(rule.get("date", ""), "yyyy-MM-dd")
+            if day.isValid():
+                return "%s · %s" % (repeat, day.toString("MM-dd"))
+        return repeat
+
+    def _next_text(self, rule, now):
+        if not rule.get("enabled", True):
+            if rule.get("repeat") == REPEAT_ONCE and rule.get("last_fired"):
+                return "已提醒"
+            return "已停用"
+        when = reminder_upcoming(rule, now)
+        return reminder_when_text(when, now) if when else "已过期"
+
+    def _fill_item(self, item, rule, now):
+        enabled = rule.get("enabled", True)
+        item.setText(0, rule.get("name", ""))
+        item.setCheckState(0, Qt.Checked if enabled else Qt.Unchecked)
+        item.setToolTip(0, "勾选启用，取消勾选停用")
+        item.setText(1, rule.get("time", ""))
+        item.setText(2, self._repeat_text(rule))
+        item.setText(3, self._next_text(rule, now))
+        color = QColor("#1F2328") if enabled else QColor("#9AA4B2")
+        for column in range(4):
+            item.setForeground(column, QBrush(color))
+
+    def refresh(self):
+        now = QDateTime.currentDateTime()
+        selected = self.table.selectedItems()
+        selected_index = self.table.indexOfTopLevelItem(selected[0]) if selected else -1
+        rules = self.engine.rules()
         self._loading = True
         self.table.clear()
-        for rule in self.engine.rules():
-            item = QTreeWidgetItem([
-                rule.get("name", ""),
-                rule.get("time", ""),
-                rule.get("repeat", REPEAT_DAILY),
-                "",
-                rule.get("last_fired", "—"),
-            ])
+        for rule in rules:
+            item = QTreeWidgetItem()
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(3, Qt.Checked if rule.get("enabled", True) else Qt.Unchecked)
+            self._fill_item(item, rule, now)
             self.table.addTopLevelItem(item)
+        if 0 <= selected_index < len(rules):
+            self.table.topLevelItem(selected_index).setSelected(True)
         self._loading = False
+        self.table.setVisible(bool(rules))
+        self.empty_label.setVisible(not rules)
+        self._update_summary(now)
+
+    def _update_summary(self, now):
+        rules = self.engine.rules()
+        enabled = sum(1 for r in rules if r.get("enabled", True))
+        self.count_label.setText("共 %d 条 · 启用 %d 条" % (len(rules), enabled) if rules else "")
+        name, when = next_reminder(rules, now)
+        self.next_label.setText("下一条：%s · %s" % (name, reminder_when_text(when, now))
+                                if when else "暂无待提醒的事项")
+        self._sync_delete_btn()
+
+    def _sync_delete_btn(self):
+        self.delete_btn.setEnabled(bool(self.table.selectedItems()))
 
     def on_item_changed(self, item, column):
-        if self._loading or column != 3:
+        if self._loading or column != 0:
             return
         index = self.table.indexOfTopLevelItem(item)
         if not (0 <= index < len(self.engine.rules())):
             return
         rule = self.engine.rules()[index]
-        rule["enabled"] = item.checkState(3) == Qt.Checked
+        enabled = item.checkState(0) == Qt.Checked
+        if rule.get("enabled", True) == enabled:
+            return
+        rule["enabled"] = enabled
+        if not enabled:
+            self.engine.forget(rule)
         save_reminders(self.engine.state)
-        self.update_next_label()
+        now = QDateTime.currentDateTime()
+        self._loading = True
+        self._fill_item(item, rule, now)
+        self._loading = False
+        self._update_summary(now)
 
     def on_sound_toggled(self, checked):
         self.engine.state["sound"] = checked
         save_reminders(self.engine.state)
 
-    def update_next_label(self):
-        now = QDateTime.currentDateTime()
-        name, when = next_reminder(self.engine.rules(), now)
-        if when is None:
-            self.status_label.setText("当前没有启用的提醒")
-        else:
-            self.status_label.setText("下一条：%s  %s" % (
-                name, when.toString("MM-dd HH:mm")))
-
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
             self.close()
-
-
-class _DragTree(QTreeWidget):
-    orderChanged = pyqtSignal()
-
-    def dropEvent(self, event):
-        super().dropEvent(event)
-        self.orderChanged.emit()
+        elif event.key() in (Qt.Key_Delete, Qt.Key_Backspace) and self.table.hasFocus():
+            self.delete_rule()
+        else:
+            super().keyPressEvent(event)
 
 
 class SectionOrderWindow(QMainWindow):
@@ -10751,7 +13045,6 @@ class SectionOrderWindow(QMainWindow):
 
 
 class SettingsWindow(QMainWindow):
-    """通用设置：开机自启、缓存目录、源码仓库。"""
 
     REPO_URL = "https://github.com/FantasyEngineer/personal_tool"
 
@@ -10760,11 +13053,31 @@ class SettingsWindow(QMainWindow):
         self.main = main
         self.setWindowTitle("设置")
         self.setGeometry(*tool_win_geometry())
+        self.resize(660, 590)
+        self.setMinimumSize(590, 540)
         self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
         central = QWidget()
         self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(15, 12, 15, 12)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(20, 18, 20, 16)
+        outer.setSpacing(14)
+        title = QLabel("设置")
+        title.setFont(ui_font(19, 22, bold=True))
+        title.setStyleSheet("color: #202124;")
+        outer.addWidget(title)
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet("""
+            QTabWidget::pane { border: none; border-top: 1px solid #E8EAED; }
+            QTabBar::tab { padding: 10px 22px; color: #697386; font-size: 13px;
+                background: transparent; border-bottom: 2px solid transparent; }
+            QTabBar::tab:selected { color: #1A73E8; border-bottom: 2px solid #1A73E8; }
+            QTabBar::tab:hover { color: #1A73E8; }
+        """)
+        outer.addWidget(self.tabs, 1)
+        general = QWidget()
+        self.tabs.addTab(general, "通用")
+        layout = QVBoxLayout(general)
+        layout.setContentsMargins(0, 16, 0, 0)
         layout.setSpacing(10)
 
         layout.addWidget(self._group_title("开机自启"))
@@ -10829,15 +13142,180 @@ class SettingsWindow(QMainWindow):
         layout.addLayout(upd_row)
 
         layout.addStretch()
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        done_btn = QPushButton("完成")
-        done_btn.setFixedSize(80, 30)
-        done_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        done_btn.setStyleSheet(_primary_btn() + "QPushButton { font-size: 12px; }")
-        done_btn.clicked.connect(self.close)
-        btn_row.addWidget(done_btn)
-        layout.addLayout(btn_row)
+        self._build_shortcuts_page()
+        self.tabs.currentChanged.connect(self._sync_hotkeys)
+        self.main.hotkey.status_changed.connect(self._refresh_shortcut_status)
+
+    def _build_shortcuts_page(self):
+        page = QWidget()
+        self.tabs.addTab(page, "快捷键")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 18, 0, 0)
+        layout.setSpacing(14)
+        heading = self._group_title("全局快捷键")
+        layout.addWidget(heading)
+        hint = QLabel("工具箱运行时，在其他应用中也可使用。点击输入框，直接按下新的组合键。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #697386; font-size: 12px;")
+        layout.addWidget(hint)
+        self.shortcut_edits = {}
+        self.shortcut_states = {}
+        body = QWidget()
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 8, 8)
+        body_layout.setSpacing(12)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.viewport().setObjectName("shortcutViewport")
+        scroll.viewport().setStyleSheet("QWidget#shortcutViewport { background: #FFFFFF; }")
+        scroll.setWidget(body)
+        body.setAutoFillBackground(False)
+        layout.addWidget(scroll, 1)
+        descriptions = {"rain": "开启 / 关闭桌面文字雨，自动联动防黑屏",
+                        "picker": "启动 / 关闭屏幕放大镜，快速获取颜色",
+                        "capture": "像素取色与本地 OCR，框选后调整与标注，直接复制、保存或贴图",
+                        "capture_copy": "框选完成后直接复制，不弹出预览",
+                        "custom_capture": "按屏幕、坐标及尺寸截取指定区域",
+                        "paste_image": "把剪贴板中的图片固定到桌面",
+                        "toggle_pins": "统一隐藏或显示全部桌面贴图"}
+        for action, name in SHORTCUT_ACTIONS.items():
+            card = QFrame()
+            card.setObjectName("shortcutCard")
+            card.setStyleSheet("QFrame#shortcutCard { background: #F8FAFC; border: 1px solid #E8EDF3; border-radius: 8px; }")
+            row = QHBoxLayout(card)
+            row.setContentsMargins(14, 12, 14, 12)
+            row.setSpacing(10)
+            text = QVBoxLayout()
+            text.setSpacing(4)
+            text.addWidget(self._group_title(name))
+            description = QLabel(descriptions[action])
+            description.setWordWrap(True)
+            description.setStyleSheet("color: #697386; font-size: 11px;")
+            text.addWidget(description)
+            state = QLabel()
+            state.setWordWrap(True)
+            text.addWidget(state)
+            self.shortcut_states[action] = state
+            row.addLayout(text, 1)
+            edit = QKeySequenceEdit(QKeySequence(self.main.hotkey.bindings[action]))
+            edit.setFixedSize(180, 36)
+            edit.setStyleSheet("""
+                QLineEdit { background: white; border: 1px solid #D6DEE8; border-radius: 6px;
+                    padding: 6px 8px; font-size: 13px; }
+                QLineEdit:focus { border: 1px solid #1A73E8; }
+            """)
+            edit.findChild(QLineEdit).setPlaceholderText("未设置")
+            edit.setToolTip("F1～F12 可单独使用；字母、数字等需搭配修饰键")
+            edit.keySequenceChanged.connect(lambda seq, a=action: self._shortcut_edited(a, seq))
+            self.shortcut_edits[action] = edit
+            row.addWidget(edit)
+            clear = QPushButton("清除")
+            clear.setFixedSize(48, 30)
+            clear.setCursor(QCursor(Qt.PointingHandCursor))
+            clear.setStyleSheet("QPushButton { color: #697386; background: transparent; border: none; font-size: 12px; } QPushButton:hover { color: #1A73E8; }")
+            clear.clicked.connect(edit.clear)
+            row.addWidget(clear)
+            body_layout.addWidget(card)
+        explanation = ("macOS：⌘ Command · ⌃ Control · ⌥ Option · ⇧ Shift。"
+                       if platform.system() == "Darwin" else "Windows：Meta 表示 Win 键；可搭配 Ctrl、Alt、Shift。")
+        note = QLabel(explanation + "\nF1～F12 可单独设置，其他按键需使用组合键。\n清除并保存可停用；编辑本页时暂停全局快捷键，切换到其他窗口后恢复。")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #697386; font-size: 11px; line-height: 1.5;")
+        body_layout.addWidget(note)
+        body_layout.addWidget(self._group_title("取色器内置按键"))
+        local = QLabel("C  复制并退出     X  切换 HEX / RGB     Esc / 左键 / 右键  退出")
+        local.setWordWrap(True)
+        local.setStyleSheet("color: #57606A; background: #F8FAFC; border-radius: 6px; padding: 10px; font-size: 12px;")
+        body_layout.addWidget(local)
+        capture_hint = QLabel("截屏取色：像素放大镜 · C 复制颜色并退出 · X 切换 HEX / RGB\n截屏：框选后调整 / 标注 · Enter / Ctrl+C 复制截图 · Ctrl+T 贴图 · Esc 退出 · 右键重选\n文字识别：框选后点击识别按钮 / Ctrl+O，识别后在旁窗查看 / 编辑 / 选中复制，不自动复制或退出；无文字或失败可调整选区重试\n贴图：拖动移动 · 滚轮缩放 · Ctrl+滚轮调透明度 · 双击 / Esc 隐藏 · 全局显隐快捷键恢复")
+        capture_hint.setWordWrap(True)
+        capture_hint.setStyleSheet("color: #697386; font-size: 11px;")
+        body_layout.addWidget(capture_hint)
+        body_layout.addStretch()
+        self.shortcut_feedback = QLabel()
+        self.shortcut_feedback.setWordWrap(True)
+        self.shortcut_feedback.setStyleSheet("color: #697386; font-size: 12px;")
+        layout.addWidget(self.shortcut_feedback)
+        buttons = QHBoxLayout()
+        reset = QPushButton("恢复默认")
+        reset.setFixedSize(94, 32)
+        reset.setStyleSheet(_secondary_btn())
+        reset.setCursor(QCursor(Qt.PointingHandCursor))
+        reset.clicked.connect(self._reset_shortcuts)
+        buttons.addWidget(reset)
+        buttons.addStretch()
+        self.save_shortcuts_btn = QPushButton("保存快捷键")
+        self.save_shortcuts_btn.setFixedSize(106, 32)
+        self.save_shortcuts_btn.setStyleSheet(_primary_btn())
+        self.save_shortcuts_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.save_shortcuts_btn.clicked.connect(self._save_shortcuts)
+        buttons.addWidget(self.save_shortcuts_btn)
+        layout.addLayout(buttons)
+        self._refresh_shortcut_status()
+
+    def _shortcut_edited(self, action, sequence):
+        if sequence.count() > 1:
+            self.shortcut_edits[action].setKeySequence(QKeySequence(sequence[0]))
+            return
+        self.shortcut_feedback.setText("修改尚未保存，点击“保存快捷键”后生效。")
+        self.shortcut_feedback.setStyleSheet("color: #697386; font-size: 12px;")
+        self._refresh_shortcut_status()
+
+    def _refresh_shortcut_status(self):
+        for action, state in self.shortcut_states.items():
+            value = self.shortcut_edits[action].keySequence().toString(QKeySequence.PortableText)
+            error = self.main.hotkey.errors.get(action)
+            if value != self.main.hotkey.bindings[action]:
+                text, color = "待保存" if value else "待停用", "#B26A00"
+            elif error:
+                text, color = error, "#C62828"
+            else:
+                text, color = ("已设置 · 全局" if value else "未设置 · 已停用"), "#188038" if value else "#697386"
+            state.setText(text)
+            state.setStyleSheet("color: %s; font-size: 11px;" % color)
+
+    def _reset_shortcuts(self):
+        for action, value in default_shortcuts().items():
+            self.shortcut_edits[action].setKeySequence(QKeySequence(value))
+        self.shortcut_feedback.setText("已填入默认组合，保存后生效。")
+
+    def _save_shortcuts(self):
+        bindings = {a: edit.keySequence().toString(QKeySequence.PortableText)
+                    for a, edit in self.shortcut_edits.items()}
+        try:
+            self.main.hotkey.apply(bindings)
+        except (OSError, ValueError) as exc:
+            self.shortcut_feedback.setText("保存失败：%s。原快捷键保持不变。" % exc)
+            self.shortcut_feedback.setStyleSheet("color: #C62828; font-size: 12px;")
+            return
+        self.shortcut_feedback.setText("已保存；切换到其他窗口即可使用，重启后仍然有效。")
+        self.shortcut_feedback.setStyleSheet("color: #188038; font-size: 12px;")
+        self._refresh_shortcut_status()
+
+    def _sync_hotkeys(self, *_):
+        self.main.hotkey.set_suspended(self.isVisible() and self.isActiveWindow() and self.tabs.currentIndex() == 1)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.ActivationChange and hasattr(self, "tabs"):
+            self._sync_hotkeys()
+
+    def hideEvent(self, event):
+        self.main.hotkey.set_suspended(False)
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        for action, value in self.main.hotkey.bindings.items():
+            edit = self.shortcut_edits[action]
+            edit.blockSignals(True)
+            edit.setKeySequence(QKeySequence(value))
+            edit.blockSignals(False)
+        self.shortcut_feedback.clear()
+        self._refresh_shortcut_status()
+        self._sync_hotkeys()
 
     def _group_title(self, text):
         lb = QLabel(text)
@@ -10869,48 +13347,32 @@ class ToolboxWindow(QMainWindow):
         w, h = 700, int(screen.height() * 0.68)
         self.setGeometry(screen.x() + (screen.width() - w) // 2,
                          screen.y() + (screen.height() - h) // 2, w, h)
-        self.setStyleSheet("""
-            QMainWindow { background: #FFFFFF; }
-        """)
+        self.setStyleSheet("QMainWindow { background: #F6F8FC; }")
         self.ip, self.mac, self.adapter = get_effective_ip()
         self.popup = None
-        self.markup_window = None
+        self.data_format_window = None
         self.codec_window = None
         self.hash_window = None
         self.crypto_window = None
         self.regex_window = None
-        self.diff_window = None
+        self.text_tool_window = None
         self.generator_window = None
-        self.qr_window = None
-        self.barcode_window = None
-        self.uuid_window = None
-        self.baseconvert_window = None
+        self.number_convert_window = None
         self.divmod_window = None
-        self.convert_window = None
         self.color_window = None
+        self.screenshot_tool = None
         self._screen_pick_overlay = None
         self._screen_pick_prev_pid = None
         self._screen_pick_silent_exit = False
-        self.json_yaml_window = None
         self.config_window = None
         self.unit_window = None
-        self.random_window = None
-        self.textstat_window = None
         self.cron_window = None
         self.image_window = None
-        self.rmb_window = None
-        self.roman_window = None
-        self.ping_window = None
-        self.dns_window = None
-        self.traceroute_window = None
-        self.portscan_window = None
-        self.speedtest_window = None
-        self.cmdref_window = None
+        self.network_window = None
+        self.dev_reference_window = None
         self.mortgage_window = None
-        self.http_status_window = None
         self.chmod_window = None
         self.datetime_window = None
-        self.timestamp_window = None
         self.reminder_window = None
         self.section_order_window = None
         self.settings_window = None
@@ -10924,108 +13386,105 @@ class ToolboxWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(15, 8, 15, 4)
-        main_layout.setSpacing(4)
+        main_layout.setContentsMargins(18, 14, 18, 10)
+        main_layout.setSpacing(10)
 
-        # 搜索框：模糊匹配工具名称和内部功能
-        search_container = QWidget()
-        search_container.setStyleSheet("""
-            QWidget {
-                background: #F5F5F5;
-                border: 1px solid #E0E0E0;
-                border-radius: 8px;
-                margin: 2px 15px;
-            }
-            QWidget:focus-within {
-                border: 1px solid #1A73E8;
-                background: #FFFFFF;
-            }
-        """)
-        search_layout = QHBoxLayout(search_container)
-        search_layout.setContentsMargins(12, 6, 12, 6)
-        search_layout.setSpacing(8)
-        
-        # 搜索输入框
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        title = QLabel("工具箱")
+        title.setFont(ui_font(18, 21, bold=True))
+        title.setStyleSheet("color: #202B3D;")
+        header.addWidget(title)
+        subtitle = QLabel("系统 · 开发 · 日常")
+        subtitle.setFont(ui_font(10, 12))
+        subtitle.setStyleSheet("color: #8290A5;")
+        header.addWidget(subtitle)
+        header.addStretch()
+        self.tool_count_label = QLabel()
+        self.tool_count_label.setFont(ui_font(10, 12))
+        self.tool_count_label.setStyleSheet("color: #69788F;")
+        header.addWidget(self.tool_count_label)
+        main_layout.addLayout(header)
+
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("搜索工具或功能，支持拼音…")
+        self.search_input.setPlaceholderText("搜索工具、功能或拼音 · 唯一结果按 Enter 打开")
         self.search_input.setClearButtonEnabled(True)
+        self.search_input.setFixedHeight(40)
         self.search_input.setStyleSheet("""
-            QLineEdit {
-                border: none;
-                background: transparent;
-                font-size: 13px;
-                color: #333333;
-                padding: 0;
-                padding-right: 8px;
-            }
-            QLineEdit::placeholder {
-                color: #999999;
-            }
-            QLineEdit > QPushButton {
-                background: #CCCCCC;
-                border-radius: 10px;
-                min-width: 20px;
-                max-width: 20px;
-                min-height: 20px;
-                max-height: 20px;
-            }
-            QLineEdit > QPushButton:hover {
-                background: #999999;
-            }
+            QLineEdit { background: #FFFFFF; color: #263449; font-size: 13px;
+                border: 1px solid #DAE2ED; border-radius: 8px; padding: 0 12px; }
+            QLineEdit:hover { border-color: #BCCBE0; }
+            QLineEdit:focus { border-color: #1A73E8; }
         """)
         self.search_input.textChanged.connect(self.filter_tools)
         self.search_input.returnPressed.connect(self.open_single_match)
         self.search_input.setFocusPolicy(Qt.ClickFocus)
-        search_layout.addWidget(self.search_input, 1)
-        
-        main_layout.addWidget(search_container)
-        
-        # 使用历史区域：固定预留一行胶囊的高度，点击工具时不再把下面的网格顶下去
-        # 64 = 标题 20 + 间距 6 + 胶囊一行 28 + 间距 6 + 底边距 4
+        main_layout.addWidget(self.search_input)
+
+        self.history_mode = "recent"
+        self.usage_history = []
+        self.search_history = []
+        self.max_history = 12
         self.history_widget = QWidget()
         self.history_widget.setFixedHeight(64)
+        self.history_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         history_layout = QVBoxLayout(self.history_widget)
-        history_layout.setContentsMargins(15, 0, 15, 4)
+        history_layout.setContentsMargins(0, 0, 0, 4)
         history_layout.setSpacing(6)
 
         history_header = QHBoxLayout()
-        history_label = QLabel("最近使用")
-        history_label.setFixedHeight(20)
-        history_label.setStyleSheet("font-size: 12px; color: #999999; border: none; margin: 0;")
-        history_header.addWidget(history_label)
+        history_header.setSpacing(14)
+        self.history_tabs = {}
+        for mode, label in (("recent", "最近使用"), ("search", "搜索记录")):
+            btn = QPushButton(label)
+            btn.setFixedHeight(22)
+            btn.setCheckable(True)
+            btn.setChecked(mode == self.history_mode)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setStyleSheet("""
+                QPushButton { color: #8290A5; background: transparent; border: none;
+                    border-bottom: 2px solid transparent; padding: 0 0 3px; font-size: 12px; }
+                QPushButton:hover { color: #1A73E8; }
+                QPushButton:checked { color: #1A73E8; border-bottom-color: #1A73E8; }
+            """)
+            btn.clicked.connect(lambda _checked, m=mode: self._set_history_mode(m))
+            history_header.addWidget(btn)
+            self.history_tabs[mode] = btn
         history_header.addStretch()
-
-        self.history_clear_all = QPushButton("清空")
-        self.history_clear_all.setFixedHeight(20)
-        self.history_clear_all.setCursor(Qt.PointingHandCursor)
-        self.history_clear_all.setStyleSheet("""
-            QPushButton {
-                font-size: 11px;
-                color: #999999;
-                border: none;
-                background: transparent;
-                padding: 2px 6px;
-            }
-            QPushButton:hover {
-                color: #1A73E8;
-            }
+        self.history_more = QPushButton("全部")
+        self.history_more.setFixedHeight(22)
+        self.history_more.setCursor(Qt.PointingHandCursor)
+        self.history_more.setStyleSheet("""
+            QPushButton { color: #69788F; border: none; background: transparent;
+                padding: 0 16px 0 6px; font-size: 11px; }
+            QPushButton:hover { color: #1A73E8; }
+            QPushButton:disabled { color: #AAB4C1; }
         """)
-        self.history_clear_all.clicked.connect(self._clear_all_history)
-        history_header.addWidget(self.history_clear_all)
+        self.history_menu = QMenu(self.history_more)
+        self.history_menu.setStyleSheet("""
+            QMenu { background: #FFFFFF; color: #33435A; border: 1px solid #DAE2ED;
+                padding: 4px; font-size: 12px; }
+            QMenu::item { padding: 7px 28px 7px 14px; }
+            QMenu::item:selected { background: #EDF3FC; color: #1A73E8; }
+            QMenu::separator { height: 1px; background: #E4EAF2; margin: 4px 6px; }
+        """)
+        self.history_menu.aboutToShow.connect(self._populate_history_menu)
+        self.history_more.setMenu(self.history_menu)
+        history_header.addWidget(self.history_more)
         history_layout.addLayout(history_header)
 
-        self.history_rows_layout = QVBoxLayout()
-        self.history_rows_layout.setSpacing(6)
-        self.history_rows_layout.setContentsMargins(0, 0, 0, 0)
-        history_layout.addLayout(self.history_rows_layout)
+        self.history_row = QHBoxLayout()
+        self.history_row.setContentsMargins(0, 0, 0, 0)
+        self.history_row.setSpacing(6)
+        history_layout.addLayout(self.history_row)
         history_layout.addStretch()
-
+        self.history_widget.installEventFilter(self)
         main_layout.addWidget(self.history_widget)
 
         content_area = QWidget()
         content_layout = QVBoxLayout(content_area)
         content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.setSpacing(8)
+        content_layout.setSpacing(12)
 
         self.toggle_buttons = {}
         self._caffeinate = None
@@ -11033,90 +13492,57 @@ class ToolboxWindow(QMainWindow):
         self._rain_saved_awake = None
         self.all_buttons = {}  # 存储按钮引用用于搜索过滤
         self.sections = []  # 存储 (section_widget, [button_texts]) 用于搜索时隐藏空分类
-        self.usage_history = []  # 使用历史记录
-        self.max_history = 10  # 最多记录10条
-        self.usage_history = self._load_usage_history()
-        # 启动就把历史显示出来：否则第一次点击时这一行才出现，整块网格会往下跳
-        self._refresh_history_display()
+        self._tool_callbacks = {}
 
-        section1 = self.create_section("系统工具", [
-            "进程管理", "端口扫描", "Ping 测试", "DNS 查询", "路由追踪",
-            "网络测速", "配置"
+        self.create_section("系统与桌面", [
+            "网络诊断", "进程管理", "配置", "截图贴图", "取色器", "图片处理", "防黑屏", "文字雨"
         ], {
+            "网络诊断": self.show_network,
             "进程管理": self.show_process_search,
-            "端口扫描": self.show_portscan,
-            "Ping 测试": self.show_ping,
-            "DNS 查询": self.show_dns,
-            "路由追踪": self.show_traceroute,
-            "网络测速": self.show_speedtest,
-            "配置": self.show_config
+            "配置": self.show_config,
+            "截图贴图": self.show_screenshots,
+            "取色器": self.show_screen_pick,
+            "图片处理": self.show_image_tool
+        }, {
+            "防黑屏": self.set_awake,
+            "文字雨": self.set_matrix_rain
         })
 
-        section_generate = self.create_section("生成工具", [
-            "二维码", "条形码", "UUID", "随机数"
-        ], {
-            "二维码": self.show_qrcode,
-            "条形码": self.show_barcode,
-            "UUID": self.show_uuid,
-            "随机数": self.show_random
-        })
-
-        section_crypto = self.create_section("加解密/编解码", [
-            "加解密", "编解码", "哈希计算"
-        ], {
-            "加解密": self.show_crypto,
+        self.create_section("编码与安全", ["编解码", "加解密", "哈希计算"], {
             "编解码": self.show_codec,
+            "加解密": self.show_crypto,
             "哈希计算": self.show_hash
         })
 
-        section3 = self.create_section("文本处理", [
-            "JSON/XML", "JSON-YAML", "正则测试", "文本对比", "文本统计"
-        ], {
-            "JSON/XML": self.show_markup,
-            "JSON-YAML": self.show_json_yaml,
-            "正则测试": self.show_regex,
-            "文本对比": self.show_diff,
-            "文本统计": self.show_textstat
+        self.create_section("文本与数据", ["数据格式", "文本工具", "正则测试"], {
+            "数据格式": self.show_data_format,
+            "文本工具": self.show_text_tool,
+            "正则测试": self.show_regex
         })
 
-        section_time = self.create_section("时间工具", [
-            "日期时间", "时间戳", "打卡提醒"
-        ], {
+        self.create_section("时间与日程", ["日期时间", "Cron 表达式", "提醒事项"], {
             "日期时间": self.show_datetime,
-            "时间戳": self.show_timestamp,
-            "打卡提醒": self.show_reminder
-        })
-
-        section4 = self.create_section("数学工具", [
-            "进制转换", "商余计算", "单位转换", "金额大写", "罗马数字"
-        ], {
-            "进制转换": self.show_base_convert,
-            "商余计算": self.show_divmod,
-            "单位转换": self.show_unit_convert,
-            "金额大写": self.show_rmb,
-            "罗马数字": self.show_roman
-        })
-
-        section_dev = self.create_section("开发工具", [
-            "命令速查", "HTTP 状态码", "chmod 权限", "Cron 表达式", "颜色", "屏幕取色"
-        ], {
-            "命令速查": self.show_command_reference,
-            "HTTP 状态码": self.show_http_status,
-            "chmod 权限": self.show_chmod,
             "Cron 表达式": self.show_cron,
-            "颜色": self.show_color,
-            "屏幕取色": self.show_screen_pick
+            "提醒事项": self.show_reminder
         })
 
-        section6 = self.create_section("其他", [
-            "房贷计算器", "图片处理", "文字雨", "防黑屏"
-        ], {
-            "房贷计算器": self.show_mortgage,
-            "图片处理": self.show_image_tool
-        }, {
-            "文字雨": self.set_matrix_rain,
-            "防黑屏": self.set_awake
+        self.create_section("数值计算", ["数字转换", "单位转换", "商余计算", "房贷计算器"], {
+            "数字转换": self.show_number_convert,
+            "单位转换": self.show_unit_convert,
+            "商余计算": self.show_divmod,
+            "房贷计算器": self.show_mortgage
         })
+
+        self.create_section("开发辅助", ["开发速查", "chmod 权限", "颜色", "生成器"], {
+            "开发速查": self.show_dev_reference,
+            "chmod 权限": self.show_chmod,
+            "颜色": self.show_color,
+            "生成器": self.show_generator
+        })
+
+        self.usage_history = self._load_usage_history()
+        self.search_history = self._load_search_history()
+        self._refresh_history_display()
 
         self.content_layout = content_layout
         default_order = [s[1].text() for s in self.sections]
@@ -11144,16 +13570,32 @@ class ToolboxWindow(QMainWindow):
                     self.tool_order[cat].append(n)
         self.apply_tool_order()
 
+        self.empty_search_label = QLabel("没有找到匹配的工具\n试试功能名称、拼音，或清除搜索。")
+        self.empty_search_label.setAlignment(Qt.AlignCenter)
+        self.empty_search_label.setStyleSheet("color: #8290A5; font-size: 13px; padding: 40px 16px;")
+        self.empty_search_label.hide()
+        content_layout.addWidget(self.empty_search_label)
         content_layout.addStretch()
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
-        scroll.viewport().setStyleSheet("background: #FFFFFF;")
+        scroll.setStyleSheet("""
+            QScrollArea { border: none; background: transparent; }
+            QScrollBar:vertical { background: transparent; width: 8px; margin: 0; }
+            QScrollBar::handle:vertical { background: #CFD9E6; border-radius: 4px; min-height: 32px; }
+            QScrollBar::handle:vertical:hover { background: #AEBED3; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+        """)
+        scroll.viewport().setObjectName("launcherViewport")
+        scroll.viewport().setStyleSheet("QWidget#launcherViewport { background: #F6F8FC; }")
         scroll.setWidget(content_area)
+        content_area.setAutoFillBackground(False)
+        self.tool_count_label.setText("%s 个工具" % len(self.all_buttons))
         # 顶部渐隐：仅当内容真正向上滚动时才淡出顶端，静止时标题完全可见
         self._top_fade = QGraphicsOpacityEffect(scroll.viewport())
+        self._top_fade.setOpacity(1.0)
         scroll.viewport().setGraphicsEffect(self._top_fade)
 
         def update_top_fade(value):
@@ -11171,53 +13613,46 @@ class ToolboxWindow(QMainWindow):
         main_layout.addWidget(scroll, 1)
 
         bottom_bar = QFrame()
-        bottom_bar.setStyleSheet("QFrame { background: #FFFFFF; }")
+        bottom_bar.setObjectName("launcherFooter")
+        bottom_bar.setStyleSheet("QFrame#launcherFooter { border-top: 1px solid #E1E7F0; }")
         bottom_layout = QHBoxLayout(bottom_bar)
-        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.setContentsMargins(0, 10, 0, 0)
+        bottom_layout.setSpacing(12)
 
         self.cpu_label = QLabel("CPU: --")
         self.cpu_label.setFont(ui_font(10, 11))
-        self.cpu_label.setStyleSheet("color: #999999;")
+        self.cpu_label.setStyleSheet("color: #8290A5;")
         bottom_layout.addWidget(self.cpu_label)
 
         self.mem_label = QLabel("内存: --")
         self.mem_label.setFont(ui_font(10, 11))
-        self.mem_label.setStyleSheet("color: #999999;")
+        self.mem_label.setStyleSheet("color: #8290A5;")
         bottom_layout.addWidget(self.mem_label)
-
         bottom_layout.addStretch()
 
+        info_label = QLabel(f"IP: {self.ip}")
+        info_label.setFont(ui_font(10, 11))
+        info_label.setStyleSheet("color: #69788F;")
+        info_label.setCursor(QCursor(Qt.PointingHandCursor))
+        info_label.setToolTip("点击复制 IP\nMAC: %s\n网卡: %s" % (self.mac or "--", self.adapter))
+        info_label.mousePressEvent = lambda e: self.copy_to_clipboard(self.ip)
+        bottom_layout.addWidget(info_label)
+
         settings_btn = QPushButton("设置")
-        settings_btn.setFont(ui_font(10, 11))
+        settings_btn.setFont(ui_font(10, 12))
+        settings_btn.setFixedSize(56, 30)
         settings_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        settings_btn.setToolTip("开机自启 / 首页排序 / 缓存目录 / 源码仓库 / 检查更新")
+        settings_btn.setToolTip("快捷键 / 开机自启 / 首页排序 / 缓存目录 / 源码仓库 / 检查更新")
         settings_btn.setStyleSheet("""
-            QPushButton {
-                color: #1A73E8;
-                border: none;
-                background: transparent;
-                padding: 0;
-                text-decoration: underline;
-            }
-            QPushButton:hover {
-                color: #1557b0;
-            }
+            QPushButton { color: #53657E; background: #FFFFFF; border: 1px solid #DAE2ED; border-radius: 6px; }
+            QPushButton:hover { color: #1A73E8; background: #EDF4FF; border-color: #AAC8F4; }
         """)
         settings_btn.clicked.connect(self.show_settings)
         bottom_layout.addWidget(settings_btn)
 
-        ip_text = f"IP: {self.ip}"
-        mac_text = f"MAC: {self.mac}" if self.mac and self.mac != "-" else ""
-        info_text = f"{ip_text}  |  {mac_text}" if mac_text else ip_text
-
-        info_label = QLabel(info_text)
-        info_label.setFont(ui_font(10, 11))
-        info_label.setStyleSheet("color: #999999;")
-        info_label.setCursor(QCursor(Qt.PointingHandCursor))
-        info_label.setToolTip("点击复制 IP")
-        info_label.mousePressEvent = lambda e: self.copy_to_clipboard(self.ip)
-        bottom_layout.addWidget(info_label)
-
+        self._update_dialog = None
+        self.check_thread = None
+        QApplication.instance().aboutToQuit.connect(self._stop_update_check)
         self.update_btn = QPushButton("检查更新")
         self.update_btn.setFixedSize(90, 28)
         self.update_btn.setCursor(QCursor(Qt.PointingHandCursor))
@@ -11225,18 +13660,12 @@ class ToolboxWindow(QMainWindow):
         self.update_btn.clicked.connect(self.check_for_updates)
 
         exit_btn = QPushButton("退出")
-        exit_btn.setFont(ui_font(10, 11))
+        exit_btn.setFont(ui_font(10, 12))
+        exit_btn.setFixedSize(56, 30)
         exit_btn.setCursor(QCursor(Qt.PointingHandCursor))
         exit_btn.setStyleSheet("""
-            QPushButton {
-                color: #D32F2F;
-                background: transparent;
-                border: none;
-                padding: 4px 6px;
-            }
-            QPushButton:hover {
-                color: #B71C1C;
-            }
+            QPushButton { color: #BA5555; background: transparent; border: 1px solid transparent; border-radius: 6px; }
+            QPushButton:hover { color: #B3261E; background: #FFF0EF; border-color: #F2D2D0; }
         """)
         exit_btn.clicked.connect(QApplication.instance().quit)
         bottom_layout.addWidget(exit_btn)
@@ -11251,11 +13680,33 @@ class ToolboxWindow(QMainWindow):
         self.hotkey = GlobalHotkey()
         self.hotkey.triggered.connect(self._on_global_hotkey)
         self.hotkey.start()
+        QApplication.instance().aboutToQuit.connect(self.hotkey.stop)
 
-    def _on_global_hotkey(self):
-        btn = self.toggle_buttons.get("文字雨")
-        if btn is not None:
-            btn.setChecked(not btn.isChecked())
+    def _on_global_hotkey(self, action):
+        if action == "rain":
+            btn = self.toggle_buttons.get("文字雨")
+            if btn is not None:
+                btn.setChecked(not btn.isChecked())
+        elif action == "picker":
+            if self._screen_pick_overlay is not None:
+                self._screen_pick_overlay.close()
+            else:
+                self._record_usage_and_call(self.show_screen_pick)
+        elif action in ("capture", "capture_copy", "custom_capture", "paste_image", "toggle_pins"):
+            self._add_to_history("截图贴图")
+            tool = self._get_screenshot_tool()
+            callbacks = {"capture": tool.capture, "capture_copy": tool.capture_copy,
+                         "custom_capture": tool.custom_capture, "paste_image": tool.paste,
+                         "toggle_pins": tool.toggle_pins}
+            callbacks[action]()
+
+    def _get_screenshot_tool(self):
+        if self.screenshot_tool is None:
+            self.screenshot_tool = ScreenshotTool(self)
+        return self.screenshot_tool
+
+    def show_screenshots(self):
+        self._get_screenshot_tool().capture()
 
     def refresh_stats(self):
         cpu_pct, mem_pct, used_gb, total_gb = get_system_stats()
@@ -11267,18 +13718,15 @@ class ToolboxWindow(QMainWindow):
     def create_section(self, title, buttons, callbacks=None, toggle_callbacks=None):
         toggle_callbacks = toggle_callbacks or {}
         section = QFrame()
-        section.setStyleSheet("""
-            QFrame {
-                background: #FAFAFA;
-            }
-        """)
+        section.setObjectName("toolSection")
+        section.setStyleSheet("QFrame#toolSection { background: #FFFFFF; border: 1px solid #E4EAF2; border-radius: 10px; }")
         layout = QVBoxLayout(section)
-        layout.setContentsMargins(15, 12, 15, 12)
+        layout.setContentsMargins(14, 12, 14, 14)
         layout.setSpacing(10)
 
         title_label = QLabel(title)
-        title_label.setFont(ui_font(14, 15, bold=True))
-        title_label.setStyleSheet("color: #222222;")
+        title_label.setFont(ui_font(12, 13, bold=True))
+        title_label.setStyleSheet("color: #53657E;")
         layout.addWidget(title_label)
 
         from PyQt5.QtWidgets import QGridLayout
@@ -11295,14 +13743,14 @@ class ToolboxWindow(QMainWindow):
                 btn.setToolTip(tip)
             btn.setStyleSheet("""
                 QPushButton {
-                    color: #222222;
-                    background: #FFFFFF;
-                    border: 1px solid #CFCFCF;
-                    border-radius: 4px;
+                    color: #33435A;
+                    background: #F8FAFD;
+                    border: 1px solid #E8EDF5;
+                    border-radius: 6px;
                     font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
                     font-size: __FS__px;
                     font-weight: normal;
-                    padding: 0 14px;
+                    padding: 0 8px;
                 }
                 QPushButton:hover {
                     background: #F0F6FF;
@@ -11310,7 +13758,7 @@ class ToolboxWindow(QMainWindow):
                     color: #1A73E8;
                 }
                 QPushButton:pressed {
-                    background: #E8E8E8;
+                    background: #E3EDFC;
                 }
             """.replace("__FS__", "13" if platform.system() == "Windows" else "12")
             )
@@ -11327,9 +13775,11 @@ class ToolboxWindow(QMainWindow):
                 }
                 """)
                 btn.toggled.connect(lambda checked, t=btn_text: self._record_usage_and_call(toggle_callbacks[t], checked))
+                btn.clicked.connect(self._remember_search)
                 self.toggle_buttons[btn_text] = btn
             elif callbacks and btn_text in callbacks:
-                btn.clicked.connect(lambda _, t=btn_text: self._record_usage_and_call(callbacks[t]))
+                self._tool_callbacks[btn_text] = callbacks[btn_text]
+                btn.clicked.connect(lambda _, t=btn_text: self._activate_tool(t))
             self.all_buttons[btn_text] = btn  # 存储按钮引用用于搜索
             section_buttons.append(btn_text)  # 记录到分类按钮列表
             row = i // 6
@@ -11490,11 +13940,11 @@ class ToolboxWindow(QMainWindow):
         self.popup = ProcessManagerWindow(self)
         self.popup.show()
 
-    def show_markup(self):
-        if self.markup_window is None:
-            self.markup_window = MarkupWindow()
-        self.markup_window.show()
-        self.markup_window.activateWindow()
+    def show_data_format(self):
+        if self.data_format_window is None:
+            self.data_format_window = DataFormatWindow()
+        self.data_format_window.show()
+        self.data_format_window.activateWindow()
 
     def show_codec(self):
         if self.codec_window is None:
@@ -11520,11 +13970,11 @@ class ToolboxWindow(QMainWindow):
         self.regex_window.show()
         self.regex_window.activateWindow()
 
-    def show_diff(self):
-        if self.diff_window is None:
-            self.diff_window = DiffWindow()
-        self.diff_window.show()
-        self.diff_window.activateWindow()
+    def show_text_tool(self):
+        if self.text_tool_window is None:
+            self.text_tool_window = TextToolWindow()
+        self.text_tool_window.show()
+        self.text_tool_window.activateWindow()
 
     def show_generator(self):
         if self.generator_window is None:
@@ -11532,41 +13982,17 @@ class ToolboxWindow(QMainWindow):
         self.generator_window.show()
         self.generator_window.activateWindow()
 
-    def show_qrcode(self):
-        if self.qr_window is None:
-            self.qr_window = QrCodeWindow()
-        self.qr_window.show()
-        self.qr_window.activateWindow()
-
-    def show_barcode(self):
-        if self.barcode_window is None:
-            self.barcode_window = BarcodeWindow()
-        self.barcode_window.show()
-        self.barcode_window.activateWindow()
-
-    def show_uuid(self):
-        if self.uuid_window is None:
-            self.uuid_window = UuidWindow()
-        self.uuid_window.show()
-        self.uuid_window.activateWindow()
-
-    def show_base_convert(self):
-        if self.baseconvert_window is None:
-            self.baseconvert_window = BaseConvertWindow()
-        self.baseconvert_window.show()
-        self.baseconvert_window.activateWindow()
+    def show_number_convert(self):
+        if self.number_convert_window is None:
+            self.number_convert_window = NumberConvertWindow()
+        self.number_convert_window.show()
+        self.number_convert_window.activateWindow()
 
     def show_divmod(self):
         if self.divmod_window is None:
             self.divmod_window = DivModWindow()
         self.divmod_window.show()
         self.divmod_window.activateWindow()
-
-    def show_convert(self):
-        if self.convert_window is None:
-            self.convert_window = ConvertWindow()
-        self.convert_window.show()
-        self.convert_window.activateWindow()
 
     def show_color(self):
         if self.color_window is None:
@@ -11592,7 +14018,7 @@ class ToolboxWindow(QMainWindow):
         if self.color_window is not None:
             hexval = color.name().upper()
             self.color_window.color_edit.setText(hexval)
-            self.color_window.set_status(f"屏幕取色 {hexval}，已复制到剪贴板", ok=True)
+            self.color_window.set_status(f"取色器 {hexval}，已复制到剪贴板", ok=True)
 
     def _on_screen_pick_closed(self, *_):
         self._screen_pick_overlay = None
@@ -11605,35 +14031,23 @@ class ToolboxWindow(QMainWindow):
         if prev:
             _mac_reactivate(prev)
 
-    def show_json_yaml(self):
-        if self.json_yaml_window is None:
-            self.json_yaml_window = JsonYamlWindow()
-        self.json_yaml_window.show()
-        self.json_yaml_window.activateWindow()
-
     def show_config(self):
         if self.config_window is None:
             self.config_window = ConfigWindow()
         self.config_window.show()
         self.config_window.activateWindow()
 
-    def show_command_reference(self):
-        if self.cmdref_window is None:
-            self.cmdref_window = CommandReferenceWindow()
-        self.cmdref_window.show()
-        self.cmdref_window.activateWindow()
+    def show_dev_reference(self):
+        if self.dev_reference_window is None:
+            self.dev_reference_window = DeveloperReferenceWindow()
+        self.dev_reference_window.show()
+        self.dev_reference_window.activateWindow()
 
     def show_mortgage(self):
         if self.mortgage_window is None:
             self.mortgage_window = MortgageWindow()
         self.mortgage_window.show()
         self.mortgage_window.activateWindow()
-
-    def show_http_status(self):
-        if self.http_status_window is None:
-            self.http_status_window = HttpStatusWindow()
-        self.http_status_window.show()
-        self.http_status_window.activateWindow()
 
     def show_chmod(self):
         if self.chmod_window is None:
@@ -11647,16 +14061,10 @@ class ToolboxWindow(QMainWindow):
         self.datetime_window.show()
         self.datetime_window.activateWindow()
 
-    def show_timestamp(self):
-        if self.timestamp_window is None:
-            self.timestamp_window = TimestampWindow()
-        self.timestamp_window.show()
-        self.timestamp_window.activateWindow()
-
     def show_reminder(self):
         if self.reminder_window is None:
             self.reminder_window = ReminderWindow(self.reminder_engine)
-        self.reminder_window.update_next_label()
+        self.reminder_window.refresh()
         self.reminder_window.show()
         self.reminder_window.activateWindow()
 
@@ -11666,17 +14074,6 @@ class ToolboxWindow(QMainWindow):
         self.unit_window.show()
         self.unit_window.activateWindow()
 
-    def show_random(self):
-        if self.random_window is None:
-            self.random_window = RandomWindow()
-        self.random_window.show()
-        self.random_window.activateWindow()
-
-    def show_textstat(self):
-        if self.textstat_window is None:
-            self.textstat_window = TextStatWindow()
-        self.textstat_window.show()
-        self.textstat_window.activateWindow()
 
     def show_cron(self):
         if self.cron_window is None:
@@ -11690,47 +14087,11 @@ class ToolboxWindow(QMainWindow):
         self.image_window.show()
         self.image_window.activateWindow()
 
-    def show_rmb(self):
-        if self.rmb_window is None:
-            self.rmb_window = RmbUppercaseWindow()
-        self.rmb_window.show()
-        self.rmb_window.activateWindow()
-
-    def show_roman(self):
-        if self.roman_window is None:
-            self.roman_window = RomanNumeralWindow()
-        self.roman_window.show()
-        self.roman_window.activateWindow()
-
-    def show_ping(self):
-        if self.ping_window is None:
-            self.ping_window = PingWindow()
-        self.ping_window.show()
-        self.ping_window.activateWindow()
-
-    def show_dns(self):
-        if self.dns_window is None:
-            self.dns_window = DNSWindow()
-        self.dns_window.show()
-        self.dns_window.activateWindow()
-
-    def show_traceroute(self):
-        if self.traceroute_window is None:
-            self.traceroute_window = TracerouteWindow()
-        self.traceroute_window.show()
-        self.traceroute_window.activateWindow()
-
-    def show_portscan(self):
-        if self.portscan_window is None:
-            self.portscan_window = PortScanWindow()
-        self.portscan_window.show()
-        self.portscan_window.activateWindow()
-
-    def show_speedtest(self):
-        if self.speedtest_window is None:
-            self.speedtest_window = SpeedTestWindow()
-        self.speedtest_window.show()
-        self.speedtest_window.activateWindow()
+    def show_network(self):
+        if self.network_window is None:
+            self.network_window = NetworkDiagnosticsWindow()
+        self.network_window.show()
+        self.network_window.activateWindow()
 
     def filter_tools(self):
         """根据搜索框内容过滤工具按钮，匹配工具名称、内部功能和拼音。"""
@@ -11742,6 +14103,8 @@ class ToolboxWindow(QMainWindow):
                 btn._filter_match = True
             for section, title_label, _, _ in self.sections:
                 section.setVisible(True)
+            self.tool_count_label.setText("%s 个工具" % len(self.all_buttons))
+            self.empty_search_label.hide()
             return
         # 模糊匹配：工具名称、提示内容或拼音包含关键词
         for btn_text, btn in self.all_buttons.items():
@@ -11750,7 +14113,8 @@ class ToolboxWindow(QMainWindow):
             pinyin_match = any(py.startswith(keyword) or keyword == py 
                              for py, tools in PINYIN_MAP.items() 
                              if btn_text in tools)
-            match = keyword in btn_text.lower() or keyword in tip or pinyin_match
+            alias_match = any(keyword in old.lower() for old, new in TOOL_RENAMES.items() if new == btn_text)
+            match = keyword in btn_text.lower() or keyword in tip or pinyin_match or alias_match
             btn.setVisible(match)
             btn._filter_match = match
         
@@ -11759,6 +14123,9 @@ class ToolboxWindow(QMainWindow):
             has_visible = any(self.all_buttons[text]._filter_match 
                             for text in btn_texts if text in self.all_buttons)
             section.setVisible(has_visible)
+        count = sum(btn._filter_match for btn in self.all_buttons.values())
+        self.tool_count_label.setText("找到 %s 个工具" % count)
+        self.empty_search_label.setVisible(count == 0)
 
     def open_single_match(self):
         """搜索框按回车时，如果只有一个匹配项，直接打开该工具。"""
@@ -11770,63 +14137,22 @@ class ToolboxWindow(QMainWindow):
             if not getattr(btn, '_filter_match', False):
                 continue
             matches.append(btn_text)
+        if matches:
+            self._remember_search()
         if len(matches) == 1:
-            btn = self.all_buttons[matches[0]]
-            btn.click()
+            self.all_buttons[matches[0]].click()
             self.search_input.clear()
 
+    def _activate_tool(self, name, from_search=True):
+        if from_search:
+            self._remember_search()
+        self.search_input.clear()
+        self._record_usage_and_call(self._tool_callbacks[name])
+
     def _record_usage_and_call(self, callback, *args):
-        """记录工具使用历史，然后调用原始回调。"""
-        # 从回调函数名推断工具名称
-        callback_name = callback.__name__ if hasattr(callback, '__name__') else str(callback)
-        # 查找对应的工具名称
-        tool_name = None
-        for name, method in [
-            ('进程管理', self.show_process_search),
-            ('端口扫描', self.show_portscan),
-            ('Ping 测试', self.show_ping),
-            ('DNS 查询', self.show_dns),
-            ('路由追踪', self.show_traceroute),
-            ('网络测速', self.show_speedtest),
-            ('配置', self.show_config),
-            ('JSON/XML', self.show_markup),
-            ('编解码', self.show_codec),
-            ('哈希计算', self.show_hash),
-            ('加解密', self.show_crypto),
-            ('正则测试', self.show_regex),
-            ('文本对比', self.show_diff),
-            ('二维码', self.show_qrcode),
-            ('条形码', self.show_barcode),
-            ('UUID', self.show_uuid),
-            ('格式转换', self.show_convert),
-            ('颜色', self.show_color),
-            ('屏幕取色', self.show_screen_pick),
-            ('JSON-YAML', self.show_json_yaml),
-            ('文本统计', self.show_textstat),
-            ('Cron 表达式', self.show_cron),
-            ('命令速查', self.show_command_reference),
-            ('HTTP 状态码', self.show_http_status),
-            ('chmod 权限', self.show_chmod),
-            ('日期时间', self.show_datetime),
-            ('时间戳', self.show_timestamp),
-            ('房贷计算器', self.show_mortgage),
-            ('图片处理', self.show_image_tool),
-            ('进制转换', self.show_base_convert),
-            ('商余计算', self.show_divmod),
-            ('单位转换', self.show_unit_convert),
-            ('随机数', self.show_random),
-            ('金额大写', self.show_rmb),
-            ('罗马数字', self.show_roman),
-        ]:
-            if callback == method:
-                tool_name = name
-                break
-        
-        # 记录到历史
+        tool_name = next((name for name, cb in self._tool_callbacks.items() if cb == callback), None)
         if tool_name:
             self._add_to_history(tool_name)
-        
-        # 调用原始回调
         callback(*args)
 
     def _load_usage_history(self):
@@ -11834,123 +14160,175 @@ class ToolboxWindow(QMainWindow):
         try:
             with open(TOOL_USAGE_HISTORY_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
+                if isinstance(data, dict):
+                    data = list(data)
                 if isinstance(data, list):
-                    return data[:self.max_history]
-                elif isinstance(data, dict):
-                    # 兼容 LRU 格式，取 key 列表
-                    return list(data.keys())[:self.max_history]
-        except (OSError, ValueError, json.JSONDecodeError):
+                    names = []
+                    for name in data:
+                        if not isinstance(name, str):
+                            continue
+                        name = TOOL_RENAMES.get(name, name)
+                        if name in self._tool_callbacks and name not in names:
+                            names.append(name)
+                    return names[:self.max_history]
+        except (OSError, ValueError):
             pass
         return []
 
-    def _save_usage_history(self):
-        """保存使用历史到文件。"""
+    def _load_search_history(self):
         try:
-            os.makedirs(os.path.dirname(TOOL_USAGE_HISTORY_PATH), exist_ok=True)
-            with open(TOOL_USAGE_HISTORY_PATH, "w", encoding="utf-8") as f:
-                json.dump(self.usage_history, f, ensure_ascii=False, indent=2)
+            with open(SEARCH_HISTORY_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return []
+        if not isinstance(data, list):
+            return []
+        terms, seen = [], set()
+        for value in data:
+            if not isinstance(value, str):
+                continue
+            term = value.strip()
+            if 0 < len(term) <= 80 and term.casefold() not in seen:
+                terms.append(term)
+                seen.add(term.casefold())
+        return terms[:8]
+
+    def _history_items(self, mode):
+        return self.usage_history if mode == "recent" else self.search_history
+
+    def _save_launcher_history(self, mode):
+        path = TOOL_USAGE_HISTORY_PATH if mode == "recent" else SEARCH_HISTORY_PATH
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self._history_items(mode), f, ensure_ascii=False, indent=2)
         except OSError:
             pass
 
+    def _remember_search(self):
+        term = self.search_input.text().strip()
+        if not term or len(term) > 80:
+            return
+        if not any(getattr(btn, "_filter_match", False) for btn in self.all_buttons.values()):
+            return
+        if self.search_history and self.search_history[0] == term:
+            return
+        self.search_history = ([term] + [s for s in self.search_history if s.casefold() != term.casefold()])[:8]
+        self._save_launcher_history("search")
+        if self.history_mode == "search":
+            self._refresh_history_display()
+
     def _add_to_history(self, tool_name):
-        """添加工具到使用历史。"""
-        if tool_name in self.usage_history:
-            self.usage_history.remove(tool_name)
-        self.usage_history.insert(0, tool_name)
-        if len(self.usage_history) > self.max_history:
-            self.usage_history = self.usage_history[:self.max_history]
-        self._save_usage_history()
+        if tool_name not in self._tool_callbacks:
+            return
+        self.usage_history = ([tool_name] + [name for name in self.usage_history if name != tool_name])[:self.max_history]
+        self._save_launcher_history("recent")
+        if self.history_mode == "recent":
+            self._refresh_history_display()
+
+    def _set_history_mode(self, mode):
+        self.history_mode = mode
+        for name, btn in self.history_tabs.items():
+            btn.setChecked(name == mode)
         self._refresh_history_display()
+
+    def _use_history_entry(self, mode, value):
+        if mode == "recent":
+            self._activate_tool(value, from_search=False)
+        else:
+            self.search_input.setText(value)
+            self.search_input.setFocus()
+            self.search_input.selectAll()
 
     def _refresh_history_display(self):
-        """刷新使用历史按钮区域：每行最多 6 个胶囊，超出换行。"""
-        while self.history_rows_layout.count():
-            row = self.history_rows_layout.takeAt(0).layout()
-            if row:
-                while row.count():
-                    w = row.takeAt(0).widget()
-                    if w:
-                        w.deleteLater()
-                row.deleteLater()
-
-        self.history_clear_all.setVisible(bool(self.usage_history))
-        if not self.usage_history:
-            return
-        
-        # 回调映射
-        callback_map = {
-            '进程管理': self.show_process_search,
-            '端口扫描': self.show_portscan,
-            'Ping 测试': self.show_ping,
-            'DNS 查询': self.show_dns,
-            '路由追踪': self.show_traceroute,
-            '网络测速': self.show_speedtest,
-            '配置': self.show_config,
-            'JSON/XML': self.show_markup,
-            '编解码': self.show_codec,
-            '哈希计算': self.show_hash,
-            '加解密': self.show_crypto,
-            '正则测试': self.show_regex,
-            '文本对比': self.show_diff,
-            '二维码': self.show_qrcode,
-            '条形码': self.show_barcode,
-            'UUID': self.show_uuid,
-            '格式转换': self.show_convert,
-            '颜色': self.show_color,
-            '屏幕取色': self.show_screen_pick,
-            'JSON-YAML': self.show_json_yaml,
-            '文本统计': self.show_textstat,
-            'Cron 表达式': self.show_cron,
-            '命令速查': self.show_command_reference,
-            'HTTP 状态码': self.show_http_status,
-            'chmod 权限': self.show_chmod,
-            '日期时间': self.show_datetime,
-            '时间戳': self.show_timestamp,
-            '房贷计算器': self.show_mortgage,
-            '图片处理': self.show_image_tool,
-            '进制转换': self.show_base_convert,
-            '商余计算': self.show_divmod,
-            '单位转换': self.show_unit_convert,
-            '随机数': self.show_random,
-            '金额大写': self.show_rmb,
-            '罗马数字': self.show_roman,
-        }
-        
-        # 只展示一行：最多 6 个胶囊，更早的历史仍保存在文件里
-        row = QHBoxLayout()
-        row.setSpacing(6)
-        row.setContentsMargins(0, 0, 0, 0)
-        for name in self.usage_history[:6]:
-            btn = QPushButton(name)
+        while self.history_row.count():
+            widget = self.history_row.takeAt(0).widget()
+            if widget:
+                widget.hide()
+                widget.deleteLater()
+        mode = self.history_mode
+        items = self._history_items(mode)
+        self.history_more.setText("全部 (%d)" % len(items) if items else "全部")
+        self.history_more.setEnabled(bool(items))
+        if not items:
+            text = "打开工具后会出现在这里" if mode == "recent" else "确认搜索后保留记录，不记录输入过程"
+            hint = QLabel(text)
+            hint.setFixedHeight(28)
+            hint.setFont(ui_font(10, 12))
+            hint.setStyleSheet("color: #9AA7B8;")
+            self.history_row.addWidget(hint)
+        available = self.history_widget.contentsRect().width()
+        for value in items[:5]:
+            btn = QPushButton()
+            btn.setFont(ui_font(10, 12))
+            width = min(160, btn.fontMetrics().horizontalAdvance(value) + 24)
+            if width > available and self.history_row.count():
+                btn.deleteLater()
+                break
+            width = min(width, max(40, available))
+            btn.setText(btn.fontMetrics().elidedText(value, Qt.ElideRight, width - 24).replace("&", "&&"))
+            btn.setFixedSize(width, 28)
+            btn.setProperty("historyValue", value)
+            btn.setToolTip(value + "\n" + ("点击打开工具" if mode == "recent" else "点击重新搜索") + " · 右键移除")
             btn.setCursor(Qt.PointingHandCursor)
-            btn.setFixedHeight(28)
             btn.setStyleSheet("""
-                QPushButton {
-                    background: #FFFFFF;
-                    border: 1px solid #E0E0E0;
-                    border-radius: 14px;
-                    padding: 0 14px;
-                    font-size: 12px;
-                    color: #555555;
-                }
-                QPushButton:hover {
-                    background: #F0F5FF;
-                    border: 1px solid #1A73E8;
-                    color: #1A73E8;
-                }
+                QPushButton { background: #EDF3FC; border: 1px solid #DDE7F6;
+                    border-radius: 14px; padding: 0 10px; color: #526A8C; }
+                QPushButton:hover { background: #F0F5FF; border-color: #1A73E8; color: #1A73E8; }
             """)
-            cb = callback_map.get(name)
-            if cb:
-                btn.clicked.connect(lambda checked, callback=cb: callback())
-            row.addWidget(btn)
-        row.addStretch()
-        self.history_rows_layout.addLayout(row)
+            btn.clicked.connect(lambda _checked, m=mode, v=value: self._use_history_entry(m, v))
+            btn.setContextMenuPolicy(Qt.CustomContextMenu)
+            btn.customContextMenuRequested.connect(
+                lambda pos, b=btn, m=mode, v=value: self._show_history_context(m, v, b.mapToGlobal(pos)))
+            self.history_row.addWidget(btn)
+            available -= width + self.history_row.spacing()
+        self.history_row.addStretch()
 
-    def _clear_all_history(self):
-        """清空所有使用历史。"""
-        self.usage_history.clear()
-        self._save_usage_history()
+    def _populate_history_menu(self):
+        self.history_menu.clear()
+        self.history_menu.setToolTipsVisible(True)
+        mode = self.history_mode
+        items = self._history_items(mode)
+        title = "最近使用" if mode == "recent" else "搜索记录"
+        self.history_menu.addAction(title + " · 最近优先").setEnabled(False)
+        for value in items:
+            label = self.history_more.fontMetrics().elidedText(value, Qt.ElideRight, 320).replace("&", "&&")
+            action = self.history_menu.addAction(label)
+            action.setToolTip(value)
+            action.setData(value)
+            action.triggered.connect(lambda _checked, m=mode, v=value: self._use_history_entry(m, v))
+        self.history_menu.addSeparator()
+        remove_menu = self.history_menu.addMenu("移除单条记录")
+        for value in items:
+            label = self.history_more.fontMetrics().elidedText(value, Qt.ElideRight, 320).replace("&", "&&")
+            action = remove_menu.addAction(label)
+            action.setToolTip(value)
+            action.triggered.connect(lambda _checked, m=mode, v=value: self._remove_history_entry(m, v))
+        self.history_menu.addAction("清空" + title).triggered.connect(lambda _checked: self._clear_history(mode))
+
+    def _show_history_context(self, mode, value, position):
+        menu = QMenu(self)
+        menu.setStyleSheet(self.history_menu.styleSheet())
+        menu.addAction("从记录中移除").triggered.connect(lambda _checked: self._remove_history_entry(mode, value))
+        menu.exec_(position)
+        menu.deleteLater()
+
+    def _remove_history_entry(self, mode, value):
+        items = self._history_items(mode)
+        if value in items:
+            items.remove(value)
+            self._save_launcher_history(mode)
+            self._refresh_history_display()
+
+    def _clear_history(self, mode):
+        self._history_items(mode).clear()
+        self._save_launcher_history(mode)
         self._refresh_history_display()
+
+    def eventFilter(self, obj, event):
+        if obj is self.history_widget and event.type() == QEvent.Resize:
+            self._refresh_history_display()
+        return super().eventFilter(obj, event)
 
     def apply_section_order(self):
         """按 self.section_order 重排首页分组，并持久化。"""
@@ -12018,65 +14396,719 @@ class ToolboxWindow(QMainWindow):
         QMessageBox.information(self, "已复制", f"已复制到剪贴板:\n{text}", QMessageBox.Ok)
 
     def check_for_updates(self):
-        """检查更新：后台线程请求 version.json"""
+        if self._update_dialog is not None and self._update_dialog.isVisible():
+            self._update_dialog.raise_()
+            self._update_dialog.activateWindow()
+            return
+        if self.check_thread is not None and self.check_thread.isRunning():
+            return
+        self._update_parent = QApplication.activeWindow() or self
         self.update_btn.setEnabled(False)
         self.update_btn.setText("检查中...")
-        self.check_thread = CheckUpdateThread()
+        self.check_thread = CheckUpdateThread(self)
         self.check_thread.result.connect(self._on_check_update_result)
+        self.check_thread.finished.connect(self._update_check_finished)
         self.check_thread.start()
-    
+
+    def _update_check_finished(self):
+        thread = self.sender()
+        if self.check_thread is thread:
+            self.check_thread = None
+        thread.deleteLater()
+
+    def _stop_update_check(self):
+        if self.check_thread is not None:
+            self.check_thread.wait()
+
     def _on_check_update_result(self, success, data, error):
         self.update_btn.setEnabled(True)
         self.update_btn.setText("检查更新")
-        
+        parent = self._update_parent if self._update_parent.isVisible() else self
         if not success:
-            QMessageBox.warning(self, "检查更新", error, QMessageBox.Ok)
+            box = QMessageBox(QMessageBox.Warning, "检查更新", error, QMessageBox.Ok, parent)
+            box.setTextFormat(Qt.PlainText)
+            box.exec_()
             return
-        
-        remote_version = data.get('version', '')
-        changelog = data.get('changelog', '')
-        
-        if not self._is_newer_version(APP_VERSION, remote_version):
-            QMessageBox.information(self, "检查更新", f"当前已是最新版本 v{APP_VERSION}", QMessageBox.Ok)
+        if not self._is_newer_version(APP_VERSION, data['version']):
+            QMessageBox.information(parent, "检查更新", f"当前已是最新版本 v{APP_VERSION}", QMessageBox.Ok)
             return
-        
-        msg = f"发现新版本 v{remote_version}\n\n更新内容：\n{changelog}\n\n是否用浏览器打开下载？"
-        reply = QMessageBox.question(self, "检查更新", msg, QMessageBox.Yes | QMessageBox.No)
-        
-        if reply == QMessageBox.Yes:
-            self._download_update(data)
+        self._download_update(data, parent)
 
     def _is_newer_version(self, current, remote):
-        """比较版本号，remote > current 返回 True"""
+        return update_version_parts(remote) > update_version_parts(current)
+
+    def _download_update(self, data, parent):
         try:
-            cur_parts = [int(x) for x in current.split('.')]
-            rem_parts = [int(x) for x in remote.split('.')]
-            return rem_parts > cur_parts
-        except:
-            return False
+            self._update_dialog = AppUpdateDialog(data, parent)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(parent, "下载更新", str(exc), QMessageBox.Ok)
+            return
+        self._update_dialog.install_ready.connect(QApplication.instance().quit)
+        self._update_dialog.show()
 
-    def _download_update(self, data):
-        """用系统浏览器打开 R2 安装包地址下载。
-        浏览器自带正常 UA、可走系统代理，避免应用内直连 r2.dev 被 403 拦截。"""
-        system = platform.system()
-        if system == "Darwin":
-            url = data.get('mac_url', '')
-        elif system == "Windows":
-            url = data.get('win_url', '')
+
+def update_version_parts(version):
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9]{1,5}(?:\.[0-9]{1,5}){1,3}", version):
+        raise ValueError("更新服务器返回了无效的版本号。")
+    parts = tuple(int(part) for part in version.split('.'))
+    return parts + (0,) * (4 - len(parts))
+
+
+def validate_update_url(url):
+    if not isinstance(url, str) or any(ord(char) < 33 for char in url):
+        raise ValueError("更新下载地址无效。")
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != 'https' or not parts.hostname or parts.username or parts.password or parts.fragment:
+        raise ValueError("更新仅接受不含账号信息的 HTTPS 下载地址。")
+
+
+class UpdateRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        validate_update_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def update_install_target(system):
+    if system == "Windows":
+        if getattr(sys, "frozen", False):
+            return os.path.abspath(sys.executable)
+        return os.path.join(os.environ['LOCALAPPDATA'], "PersonalToolbox", "Toolbox.exe")
+    if system == "Darwin":
+        return os.path.join(QStandardPaths.writableLocation(QStandardPaths.DownloadLocation), "Toolbox.app")
+    raise ValueError("应用内更新仅支持 Windows 和 macOS。")
+
+
+def extract_update_package(archive_path, directory, system, cancelled):
+    with zipfile.ZipFile(archive_path) as archive:
+        entries = archive.infolist()
+        if len(entries) > 30000 or sum(entry.file_size for entry in entries) > 2 * 1024 ** 3:
+            raise ValueError("更新包解压后的大小或文件数超出限制。")
+        names = {}
+        for entry in entries:
+            name = entry.filename.rstrip('/')
+            parts = name.split('/')
+            mode = entry.external_attr >> 16
+            if (entry.orig_filename != entry.filename or not name or '\\' in name
+                    or ntpath.splitdrive(name)[0] or any(part in ('', '.', '..') for part in parts)
+                    or any(ord(char) < 32 for char in name)
+                    or stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR, stat.S_IFLNK)):
+                raise ValueError("更新包包含不安全的路径或文件类型。")
+            if system == 'Windows' and (stat.S_ISLNK(mode) or any(
+                    ':' in part or part.endswith(('.', ' ')) or re.fullmatch(
+                        r'(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?', part, re.I)
+                    for part in parts)):
+                raise ValueError("更新包包含不安全的 Windows 文件名。")
+            key = name.casefold()
+            if key in names:
+                raise ValueError("更新包包含重复的文件路径。")
+            names[key] = entry
+            if entry.flag_bits & 1:
+                raise ValueError("无法安装加密的更新包。")
+
+        files = [entry for entry in entries if not entry.is_dir()
+                 and not entry.filename.startswith('__MACOSX/')
+                 and posixpath.basename(entry.filename) != '.DS_Store']
+        if system == 'Windows':
+            candidates = [entry for entry in files if posixpath.basename(entry.filename).casefold()
+                          in ('toolbox.exe', 'toolbox-windows.exe')]
+            if len(candidates) != 1 or len(files) != 1:
+                raise ValueError("Windows 更新包应仅包含单文件 Toolbox.exe。")
+            selected = [(candidates[0], 'Toolbox.exe')]
+            payload = os.path.join(directory, 'Toolbox.exe')
+        elif system == 'Darwin':
+            candidates = [entry for entry in files
+                          if entry.filename.endswith('Toolbox.app/Contents/Info.plist')]
+            if len(candidates) != 1:
+                raise ValueError("macOS 更新包中未找到唯一的 Toolbox.app。")
+            prefix = candidates[0].filename[:-len('Contents/Info.plist')]
+            selected = [(entry, 'Toolbox.app/' + entry.filename[len(prefix):]) for entry in entries
+                        if entry.filename.startswith(prefix) and entry.filename != prefix]
+            payload = os.path.join(directory, 'Toolbox.app')
         else:
-            QMessageBox.warning(self, "下载更新", "不支持的平台", QMessageBox.Ok)
-            return
+            raise ValueError("不支持的更新平台。")
 
-        if not url:
-            QMessageBox.warning(self, "下载更新", "未找到对应平台的下载链接", QMessageBox.Ok)
-            return
+        links, directories = [], []
+        link_names = {relative.rstrip('/') for entry, relative in selected
+                      if stat.S_ISLNK(entry.external_attr >> 16)}
+        for entry, relative in selected:
+            if cancelled.is_set():
+                raise InterruptedError("已取消更新。")
+            components = relative.rstrip('/').split('/')
+            if any('/'.join(components[:index]) in link_names for index in range(1, len(components))):
+                raise ValueError("更新包不能通过符号链接写入文件。")
+            path = os.path.join(directory, *components)
+            mode = (entry.external_attr >> 16) & 0o777
+            if entry.is_dir():
+                os.makedirs(path, exist_ok=True)
+                directories.append((path, mode))
+                continue
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if stat.S_ISLNK(entry.external_attr >> 16):
+                if entry.file_size > 4096:
+                    raise ValueError("更新包的符号链接过长。")
+                target = archive.read(entry).decode('utf-8')
+                resolved = posixpath.normpath(posixpath.join(posixpath.dirname(relative), target))
+                if (not target or '\\' in target or ntpath.splitdrive(target)[0]
+                        or target.startswith('/') or resolved == '..' or resolved.startswith('../')
+                        or not resolved.startswith('Toolbox.app/')):
+                    raise ValueError("更新包的符号链接指向应用目录之外。")
+                links.append((path, target))
+                continue
+            with archive.open(entry) as source, open(path, 'xb') as output:
+                while True:
+                    if cancelled.is_set():
+                        raise InterruptedError("已取消更新。")
+                    chunk = source.read(256 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+            if system == 'Darwin' and mode:
+                os.chmod(path, mode)
+        for path, target in links:
+            os.symlink(target, path)
+        for path, _ in links:
+            resolved = os.path.realpath(path)
+            if (os.path.commonpath((os.path.realpath(payload), resolved)) != os.path.realpath(payload)
+                    or not os.path.exists(path)):
+                raise ValueError("更新包包含越界或失效的符号链接。")
+        if system == 'Darwin':
+            for path, mode in reversed(directories):
+                if mode:
+                    os.chmod(path, mode)
+            with open(os.path.join(payload, 'Contents', 'Info.plist'), 'rb') as file:
+                info = plistlib.load(file)
+            if not isinstance(info, dict):
+                raise ValueError("更新包的应用信息格式无效。")
+            executable = info.get('CFBundleExecutable', '')
+            if (info.get('CFBundleIdentifier') != 'com.jimmy.personal_tool'
+                    or not isinstance(executable, str) or not executable
+                    or executable in ('.', '..') or ntpath.splitdrive(executable)[0]
+                    or '/' in executable or '\\' in executable):
+                raise ValueError("更新包不是系统工具箱应用。")
+            executable_path = os.path.join(payload, 'Contents', 'MacOS', executable)
+            with open(executable_path, 'rb') as file:
+                magic = file.read(4)
+            if magic not in (b'\xfe\xed\xfa\xce', b'\xce\xfa\xed\xfe', b'\xfe\xed\xfa\xcf',
+                             b'\xcf\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca',
+                             b'\xca\xfe\xba\xbf', b'\xbf\xba\xfe\xca'):
+                raise ValueError("更新包中缺少有效的 macOS 可执行程序。")
+            os.chmod(executable_path, os.stat(executable_path).st_mode | stat.S_IXUSR)
+        else:
+            with open(payload, 'rb') as file:
+                header = file.read(64)
+                if len(header) < 64 or header[:2] != b'MZ':
+                    raise ValueError("更新包不是有效的 Windows 应用程序。")
+                offset = int.from_bytes(header[60:64], 'little')
+                if offset < 64 or offset > os.path.getsize(payload) - 24:
+                    raise ValueError("更新包的 Windows 可执行文件头损坏。")
+                file.seek(offset)
+                if file.read(4) != b'PE\x00\x00':
+                    raise ValueError("更新包的 Windows 可执行文件头损坏。")
+        return payload
 
-        QDesktopServices.openUrl(QUrl(url))
-        QMessageBox.information(
-            self, "已在浏览器打开",
-            f"新版本 v{data.get('version', '')} 的下载地址已在默认浏览器打开。\n"
-            "下载完成后请退出应用，解压并替换旧版本。",
-            QMessageBox.Ok)
+
+class UpdateDownloadWorker(QThread):
+    progress = pyqtSignal(int, int)
+    unpacking = pyqtSignal()
+    ready = pyqtSignal(str, str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, url, system, parent):
+        super().__init__(parent)
+        self.url = url
+        self.system = system
+        self.cancelled = threading.Event()
+        self.directory = None
+
+    def cancel(self):
+        self.cancelled.set()
+
+    def run(self):
+        directory, delivered = None, False
+        try:
+            validate_update_url(self.url)
+            directory = tempfile.mkdtemp(prefix='toolbox_update_')
+            self.directory = directory
+            archive_path = os.path.join(directory, 'update.zip')
+            request = urllib.request.Request(self.url, headers={
+                'User-Agent': 'Mozilla/5.0', 'Accept': 'application/zip, application/octet-stream'})
+            opener = urllib.request.build_opener(UpdateRedirectHandler())
+            with opener.open(request, timeout=15) as response, open(archive_path, 'wb') as output:
+                validate_update_url(response.geturl())
+                total = int(response.headers.get('Content-Length', '0'))
+                limit = 1024 ** 3
+                if total < 0 or total > limit:
+                    raise ValueError("更新包大小超出 1 GB 限制。")
+                received, last_progress = 0, 0
+                self.progress.emit(0, total)
+                while True:
+                    if self.cancelled.is_set():
+                        raise InterruptedError("已取消更新。")
+                    chunk = response.read(256 * 1024)
+                    if not chunk:
+                        break
+                    received += len(chunk)
+                    if received > limit:
+                        raise ValueError("更新包大小超出 1 GB 限制。")
+                    output.write(chunk)
+                    if time.monotonic() - last_progress >= 0.1:
+                        self.progress.emit(received, total)
+                        last_progress = time.monotonic()
+                if total and received != total:
+                    raise ValueError("更新包下载不完整，请重试。")
+                self.progress.emit(received, total)
+            if self.cancelled.is_set():
+                raise InterruptedError("已取消更新。")
+            self.unpacking.emit()
+            payload = extract_update_package(archive_path, directory, self.system, self.cancelled)
+            os.remove(archive_path)
+            if self.cancelled.is_set():
+                raise InterruptedError("已取消更新。")
+            delivered = True
+            self.ready.emit(directory, payload)
+        except InterruptedError:
+            pass
+        except Exception as exc:
+            if not self.cancelled.is_set():
+                self.failed.emit("下载或解压失败：" + str(exc)[:400])
+        finally:
+            if directory is not None and not delivered:
+                shutil.rmtree(directory, ignore_errors=True)
+
+
+def start_update_installer(directory, payload, target, shortcut, system):
+    token = uuid.uuid4().hex
+    parent = os.path.dirname(target)
+    incoming = os.path.join(parent, '.toolbox-update-' + token + ('.exe' if system == 'Windows' else '.app'))
+    backup = os.path.join(parent, '.toolbox-backup-' + token + ('.exe' if system == 'Windows' else '.app'))
+    ready = os.path.join(directory, 'installer.ready')
+    error = os.path.join(directory, 'installer.error')
+    old_command = autostart_programs()
+    env = os.environ.copy()
+    env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+    if system == 'Windows':
+        plan = {'source': payload, 'target': target, 'incoming': incoming, 'backup': backup,
+                'shortcut': shortcut, 'process_id': os.getpid(), 'ready': ready, 'error': error,
+                'directory': directory, 'old_program': old_command[0],
+                'old_arguments': subprocess.list2cmdline(old_command[1:])}
+        plan_path = os.path.join(directory, 'install.json')
+        with open(plan_path, 'w', encoding='utf-8') as file:
+            json.dump(plan, file, ensure_ascii=False)
+        env['PERSONAL_TOOLBOX_UPDATE_PLAN'] = plan_path
+        script = r'''
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$plan = Get-Content -LiteralPath $env:PERSONAL_TOOLBOX_UPDATE_PLAN -Encoding UTF8 -Raw | ConvertFrom-Json
+$prepared = $false
+$replaced = $false
+$successful = $false
+$started = $null
+try {
+    if ([IO.Directory]::Exists($plan.target)) { throw '安装位置被同名文件夹占用。' }
+    [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($plan.target)) | Out-Null
+    [IO.File]::Copy($plan.source, $plan.incoming, $false)
+    if ((Get-FileHash -LiteralPath $plan.source -Algorithm SHA256).Hash -ne
+        (Get-FileHash -LiteralPath $plan.incoming -Algorithm SHA256).Hash) {
+        throw '安装文件复制校验失败。'
+    }
+    $previousProcess = $null
+    try { $previousProcess = [Diagnostics.Process]::GetProcessById([int]$plan.process_id) } catch [ArgumentException] {}
+    [IO.File]::WriteAllText($plan.ready, 'ready')
+    $prepared = $true
+    if ($null -ne $previousProcess -and -not $previousProcess.WaitForExit(60000)) {
+        throw '旧版本未能退出，更新已停止。'
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ($true) {
+        try {
+            if ([IO.File]::Exists($plan.target)) {
+                [IO.File]::Replace($plan.incoming, $plan.target, $plan.backup)
+            } else {
+                [IO.File]::Move($plan.incoming, $plan.target)
+            }
+            $replaced = $true
+            break
+        } catch [IO.IOException] {
+            $code = $_.Exception.GetBaseException().HResult -band 65535
+            if ($code -notin @(32, 33) -or [DateTime]::UtcNow -ge $deadline) { throw }
+            Start-Sleep -Milliseconds 200
+        }
+    }
+    $started = Start-Process -FilePath $plan.target -WorkingDirectory ([IO.Path]::GetDirectoryName($plan.target)) -PassThru
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    $name = [IO.Path]::GetFileNameWithoutExtension($plan.target)
+    while ($true) {
+        $windows = @(Get-Process -Name $name -ErrorAction SilentlyContinue | Where-Object {
+            $_.Path -eq $plan.target -and $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -like '系统工具箱*'
+        })
+        if (@($windows | Where-Object { $_.MainWindowTitle -like '*启动失败*' }).Count -gt 0) {
+            throw '新版本报告启动失败。'
+        }
+        if ($windows.Count -gt 0) { break }
+        if ($started.HasExited) { throw '新版本未能启动。' }
+        if ([DateTime]::UtcNow -ge $deadline) { throw '新版本未能显示主窗口。' }
+        Start-Sleep -Milliseconds 200
+    }
+    $shortcutWarning = ''
+    if ($plan.shortcut) {
+        try {
+            $shell = New-Object -ComObject WScript.Shell
+            $link = $shell.CreateShortcut($plan.shortcut)
+            $link.TargetPath = $plan.target
+            $link.Arguments = ''
+            $link.WindowStyle = 1
+            $link.WorkingDirectory = [IO.Path]::GetDirectoryName($plan.target)
+            $link.IconLocation = $plan.target + ',0'
+            $link.Description = '系统工具箱'
+            $link.Save()
+        } catch { $shortcutWarning = '新版已安装，但桌面快捷方式创建失败。应用位置：' + $plan.target }
+    }
+    $successful = $true
+    try { if ([IO.File]::Exists($plan.backup)) { [IO.File]::Delete($plan.backup) } } catch {}
+    if ($shortcutWarning) {
+        Add-Type -AssemblyName System.Windows.Forms
+        [Windows.Forms.MessageBox]::Show($shortcutWarning, '工具箱更新') | Out-Null
+    }
+} catch {
+    $message = $_.Exception.Message
+    if ($replaced) {
+        try {
+            if ($null -ne $started -and -not $started.HasExited) {
+                $killer = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+                & $killer /PID $started.Id /T /F | Out-Null
+                $started.WaitForExit(5000) | Out-Null
+            }
+            $deadline = [DateTime]::UtcNow.AddSeconds(30)
+            while ($true) {
+                try {
+                    if ([IO.File]::Exists($plan.backup)) {
+                        [IO.File]::Replace($plan.backup, $plan.target, [NullString]::Value)
+                    } elseif ([IO.File]::Exists($plan.target)) {
+                        [IO.File]::Delete($plan.target)
+                    }
+                    break
+                } catch [IO.IOException] {
+                    $code = $_.Exception.GetBaseException().HResult -band 65535
+                    if ($code -notin @(32, 33) -or [DateTime]::UtcNow -ge $deadline) { throw }
+                    Start-Sleep -Milliseconds 200
+                }
+            }
+        } catch { $message += "`n恢复旧版本失败：" + $_.Exception.Message + "`n请保留备份：" + $plan.backup }
+    }
+    [IO.File]::WriteAllText($plan.error, $message, [Text.UTF8Encoding]::new($false))
+    if ($prepared) {
+        Add-Type -AssemblyName System.Windows.Forms
+        [Windows.Forms.MessageBox]::Show('更新失败：' + $message, '工具箱更新失败') | Out-Null
+        if ($null -ne $previousProcess -and $previousProcess.HasExited) {
+            try {
+                if ($plan.old_arguments) {
+                    Start-Process -FilePath $plan.old_program -ArgumentList $plan.old_arguments | Out-Null
+                } else { Start-Process -FilePath $plan.old_program | Out-Null }
+            } catch {}
+        }
+    }
+} finally {
+    if ([IO.File]::Exists($plan.incoming)) { [IO.File]::Delete($plan.incoming) }
+    if ($successful) { Remove-Item -LiteralPath $plan.directory -Recurse -Force }
+}
+'''
+        encoded = base64.b64encode(script.encode('utf-16-le')).decode('ascii')
+        command = [os.path.join(os.environ['SystemRoot'], 'System32', 'WindowsPowerShell',
+                               'v1.0', 'powershell.exe'), '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded]
+        # Windows PowerShell 在 DETACHED_PROCESS 下可能直接退出而不执行命令。
+        kwargs = {'creationflags': subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
+    else:
+        values = {'source': payload, 'target': target, 'incoming': incoming, 'backup': backup,
+                  'ready': ready, 'error': error, 'directory': directory}
+        assignments = '\n'.join(key + '=' + shlex.quote(value) for key, value in values.items())
+        script = assignments + '\nold_pid=' + str(os.getpid()) + '\n' + r'''
+prepared=0
+replaced=0
+had_old=0
+fail() {
+    message="$1"
+    if [ "$replaced" = 1 ]; then
+        if [ "$had_old" = 1 ]; then
+            /bin/rm -rf "$target"
+            /bin/mv "$backup" "$target" || message="$message 旧版备份仍在：$backup"
+        else
+            /bin/rm -rf "$target"
+        fi
+    fi
+    /bin/rm -rf "$incoming"
+    printf '%s' "$message" > "$error"
+    if [ "$prepared" = 1 ]; then
+        /usr/bin/osascript -e 'on run argv
+            display alert "工具箱更新失败" message (item 1 of argv)
+        end run' "$message"
+''' + '        if ! /bin/kill -0 "$old_pid" 2>/dev/null; then\n            ' + ' '.join(shlex.quote(arg) for arg in old_command) + r'''
+        fi
+    fi
+    exit 1
+}
+/bin/mkdir -p "$(/usr/bin/dirname "$target")" || fail '无法创建安装目录。'
+/usr/bin/ditto "$source" "$incoming" || fail '无法复制新版应用，请检查安装目录权限。'
+printf '%s' ready > "$ready" || fail '无法通知应用准备完成。'
+prepared=1
+count=0
+while /bin/kill -0 "$old_pid" 2>/dev/null; do
+    count=$((count + 1))
+    [ "$count" -le 300 ] || fail '旧版本未能退出，更新已停止。'
+    /bin/sleep 0.2
+done
+if [ -e "$target" ]; then
+    /bin/mv "$target" "$backup" || fail '无法备份旧版本。'
+    had_old=1
+fi
+replaced=1
+/bin/mv "$incoming" "$target" || fail '无法安装新版本。'
+/usr/bin/open -n "$target" || fail '新版本未能启动。'
+/bin/rm -rf "$backup" "$directory"
+'''
+        script_path = os.path.join(directory, 'install.sh')
+        with open(script_path, 'w', encoding='utf-8', newline='\n') as file:
+            file.write(script)
+        command, kwargs = ['/bin/sh', script_path], {'start_new_session': True}
+    if system == 'Windows' and getattr(sys, 'frozen', False):
+        ctypes.windll.kernel32.SetDllDirectoryW(None)
+    try:
+        process = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+    finally:
+        if system == 'Windows' and getattr(sys, 'frozen', False):
+            ctypes.windll.kernel32.SetDllDirectoryW(sys._MEIPASS)
+    return process, ready, error
+
+
+class AppUpdateDialog(QDialog):
+    install_ready = pyqtSignal()
+
+    def __init__(self, data, parent):
+        super().__init__(parent)
+        self.system = platform.system()
+        self.target = update_install_target(self.system)
+        self.url = data.get('win_url' if self.system == 'Windows' else 'mac_url', '')
+        validate_update_url(self.url)
+        self._phase = 'idle'
+        self._worker = None
+        self._directory = None
+        self._helper = None
+        self.setWindowTitle('应用内更新')
+        self.setWindowModality(Qt.ApplicationModal)
+        self.resize(590, 475)
+        self.setStyleSheet('QDialog { background: #F6F8FC; } QLabel { color: #344054; }')
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(12)
+        title = QLabel('发现新版本 v' + data['version'])
+        title.setFont(ui_font(18, 22, True))
+        title.setTextFormat(Qt.PlainText)
+        layout.addWidget(title)
+        layout.addWidget(QLabel('当前版本 v' + APP_VERSION + ' · 在应用内下载、解压并安装'))
+        changelog = QPlainTextEdit()
+        changelog.setReadOnly(True)
+        changelog.setPlainText(data.get('changelog') or '此版本未提供更新说明。')
+        changelog.setMaximumHeight(140)
+        changelog.setStyleSheet('QPlainTextEdit { background: white; border: 1px solid #E1E7EF; border-radius: 8px; padding: 10px; }')
+        layout.addWidget(changelog)
+        layout.addWidget(QLabel('安装位置（下次更新覆盖同一位置）'))
+        location_row = QHBoxLayout()
+        self.location = QLineEdit(self.target)
+        self.location.setReadOnly(True)
+        self.location.setToolTip(self.target)
+        location_row.addWidget(self.location, 1)
+        self.choose_btn = QPushButton('更改位置')
+        self.choose_btn.setStyleSheet(_secondary_btn())
+        self.choose_btn.clicked.connect(self._choose_location)
+        location_row.addWidget(self.choose_btn)
+        layout.addLayout(location_row)
+        self.shortcut = QCheckBox('创建 / 更新桌面快捷方式')
+        self.shortcut.setChecked(True)
+        self.shortcut.setVisible(self.system == 'Windows')
+        layout.addWidget(self.shortcut)
+        note = ('下载完成后自动解压，退出旧版并启动新版；安装失败时保留或恢复旧版本。'
+                if getattr(sys, 'frozen', False) else
+                '当前为源码运行：发布包可能不含本地未发布功能，Python 和源码不会被覆盖；完成后退出源码运行并启动安装版。')
+        if self.system == 'Darwin':
+            note += '\n安装的是完整 Toolbox.app，无需手动解压；已有同名工具箱会被替换。'
+        hint = QLabel(note)
+        hint.setWordWrap(True)
+        hint.setStyleSheet('color: #667085; font-size: 12px;')
+        layout.addWidget(hint)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.hide()
+        self.progress_bar.setStyleSheet('QProgressBar { border: 1px solid #E1E7EF; border-radius: 5px; background: white; text-align: center; height: 18px; } QProgressBar::chunk { background: #6688D9; border-radius: 4px; }')
+        layout.addWidget(self.progress_bar)
+        self.status = QLabel('下载过程中可取消，现有应用与个人设置不会受到影响。')
+        self.status.setTextFormat(Qt.PlainText)
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        layout.addStretch()
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        self.cancel_btn = QPushButton('暂不更新')
+        self.cancel_btn.setStyleSheet(_secondary_btn())
+        self.cancel_btn.clicked.connect(self.reject)
+        buttons.addWidget(self.cancel_btn)
+        self.start_btn = QPushButton('下载并更新')
+        self.start_btn.setStyleSheet(_primary_btn())
+        self.start_btn.clicked.connect(self._start)
+        buttons.addWidget(self.start_btn)
+        layout.addLayout(buttons)
+        self._installer_timer = QTimer(self)
+        self._installer_timer.setInterval(80)
+        self._installer_timer.timeout.connect(self._poll_installer)
+        QApplication.instance().aboutToQuit.connect(self.stop)
+
+    def _choose_location(self):
+        directory = QFileDialog.getExistingDirectory(self, '选择应用安装目录', os.path.dirname(self.target))
+        if directory:
+            self.target = os.path.join(directory, 'Toolbox.exe' if self.system == 'Windows' else 'Toolbox.app')
+            self.location.setText(self.target)
+            self.location.setToolTip(self.target)
+
+    def _start(self):
+        if self._worker is not None or self._phase != 'idle':
+            return
+        try:
+            if self.system == 'Windows':
+                if os.path.isdir(self.target):
+                    raise ValueError('安装位置被同名文件夹占用，请更改位置。')
+                if (not getattr(sys, 'frozen', False) and os.path.normcase(os.path.realpath(self.target))
+                        == os.path.normcase(os.path.realpath(sys.executable))):
+                    raise ValueError('不能覆盖正在使用的 Python 解释器，请更改位置。')
+            elif os.path.lexists(self.target):
+                with open(os.path.join(self.target, 'Contents', 'Info.plist'), 'rb') as file:
+                    info = plistlib.load(file)
+                if not isinstance(info, dict) or info.get('CFBundleIdentifier') != 'com.jimmy.personal_tool':
+                    raise ValueError('安装位置已有同名的其他应用，请更改位置。')
+        except (OSError, ValueError, plistlib.InvalidFileException) as exc:
+            self.status.setText('无法安装：' + str(exc))
+            return
+        self._phase = 'downloading'
+        self.start_btn.setText('下载中…')
+        self.start_btn.setEnabled(False)
+        self.choose_btn.setEnabled(False)
+        self.shortcut.setEnabled(False)
+        self.cancel_btn.setText('取消下载')
+        self.status.setText('正在连接下载服务器…')
+        self.progress_bar.show()
+        self.progress_bar.setRange(0, 0)
+        self._worker = UpdateDownloadWorker(self.url, self.system, self)
+        self._worker.progress.connect(self._download_progress)
+        self._worker.unpacking.connect(self._unpacking)
+        self._worker.ready.connect(self._download_ready)
+        self._worker.failed.connect(self._failed)
+        self._worker.finished.connect(self._worker_finished)
+        self._worker.start()
+
+    def _download_progress(self, received, total):
+        if self._phase != 'downloading':
+            return
+        self.progress_bar.setRange(0, 100 if total else 0)
+        if total:
+            self.progress_bar.setValue(received * 100 // total)
+        self.status.setText('正在下载：%.1f MB%s' % (received / 1024 ** 2,
+                            ' / %.1f MB' % (total / 1024 ** 2) if total else ''))
+
+    def _unpacking(self):
+        if self._phase == 'downloading':
+            self.progress_bar.setRange(0, 0)
+            self.status.setText('正在校验并解压更新包…')
+
+    def _download_ready(self, directory, payload):
+        if self._phase == 'cancelling':
+            shutil.rmtree(directory, ignore_errors=True)
+            return
+        self._directory = directory
+        self._phase = 'installing'
+        self.start_btn.setText('安装中…')
+        self.cancel_btn.setEnabled(False)
+        self.status.setText('已解压，正在准备替换…完成后自动重启。')
+        shortcut = ''
+        if self.system == 'Windows' and self.shortcut.isChecked():
+            shortcut = os.path.join(QStandardPaths.writableLocation(QStandardPaths.DesktopLocation), '系统工具箱.lnk')
+        try:
+            self._helper, self._ready_file, self._error_file = start_update_installer(
+                directory, payload, self.target, shortcut, self.system)
+            self._installer_timer.start()
+        except OSError as exc:
+            self._failed('无法启动更新程序：' + str(exc))
+            self._discard_download()
+
+    def _poll_installer(self):
+        if os.path.isfile(self._error_file):
+            if self._helper.poll() is None:
+                return
+            with open(self._error_file, 'r', encoding='utf-8') as file:
+                message = file.read(1000)
+            self._installer_timer.stop()
+            self._failed('安装失败，旧版本未被修改：' + message)
+            self._discard_download()
+        elif os.path.isfile(self._ready_file):
+            self._installer_timer.stop()
+            self.status.setText('准备完成，正在退出旧版并启动新版…')
+            self.install_ready.emit()
+        elif self._helper.poll() is not None:
+            self._installer_timer.stop()
+            self._failed('更新程序未能启动，旧版本未被修改。请检查系统权限后重试。')
+            self._discard_download()
+
+    def _discard_download(self):
+        if self._directory is not None:
+            shutil.rmtree(self._directory, ignore_errors=True)
+            self._directory = None
+
+    def _failed(self, message):
+        self._phase = 'idle'
+        self.status.setText(message)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.cancel_btn.setEnabled(True)
+        self.cancel_btn.setText('关闭')
+        self.start_btn.setText('重试更新')
+        self.start_btn.setEnabled(self._worker is None)
+        self.choose_btn.setEnabled(True)
+        self.shortcut.setEnabled(True)
+
+    def _worker_finished(self):
+        worker, self._worker = self._worker, None
+        worker.deleteLater()
+        if self._phase == 'cancelling':
+            self._phase = 'idle'
+            super().reject()
+        elif self._phase == 'idle':
+            self.start_btn.setEnabled(True)
+
+    def reject(self):
+        if self._phase == 'installing':
+            return
+        if self._worker is not None:
+            self._phase = 'cancelling'
+            self._worker.cancel()
+            self.cancel_btn.setEnabled(False)
+            self.status.setText('正在取消并清理临时文件…')
+            return
+        super().reject()
+
+    def closeEvent(self, event):
+        if self._phase == 'installing' or self._worker is not None:
+            event.ignore()
+            self.reject()
+            return
+        super().closeEvent(event)
+
+    def stop(self):
+        self._installer_timer.stop()
+        if self._worker is not None:
+            self._worker.cancel()
+            self._worker.wait()
+        if self._phase != 'installing':
+            self._discard_download()
+            if self._worker is not None and self._worker.directory is not None:
+                shutil.rmtree(self._worker.directory, ignore_errors=True)
 
 
 class CheckUpdateThread(QThread):
@@ -12085,9 +15117,24 @@ class CheckUpdateThread(QThread):
     
     def run(self):
         try:
+            validate_update_url(UPDATE_CHECK_URL)
             req = urllib.request.Request(UPDATE_CHECK_URL, headers={'User-Agent': f'Toolbox/{APP_VERSION}'})
-            with urllib.request.urlopen(req, timeout=10) as response:
-                data = json.loads(response.read().decode('utf-8'))
+            opener = urllib.request.build_opener(UpdateRedirectHandler())
+            with opener.open(req, timeout=10) as response:
+                validate_update_url(response.geturl())
+                content = response.read(1024 * 1024 + 1)
+                if len(content) > 1024 * 1024:
+                    raise ValueError('更新信息超出大小限制。')
+                envelope = json.loads(content.decode('utf-8'))
+                if (not isinstance(envelope, dict) or envelope.get('encoding') != 'base64'
+                        or not isinstance(envelope.get('content'), str)):
+                    raise ValueError('更新服务器返回的文件信息无效。')
+                data = json.loads(base64.b64decode(envelope['content'], validate=True).decode('utf-8'))
+            if not isinstance(data, dict):
+                raise ValueError('更新服务器返回的内容不是版本信息。')
+            update_version_parts(data.get('version'))
+            if not isinstance(data.get('changelog', ''), str):
+                raise ValueError('更新说明格式无效。')
             self.result.emit(True, data, "")
         except urllib.error.URLError as e:
             print(f"[Update] URLError: {e}")

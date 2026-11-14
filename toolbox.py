@@ -77,7 +77,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QAbstractItemView, QKeySequenceEdit, QProgressBar, QSizePolicy,
                               QLayout,
                               QStyleOptionComboBox)
-from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QThread, QObject, pyqtSignal, QTimer, QUrl, QLockFile, QDate, QDateTime, QTime, QAbstractNativeEventFilter, QEvent, QSize, QStandardPaths
+from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QThread, QObject, pyqtSignal, QTimer, QUrl, QLockFile, QDate, QDateTime, QTime, QAbstractNativeEventFilter, QEvent, QSize, QStandardPaths, QPropertyAnimation, QEasingCurve
 from PyQt5.QtGui import (QFont, QCursor, QTextCursor, QColor, QPen, QPixmap, QPainter, QIcon,
                          QImage, QLinearGradient, QBrush, QDesktopServices, QPalette, QKeySequence,
                          QPainterPath, QPolygonF, QFontMetrics)
@@ -14214,6 +14214,12 @@ class ToolboxWindow(QMainWindow):
         self._top_fade.setOpacity(1.0)
         scroll.viewport().setGraphicsEffect(self._top_fade)
 
+        self._history_collapsed = False
+        self._history_anim = QPropertyAnimation(self.history_widget, b"maximumHeight", self)
+        self._history_anim.setDuration(170)
+        self._history_anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._history_anim.finished.connect(self._history_anim_done)
+
         def update_top_fade(value):
             grad = QLinearGradient(0, 0, 0, 28)
             if value <= 0:
@@ -14223,6 +14229,8 @@ class ToolboxWindow(QMainWindow):
                 grad.setColorAt(0.0, QColor(255, 255, 255, 0))
                 grad.setColorAt(1.0, QColor(255, 255, 255, 255))
             self._top_fade.setOpacityMask(QBrush(grad))
+            # 向上滚动时收起「最近使用 / 搜索记录」，滚回顶部再滑出
+            self._set_history_collapsed(value > 4)
 
         scroll.verticalScrollBar().valueChanged.connect(update_top_fade)
         update_top_fade(0)
@@ -14845,6 +14853,33 @@ class ToolboxWindow(QMainWindow):
         self._save_launcher_history("recent")
         if self.history_mode == "recent":
             self._refresh_history_display()
+
+    def _set_history_collapsed(self, collapsed, animate=True):
+        """工具列表滚动时收起或滑出「最近使用 / 搜索记录」面板。"""
+        if collapsed == self._history_collapsed:
+            return
+        self._history_collapsed = collapsed
+        target = 0 if collapsed else 76
+        self._history_anim.stop()
+        # 动画期间必须允许高度自由变化，结束后再固定成 76 让布局给足空间
+        self.history_widget.setMinimumHeight(0)
+        if not animate:
+            self.history_widget.setMaximumHeight(target)
+            self.history_widget.setVisible(not collapsed)
+            return
+        if not collapsed:
+            self.history_widget.setVisible(True)
+        self._history_anim.setStartValue(max(0, self.history_widget.height()))
+        self._history_anim.setEndValue(target)
+        self._history_anim.start()
+
+    def _history_anim_done(self):
+        if self._history_collapsed:
+            self.history_widget.setMinimumHeight(0)
+            self.history_widget.setMaximumHeight(0)
+            self.history_widget.setVisible(False)
+        else:
+            self.history_widget.setFixedHeight(76)
 
     def _set_history_mode(self, mode):
         self.history_mode = mode

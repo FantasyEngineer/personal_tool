@@ -49,6 +49,19 @@ from cryptography.hazmat.primitives.asymmetric import rsa, utils as der_utils
 from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from cryptography.hazmat.primitives.asymmetric.ec import ECDSA
 from cryptography.exceptions import InvalidSignature, InvalidTag
+
+# Windows 上 PyQt5 自带的 msvcp140/vcruntime140 与 onnxruntime 冲突：先加载系统运行时，
+# 否则之后再导入 onnxruntime（本地 OCR）会直接崩溃。优先用 System32 里的版本。
+if platform.system() == "Windows":
+    _system32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+    for _runtime_dll in ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"):
+        for _runtime_path in (os.path.join(_system32, _runtime_dll), _runtime_dll):
+            try:
+                ctypes.WinDLL(_runtime_path)
+                break
+            except (OSError, AttributeError):
+                continue
+
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QHBoxLayout, QLabel, QPushButton, QFrame,
                               QScrollArea, QMessageBox, QLineEdit,
@@ -62,11 +75,12 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QDialog, QFormLayout, QDialogButtonBox,
                               QDateEdit, QDateTimeEdit, QGroupBox, QTimeEdit,
                               QAbstractItemView, QKeySequenceEdit, QProgressBar, QSizePolicy,
+                              QLayout,
                               QStyleOptionComboBox)
 from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QThread, QObject, pyqtSignal, QTimer, QUrl, QLockFile, QDate, QDateTime, QTime, QAbstractNativeEventFilter, QEvent, QSize, QStandardPaths
 from PyQt5.QtGui import (QFont, QCursor, QTextCursor, QColor, QPen, QPixmap, QPainter, QIcon,
                          QImage, QLinearGradient, QBrush, QDesktopServices, QPalette, QKeySequence,
-                         QPainterPath, QPolygonF)
+                         QPainterPath, QPolygonF, QFontMetrics)
 
 
 APP_VERSION = "1.0.19"
@@ -381,6 +395,11 @@ def kill_process(pid):
 TOOL_WIN_W = 720
 TOOL_WIN_H = 480
 
+# 首页工具按钮固定尺寸：窗口变宽时列数变多，而不是把按钮拉宽
+LAUNCHER_BTN_W = 96
+LAUNCHER_BTN_H = 36
+LAUNCHER_GRID_SPACING = 8
+
 
 def tool_win_geometry():
     """Uniform default size + centered position for every tool window."""
@@ -414,6 +433,7 @@ SEARCH_HISTORY_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox",
 SECTION_ORDER_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "section_order.json")
 TOOL_ORDER_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "tool_order.json")
 SHORTCUTS_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "shortcuts.json")
+OCR_SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "ocr_settings.json")
 
 
 def load_history(path):
@@ -3456,7 +3476,11 @@ def save_screenshot(parent, image):
     return True
 
 
-def screenshot_ocr_command(image_path):
+def screenshot_ocr_layout_command(image_path):
+    """返回带坐标的系统 OCR 命令：输出 {width, height, lines:[{text, words:[...]}]}。
+
+    坐标基于识别图片的像素尺寸，调用方按 width/height 归一化后映射到窗口。
+    """
     env = os.environ.copy()
     if platform.system() == "Windows":
         script = r'''
@@ -3502,52 +3526,26 @@ try {
         [Windows.Graphics.Imaging.ColorManagementMode]::DoNotColorManage
     )) ([Windows.Graphics.Imaging.SoftwareBitmap])
     $result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
-    $englishWords = @()
-    if ($engine.RecognizerLanguage.LanguageTag -like "zh-*") {
-        $englishLanguage = $ocr::AvailableRecognizerLanguages | Where-Object {
-            $_.LanguageTag -like "en-*"
-        } | Select-Object -First 1
-        if ($null -ne $englishLanguage) {
-            $englishEngine = $ocr::TryCreateFromLanguage($englishLanguage)
-            $englishResult = Await ($englishEngine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
-            $englishWords = @($englishResult.Lines | ForEach-Object { $_.Words })
+    $lines = @()
+    foreach ($line in $result.Lines) {
+        $words = @()
+        foreach ($word in $line.Words) {
+            $rect = $word.BoundingRect
+            $words += [pscustomobject]@{
+                t = $word.Text
+                x = [double]$rect.X
+                y = [double]$rect.Y
+                w = [double]$rect.Width
+                h = [double]$rect.Height
+            }
         }
+        $lines += [pscustomobject]@{ text = $line.Text; words = @($words) }
     }
-    $lines = foreach ($line in $result.Lines) {
-        $words = @($line.Words)
-        $replacements = @{}
-        $skipped = @{}
-        foreach ($englishWord in $englishWords) {
-            $other = $englishWord.BoundingRect
-            $matches = @()
-            $compact = ""
-            for ($index = 0; $index -lt $words.Count; $index++) {
-                $rect = $words[$index].BoundingRect
-                $width = [Math]::Max(0, [Math]::Min($rect.X + $rect.Width, $other.X + $other.Width) - [Math]::Max($rect.X, $other.X))
-                $height = [Math]::Max(0, [Math]::Min($rect.Y + $rect.Height, $other.Y + $other.Height) - [Math]::Max($rect.Y, $other.Y))
-                if ($width / $rect.Width -gt 0.8 -and $height / [Math]::Min($rect.Height, $other.Height) -gt 0.5) {
-                    $matches += $index
-                    $compact += $words[$index].Text
-                }
-            }
-            if ($matches.Count -gt 0 -and [regex]::Matches($compact, "[\u3400-\u9FFF]").Count * 2 -lt $compact.Length) {
-                $replacements[$matches[0]] = $englishWord.Text
-                for ($index = 1; $index -lt $matches.Count; $index++) {
-                    $skipped[$matches[$index]] = $true
-                }
-            }
-        }
-        $parts = for ($index = 0; $index -lt $words.Count; $index++) {
-            if ($replacements.ContainsKey($index)) {
-                $replacements[$index]
-            } elseif (!$skipped.ContainsKey($index)) {
-                $words[$index].Text
-            }
-        }
-        [regex]::Replace(($parts -join " "), "(?<=[\u3400-\u9FFF])\s+(?=[\u3400-\u9FFF])", "")
-    }
-    $text = $lines -join "`n"
-    ConvertTo-Json -InputObject $text -Compress
+    ConvertTo-Json -InputObject ([pscustomobject]@{
+        width = [double]$transform.ScaledWidth
+        height = [double]$transform.ScaledHeight
+        lines = @($lines)
+    }) -Compress -Depth 6
 } catch {
     [Console]::Error.WriteLine($_.Exception.Message)
     exit 1
@@ -3582,22 +3580,329 @@ function run(argv) {
     var lines = [];
     var results = request.results;
     for (var index = 0; index < results.count; index++) {
-        var candidate = results.objectAtIndex(index).topCandidates(1).firstObject;
-        lines.push(ObjC.unwrap(candidate.string));
+        var observation = results.objectAtIndex(index);
+        var candidate = observation.topCandidates(1).firstObject;
+        var box = observation.boundingBox;
+        var x = box.origin.x;
+        var y = box.origin.y;
+        var w = box.size.width;
+        var h = box.size.height;
+        lines.push({
+            text: ObjC.unwrap(candidate.string),
+            words: [{ t: ObjC.unwrap(candidate.string), x: x, y: 1 - y - h, w: w, h: h }]
+        });
     }
-    return JSON.stringify(lines.join('\n'));
+    return JSON.stringify({ width: 1, height: 1, lines: lines });
 }
 '''
         return ["/usr/bin/osascript", "-l", "JavaScript", "-e", script, image_path], env
     raise RuntimeError("文字识别需要 Windows 10 及以上或 macOS 10.15 及以上的系统 OCR 引擎。")
 
 
+def join_ocr_spans(spans, line_text=None):
+    """拼接同一行的文字片段。
+
+    有整行原文时按词框在原文中的位置切片，能保留英文词间空格；否则按字框间距估算。
+    """
+    if not spans:
+        return ""
+    if line_text and all("start" in span and "end" in span for span in spans):
+        return line_text[spans[0]["start"]:spans[-1]["end"]].strip()
+    text = ""
+    previous = None
+    for span in spans:
+        value = span["t"]
+        if not text:
+            text = value
+        elif previous is not None and span["x"] - (previous["x"] + previous["w"]) > max(
+                2.0, 0.3 * min(previous["h"], span["h"])):
+            text += " " + value
+        else:
+            text += value
+        previous = span
+    return text
+
+
+def normalize_ocr_layout(layout):
+    """把系统 OCR 的 JSON 整理成统一结构：{width, height, lines:[[{t,x,y,w,h}]]}。"""
+    if not isinstance(layout, dict):
+        raise ValueError("系统 OCR 返回的内容不完整。")
+    try:
+        width = float(layout.get("width") or 0)
+        height = float(layout.get("height") or 0)
+    except (TypeError, ValueError):
+        raise ValueError("系统 OCR 返回的图片尺寸无效。")
+    if width <= 0 or height <= 0:
+        raise ValueError("系统 OCR 返回的图片尺寸无效。")
+    lines = []
+    for line in layout.get("lines") or []:
+        if not isinstance(line, dict):
+            continue
+        words = line.get("words")
+        if isinstance(words, dict):
+            words = [words]
+        spans = []
+        for word in words or []:
+            if not isinstance(word, dict):
+                continue
+            text = str(word.get("t") or "")
+            try:
+                x, y = float(word.get("x")), float(word.get("y"))
+                w, h = float(word.get("w")), float(word.get("h"))
+            except (TypeError, ValueError):
+                continue
+            if text and w > 0 and h > 0:
+                spans.append({"t": text, "x": x, "y": y, "w": w, "h": h})
+        if spans:
+            lines.append(spans)
+    return {"width": width, "height": height, "lines": lines}
+
+
+def execute_ocr_layout(image, cancelled, register_process):
+    """调用系统 OCR，返回 (layout, error)；失败时 layout 为 None。"""
+    try:
+        with tempfile.TemporaryDirectory(prefix="toolbox_ocr_") as directory:
+            image_path = os.path.join(directory, "selection.png")
+            if not image.save(image_path, "PNG"):
+                raise RuntimeError("无法写入识别图片，请检查系统临时目录的写入权限。")
+            if cancelled.is_set():
+                return None, ""
+            command, env = screenshot_ocr_layout_command(image_path)
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       env=env, **win_no_console())
+            register_process(process)
+            if cancelled.is_set():
+                process.kill()
+            try:
+                stdout, stderr = process.communicate(timeout=45)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                raise RuntimeError("识别超过 45 秒，请缩小识别范围后重试。")
+            if cancelled.is_set():
+                return None, ""
+            if process.returncode:
+                raise RuntimeError(stderr.decode("utf-8", errors="replace").strip()[:200] or "系统 OCR 识别失败。")
+            return normalize_ocr_layout(json.loads(stdout.decode("utf-8-sig"))), ""
+    except (OSError, RuntimeError, ValueError) as exc:
+        return None, str(exc)
+    finally:
+        register_process(None)
+
+
+RAPID_OCR_MAX_SIDE = 2560  # 整屏识别时保留足够分辨率，兼顾小字准确率与耗时
+_rapidocr_engine = None
+_rapidocr_engine_lock = threading.Lock()
+_rapidocr_run_lock = threading.Lock()
+
+
+def rapidocr_available():
+    """本地 RapidOCR 是否可用（需要 rapidocr 与 onnxruntime 都已安装）。"""
+    try:
+        import importlib.util
+        return (importlib.util.find_spec("rapidocr") is not None
+                and importlib.util.find_spec("onnxruntime") is not None)
+    except (ImportError, ValueError):
+        return False
+
+
+def rapidocr_version():
+    try:
+        import importlib.metadata
+        return importlib.metadata.version("rapidocr")
+    except Exception:
+        return ""
+
+
+def _get_rapidocr_engine():
+    """懒加载本地引擎：首次初始化约 1～2 秒，之后复用。"""
+    global _rapidocr_engine
+    if _rapidocr_engine is not None:
+        return _rapidocr_engine
+    with _rapidocr_engine_lock:
+        if _rapidocr_engine is None:
+            from rapidocr import RapidOCR
+            _rapidocr_engine = RapidOCR(params={
+                "Global.log_level": "warning",
+                "Global.max_side_len": RAPID_OCR_MAX_SIDE,
+            })
+    return _rapidocr_engine
+
+
+def warm_rapidocr():
+    """后台预热引擎，避免第一次识别多等初始化时间。"""
+    try:
+        _get_rapidocr_engine()
+    except Exception:
+        pass
+
+
+def rapidocr_layout(image_path, cancelled=None):
+    """用本地 RapidOCR 识别图片，返回与系统 OCR 相同的版面结构。
+
+    坐标基于原图像素尺寸；优先使用逐词/逐字框，便于在截图预览上精确拖选。
+    """
+    engine = _get_rapidocr_engine()
+    if cancelled is not None and cancelled.is_set():
+        raise RuntimeError("已取消")
+    with _rapidocr_run_lock:
+        result = engine(image_path, return_word_box=True)
+    if cancelled is not None and cancelled.is_set():
+        raise RuntimeError("已取消")
+    with Image.open(image_path) as loaded:
+        width, height = loaded.size
+    texts = list(result.txts or ())
+    word_lines = list(result.word_results or ())
+    line_boxes = list(result.boxes) if result.boxes is not None else []
+    lines = []
+    texts_out = []
+    for index, text in enumerate(texts):
+        spans = []
+        cursor = 0
+        for word in word_lines[index] if index < len(word_lines) else ():
+            value, box = str(word[0]), word[2]
+            xs = [float(point[0]) for point in box]
+            ys = [float(point[1]) for point in box]
+            if not value.strip() or max(xs) <= min(xs) or max(ys) <= min(ys):
+                continue
+            # 记录词框在整行原文中的位置，复制时可保留英文词间空格
+            found = text.find(value, cursor)
+            if found < 0:
+                found = cursor
+            spans.append({"t": value, "x": min(xs), "y": min(ys),
+                          "w": max(xs) - min(xs), "h": max(ys) - min(ys),
+                          "start": found, "end": found + len(value)})
+            cursor = found + len(value)
+        if not spans and text and index < len(line_boxes):
+            box = line_boxes[index]
+            xs = [float(point[0]) for point in box]
+            ys = [float(point[1]) for point in box]
+            spans.append({"t": text, "x": min(xs), "y": min(ys),
+                          "w": max(xs) - min(xs), "h": max(ys) - min(ys),
+                          "start": 0, "end": len(text)})
+        if spans:
+            lines.append(spans)
+            texts_out.append(text)
+    return {"width": float(width), "height": float(height), "lines": lines, "texts": texts_out}
+
+
+def execute_rapidocr_layout(image, cancelled):
+    """把 QImage 交给本地 RapidOCR，返回 (layout, error)。"""
+    try:
+        with tempfile.TemporaryDirectory(prefix="toolbox_rapidocr_") as directory:
+            image_path = os.path.join(directory, "screen.png")
+            if not image.save(image_path, "PNG"):
+                raise RuntimeError("无法写入识别图片，请检查系统临时目录的写入权限。")
+            if cancelled.is_set():
+                return None, ""
+            return rapidocr_layout(image_path, cancelled), ""
+    except Exception as exc:  # 模型/运行库异常统一回退系统 OCR
+        return None, "本地 RapidOCR 识别失败：%s" % str(exc)[:200]
+
+
+LLM_OCR_PROMPT = """请识别这张图片中的所有可见文字，按阅读顺序逐行输出。
+只返回 JSON，不要解释，不要 Markdown 代码块，格式如下：
+{"lines": [{"text": "这一行的完整文字", "box": [x1, y1, x2, y2]}]}
+其中 box 是这行文字的外接矩形，使用相对整张图片宽高的 0 到 1000 的归一化坐标。
+尽量保留原文的标点与大小写；没有文字时返回 {"lines": []}。"""
+
+
+def ocr_llm_ready(settings):
+    return bool(settings.get("enabled") and settings.get("base_url")
+                and settings.get("api_key") and settings.get("model"))
+
+
+def llm_ocr_layout(image, settings, timeout=90):
+    """调用 OpenAI 兼容的多模态接口识别文字，返回与系统 OCR 相同的版面结构。"""
+    if image.width() > 2048 or image.height() > 2048:
+        image = image.scaled(2048, 2048, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    with tempfile.TemporaryDirectory(prefix="toolbox_llm_ocr_") as directory:
+        png_path = os.path.join(directory, "screen.png")
+        if not image.save(png_path, "PNG"):
+            raise RuntimeError("无法写入识别图片。")
+        with open(png_path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode("ascii")
+    url = settings["base_url"].strip().rstrip("/")
+    if not url.endswith("/chat/completions"):
+        url += "/chat/completions"
+    payload = {
+        "model": settings["model"],
+        "temperature": 0,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": LLM_OCR_PROMPT},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + encoded}},
+        ]}],
+    }
+    request = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer " + settings["api_key"]},
+        method="POST")
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    content = data["choices"][0]["message"]["content"]
+    if isinstance(content, list):
+        content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+    text = str(content or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("模型没有按约定返回 JSON。")
+    try:
+        result = json.loads(text[start:end + 1])
+    except ValueError:
+        raise ValueError("模型返回的 JSON 无法解析。")
+    lines = []
+    for line in (result.get("lines") if isinstance(result, dict) else None) or []:
+        if not isinstance(line, dict):
+            continue
+        value = str(line.get("text") or "").strip()
+        box = line.get("box")
+        if not value or not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        try:
+            x1, y1, x2, y2 = [float(item) for item in box]
+        except (TypeError, ValueError):
+            continue
+        left, right = sorted((x1, x2))
+        top, bottom = sorted((y1, y2))
+        if right - left <= 0 or bottom - top <= 0:
+            continue
+        lines.append([{"t": value, "x": left, "y": top, "w": right - left, "h": bottom - top}])
+    if not lines:
+        raise ValueError("模型没有返回可用的文字坐标。")
+    return {"width": 1000.0, "height": 1000.0, "lines": lines}
+
+
+def run_ocr(image, cancelled, register_process):
+    """识别图片文字：大模型 → 本地 RapidOCR → 系统 OCR，任一步失败自动降级。"""
+    settings = load_ocr_settings()
+    if ocr_llm_ready(settings):
+        try:
+            return llm_ocr_layout(image, settings), "大模型 · " + settings["model"], ""
+        except Exception:  # 网络异常、鉴权失败、返回格式不符等一律回退
+            if cancelled.is_set():
+                return None, "", ""
+    if settings.get("local_enabled", True) and rapidocr_available():
+        layout, _ = execute_rapidocr_layout(image, cancelled)
+        if layout is not None:
+            return layout, "本地 RapidOCR", ""
+        if cancelled.is_set():
+            return None, "", ""
+    layout, error = execute_ocr_layout(image, cancelled, register_process)
+    return layout, "系统 OCR", error
+
+
 class ScreenshotOcrWorker(QThread):
-    result_ready = pyqtSignal(str, str)
+    """截图所选区域文字识别：大模型 → 本地 RapidOCR → 系统 OCR，返回带词框的版面结果。"""
+
+    result_ready = pyqtSignal(object, str, str)
 
     def __init__(self, image, parent):
         super().__init__(parent)
-        self.image = image.toImage()
+        self.image = image if isinstance(image, QImage) else image.toImage()
         self._cancelled = threading.Event()
         self._process = None
 
@@ -3611,107 +3916,14 @@ class ScreenshotOcrWorker(QThread):
                 pass
 
     def run(self):
-        text, error = "", ""
-        try:
-            with tempfile.TemporaryDirectory(prefix="toolbox_ocr_") as directory:
-                image_path = os.path.join(directory, "selection.png")
-                if not self.image.save(image_path, "PNG"):
-                    raise RuntimeError("无法写入识别图片，请检查系统临时目录的写入权限。")
-                if self._cancelled.is_set():
-                    return
-                command, env = screenshot_ocr_command(image_path)
-                process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                           env=env, **win_no_console())
-                self._process = process
-                if self._cancelled.is_set():
-                    process.kill()
-                try:
-                    stdout, stderr = process.communicate(timeout=45)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.communicate()
-                    raise RuntimeError("识别超过 45 秒，请缩小选区后重试。")
-                if self._cancelled.is_set():
-                    return
-                if process.returncode:
-                    raise RuntimeError(stderr.decode("utf-8", errors="replace").strip()[:200] or "系统 OCR 识别失败。")
-                text = json.loads(stdout.decode("utf-8-sig")).strip()
-        except (OSError, RuntimeError, ValueError) as exc:
-            error = str(exc)
-        finally:
-            self._process = None
+        layout, source, error = run_ocr(self.image, self._cancelled, self._register_process)
+        if layout is not None and not layout.get("lines"):
+            error = error or "未识别到文字。"
         if not self._cancelled.is_set():
-            self.result_ready.emit(text, error)
+            self.result_ready.emit(layout, source, error)
 
-
-class ScreenshotTextWindow(QDialog):
-    def __init__(self, parent):
-        super().__init__(parent, Qt.Tool | Qt.WindowStaysOnTopHint)
-        self.setWindowTitle("识别文字")
-        self.resize(380, 340)
-        self.setMinimumSize(280, 220)
-        self.setCursor(Qt.ArrowCursor)
-        self.setStyleSheet("QDialog { background: #F6F8FC; }")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(10)
-        hint = QLabel("可编辑文字，选中后按 Ctrl+C 复制；关闭此窗保留截图。")
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #697386; font-size: 12px;")
-        layout.addWidget(hint)
-        self.editor = QPlainTextEdit()
-        self.editor.setFont(ui_font(12, 14))
-        self.editor.setStyleSheet("QPlainTextEdit { background: white; color: #263449; border: 1px solid #DAE2ED; border-radius: 6px; padding: 8px; }")
-        layout.addWidget(self.editor, 1)
-        footer = QHBoxLayout()
-        self.status = QLabel()
-        self.status.setStyleSheet("color: #697386; font-size: 12px;")
-        footer.addWidget(self.status, 1)
-        self.copy_button = QPushButton("复制全部")
-        self.copy_button.setFixedSize(96, 32)
-        self.copy_button.setAutoDefault(False)
-        self.copy_button.setFocusPolicy(Qt.NoFocus)
-        self.copy_button.setCursor(Qt.PointingHandCursor)
-        self.copy_button.setStyleSheet(_primary_btn())
-        self.copy_button.clicked.connect(self._copy)
-        footer.addWidget(self.copy_button)
-        layout.addLayout(footer)
-        self.editor.selectionChanged.connect(self._update_copy)
-        self.editor.textChanged.connect(self._update_copy)
-
-    def _update_copy(self):
-        selected = self.editor.textCursor().hasSelection()
-        self.copy_button.setText("复制选中" if selected else "复制全部")
-        self.copy_button.setEnabled(bool(self.editor.toPlainText()))
-        self.status.setText("选中后可单独复制" if selected else "%d 个字符" % len(self.editor.toPlainText()))
-
-    def _copy(self):
-        if self.editor.textCursor().hasSelection():
-            self.editor.copy()
-            self.status.setText("已复制选中文字")
-        else:
-            QApplication.clipboard().setText(self.editor.toPlainText())
-            self.status.setText("已复制全部文字")
-
-    def show_result(self, text, selection, toolbar):
-        self.editor.setPlainText(text)
-        self.show()
-        screen = QApplication.screenAt(selection.center()) or QApplication.primaryScreen()
-        area = screen.availableGeometry().adjusted(8, 8, -8, -8)
-        size = self.frameGeometry().size()
-        x = max(area.left(), min(selection.left(), area.right() - size.width() + 1))
-        y = max(area.top(), min(selection.top(), area.bottom() - size.height() + 1))
-        candidates = [QPoint(selection.right() + 13, y),
-                      QPoint(selection.left() - size.width() - 12, y),
-                      QPoint(x, selection.bottom() + 13),
-                      QPoint(x, selection.top() - size.height() - 12)]
-        position = next((point for point in candidates
-                         if area.contains(QRect(point, size)) and not toolbar.intersects(QRect(point, size))),
-                        QPoint(area.right() - size.width() + 1, y))
-        self.move(position)
-        self.raise_()
-        self.activateWindow()
-        self.editor.setFocus()
+    def _register_process(self, process):
+        self._process = process
 
 
 class CaptureOverlay(QWidget):
@@ -3735,7 +3947,14 @@ class CaptureOverlay(QWidget):
         self._pixel_color = QColor()
         self._pixel_format = "HEX"
         self._ocr_busy = False
-        self.ocr_result_window = None
+        self._ocr_mode = False     # 识别完成后的取字模式：选区内拖选文字复制
+        self._ocr_spans = []       # [(行号, QRectF, 词框)]，窗口坐标
+        self._ocr_line_texts = []  # 每行原文，用于保留英文词间空格
+        self._ocr_selected = []    # 被选中的词框下标
+        self._ocr_text_origin = None
+        self._text_editor = None   # 就地文字输入框（文字模式下点击选区直接输入）
+        self._text_anchor = QPointF(0.0, 0.0)  # 输入框对应的落字位置（相对选区）
+        self._text_drag = None     # 拖动中的文字标注：{"index", "start_point", "start_rel"}
         self._auto_copy = auto_copy
         self._selection = selection.intersected(self.rect()) if selection is not None else QRect()
         self._accepted = False
@@ -3762,8 +3981,8 @@ class CaptureOverlay(QWidget):
         buttons.setSpacing(2)
         self.tool_buttons = {}
         for name, tip in (("select", "移动 / 调整选区"), ("rectangle", "矩形"), ("arrow", "箭头"),
-                          ("pen", "画笔"), ("text", "文字"), ("undo", "撤销 · Ctrl+Z"),
-                          ("redo", "重做 · Ctrl+Shift+Z"), ("ocr", "识别文字 · Ctrl+O · 本地识别，旁窗查看并手动复制"),
+                          ("pen", "画笔"), ("text", "文字 · 点击选区直接输入，按住已有文字可拖动"), ("undo", "撤销 · Ctrl+Z"),
+                          ("redo", "重做 · Ctrl+Shift+Z"), ("ocr", "识别文字 · Ctrl+O · 识别后框内拖选即可复制"),
                           ("save", "保存 PNG · Ctrl+S"), ("pin", "贴到桌面 · Ctrl+T"),
                           ("copy", "复制并完成 · Enter / Ctrl+C"), ("cancel", "取消 · Esc")):
             button = QPushButton()
@@ -3865,9 +4084,8 @@ class CaptureOverlay(QWidget):
         return "rgb(%s, %s, %s)" % (self._pixel_color.red(), self._pixel_color.green(), self._pixel_color.blue())
 
     def _loupe_rect(self):
-        if self.ocr_result_window is not None and self.ocr_result_window.isVisible():
-            return QRect()
-        if self._ocr_busy or self._mode != "select" or (self.toolbar.isVisible() and self.toolbar.geometry().contains(self._pixel_pos)):
+        if self._ocr_busy or self._ocr_mode or self._mode != "select" \
+                or (self.toolbar.isVisible() and self.toolbar.geometry().contains(self._pixel_pos)):
             return QRect()
         screen = QApplication.screenAt(self.mapToGlobal(self._pixel_pos)) or QApplication.primaryScreen()
         area = screen.geometry().translated(-self.geometry().topLeft()).intersected(self.rect())
@@ -4001,6 +4219,8 @@ class CaptureOverlay(QWidget):
         return QIcon(image)
 
     def _set_mode(self, mode):
+        if mode != "text":
+            self._confirm_text_editor()
         self._mode = mode
         for name, button in self.tool_buttons.items():
             if button.isCheckable():
@@ -4048,28 +4268,97 @@ class CaptureOverlay(QWidget):
     def _start_ocr(self):
         if self._selection.isEmpty() or self._ocr_busy or self._origin is not None:
             return
-        if self.ocr_result_window is not None:
-            self.ocr_result_window.hide()
-        self.ocr_status.setText("正在本地识别文字… · Esc 退出")
+        self._confirm_text_editor()
+        self._exit_ocr_mode()
+        self.ocr_status.setText("正在识别所选区域文字… · Esc 取消")
         self.ocr_status.show()
         self._set_ocr_busy(True)
         self._position_toolbar()
         self.ocr_requested.emit(crop_desktop(self.desktop, self._selection))
 
-    def set_ocr_result(self, text, error):
+    def set_ocr_result(self, layout, source, error):
         self._set_ocr_busy(False)
-        if error or not text:
-            self.ocr_status.setText("识别失败：" + error if error else "未识别到文字，请调整选区或放大原页面后重试。")
+        if layout is None or error:
+            self.ocr_status.setText("识别失败：" + error if error else "识别失败，请调整选区后重试。")
             self._position_toolbar()
             return
-        self.ocr_status.setText("识别完成 · 在旁窗选中文字复制 · 可调整选区后再次识别")
+        spans, line_texts = self._layout_spans(layout)
+        if not spans:
+            self.ocr_status.setText("未识别到文字，请调整选区或放大原页面后重试。")
+            self._position_toolbar()
+            return
+        self._ocr_line_texts = line_texts
+        self._ocr_spans = spans
+        self._ocr_selected = []
+        self._ocr_mode = True
+        self.setCursor(Qt.IBeamCursor)
+        self.ocr_status.setText("%s 识别到 %d 段文字 · 选区内拖选复制 · Esc 返回调整" % (source, len(spans)))
         self._position_toolbar()
-        if self.ocr_result_window is None:
-            self.ocr_result_window = ScreenshotTextWindow(self)
-            self.ocr_result_window.finished.connect(lambda _: self.update())
-        self.ocr_result_window.show_result(
-            text, self._selection.translated(self.geometry().topLeft()),
-            QRect(self.toolbar.mapToGlobal(QPoint()), self.toolbar.size()))
+        self.update()
+
+    def _layout_spans(self, layout):
+        """把识别结果坐标（像素或归一化）映射到窗口坐标：选区图对应 _selection 区域。"""
+        width = float(layout.get("width") or 0)
+        height = float(layout.get("height") or 0)
+        if width <= 0 or height <= 0:
+            return [], []
+        scale_x = self._selection.width() / width
+        scale_y = self._selection.height() / height
+        origin_x = self._selection.x()
+        origin_y = self._selection.y()
+        spans = []
+        for line_no, line in enumerate(layout.get("lines") or []):
+            for span in line:
+                box = QRectF(origin_x + span["x"] * scale_x, origin_y + span["y"] * scale_y,
+                             span["w"] * scale_x, span["h"] * scale_y)
+                spans.append((line_no, box, span))
+        return spans, list(layout.get("texts") or [])
+
+    def _ocr_select_in(self, rect):
+        # 横向拖动时高度可能为 0，稍微放大避免漏选
+        rect = rect.adjusted(-2, -2, 2, 2)
+        chosen = [index for index, (_, box, _) in enumerate(self._ocr_spans)
+                  if rect.intersects(box.toRect())]
+        if chosen != self._ocr_selected:
+            self._ocr_selected = chosen
+            self.update()
+
+    def _ocr_selected_text(self):
+        """按阅读顺序拼接选中文字：换行保留，英文词间空格按整行原文还原。"""
+        groups = []
+        for index in self._ocr_selected:
+            line_no, _, span = self._ocr_spans[index]
+            if groups and groups[-1][0] == line_no:
+                groups[-1][1].append(span)
+            else:
+                groups.append((line_no, [span]))
+        parts = []
+        for line_no, spans in groups:
+            text = self._ocr_line_texts[line_no] if line_no < len(self._ocr_line_texts) else None
+            parts.append(join_ocr_spans(spans, text))
+        return "\n".join(parts)
+
+    def _ocr_copy_selected(self):
+        if not self._ocr_selected:
+            self.ocr_status.setText("没有选中文字 · 选区内继续拖选 · Esc 返回")
+            self._position_toolbar()
+            return
+        text = self._ocr_selected_text()
+        QApplication.clipboard().setText(text)
+        self.ocr_status.setText("已复制 %d 个字符 · 选区内继续拖选 · Esc 返回" % len(text))
+        self._position_toolbar()
+
+    def _exit_ocr_mode(self):
+        """退出取字模式，清空识别结果；选区本身保留，可继续调整或重新识别。"""
+        if not self._ocr_mode and not self._ocr_spans:
+            return
+        self._ocr_mode = False
+        self._ocr_text_origin = None
+        self._ocr_spans = []
+        self._ocr_line_texts = []
+        self._ocr_selected = []
+        self.setCursor(Qt.SizeAllCursor if self._mode == "select" and not self._selection.isEmpty() else Qt.CrossCursor)
+        self.update()
 
     def _handles(self):
         rect = self._selection
@@ -4136,9 +4425,15 @@ class CaptureOverlay(QWidget):
             painter.drawPixmap(0, 0, self.desktop)
             painter.restore()
             self._draw_annotations(painter)
+            painter.save()
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(0, 120, 215, 185))
+            for index in self._ocr_selected:
+                painter.drawRoundedRect(self._ocr_spans[index][1].adjusted(-1, -1, 1, 1), 2, 2)
+            painter.restore()
             painter.setPen(QPen(QColor("#2684FF"), 1))
             painter.drawRect(self._selection.adjusted(0, 0, -1, -1))
-            if self._mode == "select" and not self._ocr_busy:
+            if self._mode == "select" and not self._ocr_busy and not self._ocr_mode:
                 painter.setBrush(Qt.white)
                 for point in self._handles().values():
                     painter.drawRect(QRect(point.x() - 3, point.y() - 3, 6, 6))
@@ -4147,7 +4442,9 @@ class CaptureOverlay(QWidget):
         painter.setFont(ui_font(11, 13))
         text = "拖动框选 · C 复制颜色 · X 切换 · Esc 取消"
         if self._ocr_busy:
-            text = "正在本地识别文字 · Esc 退出"
+            text = "正在识别所选区域文字 · Esc 取消"
+        elif self._ocr_mode:
+            text = "框内拖选文字松开即复制 · Esc 返回调整选区"
         elif not self._selection.isEmpty():
             dpr = self.desktop.devicePixelRatio()
             text = "%s × %s px · 拖动调整 · Enter 复制 · Ctrl+O 识别文字 · Ctrl+T 贴图" % (
@@ -4164,7 +4461,23 @@ class CaptureOverlay(QWidget):
             if event.button() == Qt.RightButton:
                 self.close()
             return
+        if self._ocr_mode:
+            if event.button() == Qt.RightButton:
+                self._exit_ocr_mode()
+                self.ocr_status.hide()
+                return
+            if event.button() != Qt.LeftButton:
+                return
+            point = event.pos()
+            if self._selection.adjusted(-2, -2, 2, 2).contains(point):
+                self._ocr_text_origin = point
+                self._ocr_select_in(QRect(point - QPoint(3, 3), QSize(6, 6)))
+            else:
+                self._exit_ocr_mode()
+                self.ocr_status.hide()
+            return
         if event.button() == Qt.RightButton:
+            self._cancel_text_editor()
             if self._selection.isEmpty() or self._auto_copy:
                 self.close()
             else:
@@ -4175,8 +4488,6 @@ class CaptureOverlay(QWidget):
                 self._origin = self._drag = None
                 self._set_mode("select")
                 self.ocr_status.hide()
-                if self.ocr_result_window is not None:
-                    self.ocr_result_window.hide()
                 self.toolbar.hide()
                 self.update()
             return
@@ -4188,20 +4499,20 @@ class CaptureOverlay(QWidget):
         if self._mode != "select" and self._selection.contains(point):
             if self._mode == "text":
                 self._origin = None
-                text, ok = QInputDialog.getText(self, "添加文字", "文字内容：")
-                if ok and text.strip():
-                    self._annotations.append({"tool": "text", "points": [QPointF(point - self._selection.topLeft())],
-                                              "color": QColor(self._color), "width": self._width, "text": text})
-                    self._redo.clear()
-                    self._position_toolbar()
-                    self.update()
+                self._confirm_text_editor()
+                hit = self._hit_text(point)
+                if hit is not None:
+                    self._text_drag = {"index": hit, "start_point": point,
+                                       "start_rel": QPointF(self._annotations[hit]["points"][0])}
+                else:
+                    self._open_text_editor(point)
                 return
             self._drag = "draw"
             relative = QPointF(point - self._selection.topLeft())
             self._current = {"tool": self._mode, "points": [relative], "color": QColor(self._color), "width": self._width}
         else:
-            if self.ocr_result_window is not None:
-                self.ocr_result_window.hide()
+            self._confirm_text_editor()
+            self._exit_ocr_mode()
             self.ocr_status.hide()
             handle = self._hit_handle(point)
             if handle and self._mode == "select":
@@ -4223,7 +4534,25 @@ class CaptureOverlay(QWidget):
         self._update_pixel(point)
         if self._ocr_busy:
             return
+        if self._ocr_mode:
+            if self._ocr_text_origin is not None:
+                self._ocr_select_in(QRect(self._ocr_text_origin, point).normalized())
+            else:
+                self.setCursor(Qt.IBeamCursor if self._selection.contains(point) else Qt.ArrowCursor)
+            return
+        if self._text_drag is not None:
+            info = self._text_drag
+            delta = point - info["start_point"]
+            rel = info["start_rel"] + QPointF(delta)
+            rel.setX(min(max(rel.x(), 0.0), float(self._selection.width())))
+            rel.setY(min(max(rel.y(), 0.0), float(self._selection.height())))
+            self._annotations[info["index"]]["points"][0] = rel
+            self.update()
+            return
         if self._origin is None:
+            if self._mode == "text":
+                self.setCursor(Qt.SizeAllCursor if self._hit_text(point) is not None else Qt.CrossCursor)
+                return
             handle = self._hit_handle(point) if self._mode == "select" else None
             cursors = {"nw": Qt.SizeFDiagCursor, "se": Qt.SizeFDiagCursor, "ne": Qt.SizeBDiagCursor,
                        "sw": Qt.SizeBDiagCursor, "n": Qt.SizeVerCursor, "s": Qt.SizeVerCursor,
@@ -4261,6 +4590,14 @@ class CaptureOverlay(QWidget):
         self.update()
 
     def mouseReleaseEvent(self, event):
+        if self._ocr_mode:
+            if event.button() == Qt.LeftButton and self._ocr_text_origin is not None:
+                self._ocr_text_origin = None
+                self._ocr_copy_selected()
+            return
+        if self._text_drag is not None:
+            self._text_drag = None
+            return
         if event.button() != Qt.LeftButton or self._origin is None:
             return
         self.mouseMoveEvent(event)
@@ -4286,6 +4623,70 @@ class CaptureOverlay(QWidget):
             self._complete("copy")
         else:
             self.mousePressEvent(event)
+
+    def _hit_text(self, point):
+        """返回点击命中的文字标注下标（后画的优先），未命中返回 None。"""
+        for index in reversed(range(len(self._annotations))):
+            item = self._annotations[index]
+            if item["tool"] != "text":
+                continue
+            font = ui_font(14, 18)
+            font.setPixelSize(16 + item["width"] * 2)
+            metrics = QFontMetrics(font)
+            origin = item["points"][0] + QPointF(self._selection.topLeft())
+            rect = QRect(int(origin.x()) - 4, int(origin.y()) - 4,
+                         metrics.horizontalAdvance(item["text"]) + 16, metrics.height() + 8)
+            if rect.contains(point):
+                return index
+        return None
+
+    def _open_text_editor(self, point):
+        """在点击处打开就地输入框：直接打字，回车落字，Esc 取消。"""
+        font = ui_font(14, 18)
+        font.setPixelSize(16 + self._width * 2)
+        metrics = QFontMetrics(font)
+        editor = QLineEdit(self)
+        editor.setFont(font)
+        editor.setStyleSheet(
+            "QLineEdit { background: rgba(255, 255, 255, 235); border: 1px solid #2684FF;"
+            " border-radius: 3px; padding: 2px 4px; selection-background-color: #2684FF; }")
+        palette = editor.palette()
+        palette.setColor(QPalette.Text, self._color)
+        editor.setPalette(palette)
+        editor.setFixedSize(max(160, metrics.horizontalAdvance("00000000")), metrics.height() + 12)
+        editor.move(min(max(point.x(), self._selection.x()), self._selection.right() - editor.width() + 1),
+                    min(max(point.y(), self._selection.y()), self._selection.bottom() - editor.height() + 1))
+        editor.textChanged.connect(lambda _: self._adjust_text_editor(editor, metrics))
+        editor.returnPressed.connect(self._confirm_text_editor)
+        self._text_anchor = QPointF(point - self._selection.topLeft())
+        self._text_editor = editor
+        editor.show()
+        editor.setFocus()
+        self.update()
+
+    def _adjust_text_editor(self, editor, metrics):
+        """输入内容变长时输入框跟随加宽。"""
+        editor.resize(max(160, metrics.horizontalAdvance(editor.text()) + 40), editor.height())
+
+    def _confirm_text_editor(self):
+        """把就地输入框里的文字落为标注；空内容则丢弃。"""
+        editor, self._text_editor = self._text_editor, None
+        if editor is None:
+            return
+        text = editor.text().strip()
+        editor.deleteLater()
+        if not text:
+            return
+        self._annotations.append({"tool": "text", "points": [QPointF(self._text_anchor)],
+                                  "color": QColor(self._color), "width": self._width, "text": text})
+        self._redo.clear()
+        self._position_toolbar()
+        self.update()
+
+    def _cancel_text_editor(self):
+        editor, self._text_editor = self._text_editor, None
+        if editor is not None:
+            editor.deleteLater()
 
     def _undo(self):
         if self._annotations:
@@ -4319,12 +4720,21 @@ class CaptureOverlay(QWidget):
 
     def keyPressEvent(self, event):
         key, mods = event.key(), event.modifiers()
+        if key == Qt.Key_Escape and self._ocr_mode:
+            self._exit_ocr_mode()
+            self.ocr_status.hide()
+            return
+        if key == Qt.Key_Escape and self._text_editor is not None:
+            self._cancel_text_editor()
+            return
         if key == Qt.Key_Escape:
             self.close()
         elif self._ocr_busy:
             return
         elif mods & Qt.ControlModifier and key == Qt.Key_O:
             self._start_ocr()
+        elif self._ocr_mode and mods & Qt.ControlModifier and key == Qt.Key_C:
+            self._ocr_copy_selected()
         elif key in (Qt.Key_Return, Qt.Key_Enter):
             self._complete("copy")
         elif mods & Qt.ControlModifier and key in (Qt.Key_C, Qt.Key_S, Qt.Key_T):
@@ -4339,8 +4749,7 @@ class CaptureOverlay(QWidget):
             self._pixel_format = "RGB" if self._pixel_format == "HEX" else "HEX"
             self.update()
         elif key in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down) and not self._selection.isEmpty():
-            if self.ocr_result_window is not None:
-                self.ocr_result_window.hide()
+            self._exit_ocr_mode()
             self.ocr_status.hide()
             step = 10 if mods & Qt.ShiftModifier else 1
             dx = {Qt.Key_Left: -step, Qt.Key_Right: step}.get(key, 0)
@@ -4356,8 +4765,7 @@ class CaptureOverlay(QWidget):
 
     def closeEvent(self, event):
         self._pixel_timer.stop()
-        if self.ocr_result_window is not None:
-            self.ocr_result_window.close()
+        self._cancel_text_editor()
         if not self._accepted:
             self.cancelled.emit()
         super().closeEvent(event)
@@ -4662,10 +5070,10 @@ class ScreenshotTool(QObject):
         worker.finished.connect(self._ocr_worker_finished)
         worker.start()
 
-    def _ocr_result(self, text, error):
+    def _ocr_result(self, layout, source, error):
         if self.sender() is self._ocr_worker and self.overlay is not None:
             self._ocr_worker = None
-            self.overlay.set_ocr_result(text, error)
+            self.overlay.set_ocr_result(layout, source, error)
 
     def _ocr_worker_finished(self):
         worker = self.sender()
@@ -11789,7 +12197,7 @@ TOOL_TIPS = {
     "生成器": "页签：二维码 / 条形码 / UUID / 随机数",
     "颜色": "功能：颜色选择器 · HEX / RGB / HSL 互转",
     "取色器": "功能：屏幕取色 · 全屏放大镜 · C 复制并退出 · X 切换 HEX/RGB · 左键/ESC 退出",
-    "截图贴图": "功能：区域截屏 · OCR 文字识别 · 本地识别 · 旁窗查看文字 · 选中复制 · 像素放大镜 · HEX / RGB 取色 · 复制颜色 · 调整选区 · 矩形 / 箭头 / 画笔 / 文字标注 · 截图自动复制 · 自定义截屏 · 剪贴板贴图 · 桌面置顶 · 缩放 / 透明度 · 隐藏显示全部贴图",
+    "截图贴图": "功能：区域截屏 · 识别文字 · 识别后框内拖选即复制 · 像素放大镜 · HEX / RGB 取色 · 复制颜色 · 调整选区 · 矩形 / 箭头 / 画笔 / 文字标注 · 截图自动复制 · 自定义截屏 · 剪贴板贴图 · 桌面置顶 · 缩放 / 透明度 · 隐藏显示全部贴图",
     "文本工具": "页签：处理与统计（排序 · 去重 · uniq -c · 命名风格 · 合并拆分 · SQL IN · 选区实时统计 · 编码字节 · 不可见字符）/ 文本对比（行内高亮 · 忽略空白/大小写 · 差异跳转 · unified diff）",
     "Cron 表达式": "页签：执行计划 / 书写规范",
     "哈希计算": "页签：文本哈希 / 文件哈希（MD5 / SHA1 / SHA256 / SHA512）",
@@ -11847,6 +12255,8 @@ PINYIN_MAP = {
     "jieping": ["截图贴图"],
     "tietu": ["截图贴图"],
     "jietutietu": ["截图贴图"],
+    "quwenzi": ["截图贴图"],
+    "zhuawen": ["截图贴图"],
     "shijianchuo": ["日期时间"],
     "timestamp": ["日期时间"],
     "unix": ["日期时间"],
@@ -12431,6 +12841,41 @@ def save_shortcuts(bindings):
         with open(temporary, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(temporary, SHORTCUTS_PATH)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+
+
+DEFAULT_OCR_SETTINGS = {"enabled": False, "base_url": "", "api_key": "", "model": "",
+                        "local_enabled": True}
+
+
+def load_ocr_settings():
+    """读取文字识别配置；缺省时用系统 OCR。"""
+    settings = dict(DEFAULT_OCR_SETTINGS)
+    try:
+        with open(OCR_SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return settings
+    if not isinstance(data, dict):
+        return settings
+    settings["enabled"] = bool(data.get("enabled"))
+    settings["local_enabled"] = bool(data.get("local_enabled", True))
+    for key in ("base_url", "api_key", "model"):
+        value = data.get(key)
+        if isinstance(value, str):
+            settings[key] = value.strip()
+    return settings
+
+
+def save_ocr_settings(settings):
+    os.makedirs(os.path.dirname(OCR_SETTINGS_PATH), exist_ok=True)
+    temporary = OCR_SETTINGS_PATH + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+        os.replace(temporary, OCR_SETTINGS_PATH)
     finally:
         if os.path.exists(temporary):
             os.remove(temporary)
@@ -13185,8 +13630,129 @@ class SettingsWindow(QMainWindow):
 
         layout.addStretch()
         self._build_shortcuts_page()
+        self._build_ocr_page()
         self.tabs.currentChanged.connect(self._sync_hotkeys)
         self.main.hotkey.status_changed.connect(self._refresh_shortcut_status)
+
+    def _build_ocr_page(self):
+        page = QWidget()
+        self.tabs.addTab(page, "文字识别")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 18, 0, 0)
+        layout.setSpacing(10)
+        layout.addWidget(self._group_title("图片文字识别"))
+        hint = QLabel("截图识别文字会依次尝试：大模型（配置并启用时）→ 本地 RapidOCR（离线）→ 系统 OCR，\n"
+                      "任一级失败自动降级。接口需兼容 OpenAI 的 chat/completions 并支持图片输入（如 gpt-4o-mini、qwen-vl-max）。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #697386; font-size: 12px;")
+        layout.addWidget(hint)
+
+        self.ocr_local_check = QCheckBox("启用本地 RapidOCR（离线识别，无需联网）")
+        layout.addWidget(self.ocr_local_check)
+        self.ocr_local_state = QLabel()
+        self.ocr_local_state.setWordWrap(True)
+        self.ocr_local_state.setStyleSheet("color: #57606A; font-size: 12px;")
+        layout.addWidget(self.ocr_local_state)
+
+        self.ocr_enable = QCheckBox("使用大模型识别图片中的文字（优先于本地引擎）")
+        layout.addWidget(self.ocr_enable)
+
+        form = QFormLayout()
+        form.setSpacing(10)
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        field_style = ("QLineEdit { background: white; border: 1px solid #D6DEE8; border-radius: 6px;"
+                       " padding: 7px 9px; font-size: 13px; }"
+                       "QLineEdit:focus { border: 1px solid #1A73E8; }")
+        self.ocr_base_edit = QLineEdit()
+        self.ocr_base_edit.setPlaceholderText("https://api.openai.com/v1")
+        self.ocr_key_edit = QLineEdit()
+        self.ocr_key_edit.setEchoMode(QLineEdit.Password)
+        self.ocr_key_edit.setPlaceholderText("sk-…")
+        self.ocr_model_edit = QLineEdit()
+        self.ocr_model_edit.setPlaceholderText("gpt-4o-mini")
+        for edit in (self.ocr_base_edit, self.ocr_key_edit, self.ocr_model_edit):
+            edit.setStyleSheet(field_style)
+        form.addRow("接口地址", self.ocr_base_edit)
+        form.addRow("API Key", self.ocr_key_edit)
+        form.addRow("模型", self.ocr_model_edit)
+        layout.addLayout(form)
+
+        layout.addWidget(self._group_title("识别结果"))
+        self.ocr_source_label = QLabel("当前使用：系统 OCR")
+        self.ocr_source_label.setWordWrap(True)
+        self.ocr_source_label.setStyleSheet("color: #57606A; font-size: 12px;")
+        layout.addWidget(self.ocr_source_label)
+
+        self.ocr_feedback = QLabel()
+        self.ocr_feedback.setWordWrap(True)
+        self.ocr_feedback.setStyleSheet("color: #697386; font-size: 12px;")
+        layout.addWidget(self.ocr_feedback)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        save = QPushButton("保存识别设置")
+        save.setFixedSize(112, 32)
+        save.setStyleSheet(_primary_btn())
+        save.setCursor(QCursor(Qt.PointingHandCursor))
+        save.clicked.connect(self._save_ocr)
+        buttons.addWidget(save)
+        layout.addLayout(buttons)
+        layout.addStretch()
+        self._load_ocr()
+
+    def _load_ocr(self):
+        settings = load_ocr_settings()
+        self.ocr_enable.setChecked(settings["enabled"])
+        self.ocr_local_check.setChecked(settings.get("local_enabled", True))
+        self.ocr_base_edit.setText(settings["base_url"])
+        self.ocr_key_edit.setText(settings["api_key"])
+        self.ocr_model_edit.setText(settings["model"])
+        self._refresh_local_state()
+        self._refresh_ocr_source(settings)
+        self.ocr_feedback.clear()
+
+    def _refresh_local_state(self):
+        if rapidocr_available():
+            version = rapidocr_version()
+            self.ocr_local_state.setText("本地引擎已就绪：RapidOCR %s，CPU 离线识别"
+                                         % (("v" + version) if version else ""))
+            self.ocr_local_state.setStyleSheet("color: #188038; font-size: 12px;")
+        else:
+            self.ocr_local_state.setText("本地引擎未安装：在终端执行 pip install rapidocr onnxruntime 后重启工具箱。")
+            self.ocr_local_state.setStyleSheet("color: #B26A00; font-size: 12px;")
+
+    def _refresh_ocr_source(self, settings):
+        parts = []
+        if ocr_llm_ready(settings):
+            parts.append("大模型 · %s" % settings["model"])
+        local_on = settings.get("local_enabled", True)
+        if local_on and rapidocr_available():
+            parts.append("本地 RapidOCR")
+        parts.append("系统 OCR")
+        text = "当前识别顺序：" + " → ".join(parts)
+        if local_on and not rapidocr_available():
+            text += "（本地 RapidOCR 未安装，已跳过）"
+        self.ocr_source_label.setText(text)
+
+    def _save_ocr(self):
+        settings = {"enabled": self.ocr_enable.isChecked(),
+                    "base_url": self.ocr_base_edit.text().strip(),
+                    "api_key": self.ocr_key_edit.text().strip(),
+                    "model": self.ocr_model_edit.text().strip(),
+                    "local_enabled": self.ocr_local_check.isChecked()}
+        try:
+            save_ocr_settings(settings)
+        except OSError as exc:
+            self.ocr_feedback.setText("保存失败：%s" % exc)
+            self.ocr_feedback.setStyleSheet("color: #C62828; font-size: 12px;")
+            return
+        self._refresh_ocr_source(settings)
+        if settings["enabled"] and not ocr_llm_ready(settings):
+            self.ocr_feedback.setText("已保存。接口地址、API Key、模型需全部填写，否则仍使用系统 OCR。")
+            self.ocr_feedback.setStyleSheet("color: #B26A00; font-size: 12px;")
+        else:
+            self.ocr_feedback.setText("已保存，下次识别生效。")
+            self.ocr_feedback.setStyleSheet("color: #188038; font-size: 12px;")
 
     def _build_shortcuts_page(self):
         page = QWidget()
@@ -13381,6 +13947,78 @@ class SettingsWindow(QMainWindow):
             super().keyPressEvent(event)
 
 
+class FlowLayout(QLayout):
+    """按可用宽度把固定尺寸的子控件自动换行。
+
+    最小宽度只按单个控件计算，窗口变窄时按钮换行（卡片高度随之变高、可滚动），
+    而不是像网格那样顶住内容宽度、把右边的按钮裁掉。
+    """
+
+    def __init__(self, parent=None, spacing=8):
+        super().__init__(parent)
+        self._items = []
+        self._spacing = spacing
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self):
+        return Qt.Orientations()
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            if item.widget() is not None and item.widget().isHidden():
+                continue
+            size = size.expandedTo(item.sizeHint())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _do_layout(self, rect, test_only):
+        m = self.contentsMargins()
+        area = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y, line_height = area.x(), area.y(), 0
+        for item in self._items:
+            widget = item.widget()
+            if item.isEmpty() or (widget is not None and widget.isHidden()):
+                continue
+            hint = item.sizeHint()
+            if x + hint.width() > area.right() + 1 and line_height > 0:
+                x = area.x()
+                y += line_height + self._spacing
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x += hint.width() + self._spacing
+            line_height = max(line_height, hint.height())
+        return y + line_height - rect.y() + m.bottom()
+
+
 class ToolboxWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -13468,10 +14106,15 @@ class ToolboxWindow(QMainWindow):
         self.search_history = []
         self.max_history = 12
         self.history_widget = QWidget()
-        self.history_widget.setFixedHeight(64)
+        self.history_widget.setObjectName("historyPanel")
+        self.history_widget.setAttribute(Qt.WA_StyledBackground, True)
+        self.history_widget.setFixedHeight(76)
         self.history_widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.history_widget.setStyleSheet(
+            "QWidget#historyPanel { background: #FFFFFF; border: 1px solid #E4EAF2; border-radius: 10px; }")
         history_layout = QVBoxLayout(self.history_widget)
-        history_layout.setContentsMargins(0, 0, 0, 4)
+        # 内边距与工具卡片一致，tab 和胶囊对齐卡片内标题的缩进
+        history_layout.setContentsMargins(14, 8, 14, 8)
         history_layout.setSpacing(6)
 
         history_header = QHBoxLayout()
@@ -13490,6 +14133,7 @@ class ToolboxWindow(QMainWindow):
                 QPushButton:checked { color: #1A73E8; border-bottom-color: #1A73E8; }
             """)
             btn.clicked.connect(lambda _checked, m=mode: self._set_history_mode(m))
+            btn.installEventFilter(self)  # Tab / 方向键在两个 tab 间切换
             history_header.addWidget(btn)
             self.history_tabs[mode] = btn
         history_header.addStretch()
@@ -13762,6 +14406,9 @@ class ToolboxWindow(QMainWindow):
         section = QFrame()
         section.setObjectName("toolSection")
         section.setStyleSheet("QFrame#toolSection { background: #FFFFFF; border: 1px solid #E4EAF2; border-radius: 10px; }")
+        policy = section.sizePolicy()
+        policy.setHeightForWidth(True)  # 换行后高度跟着行数长
+        section.setSizePolicy(policy)
         layout = QVBoxLayout(section)
         layout.setContentsMargins(14, 12, 14, 14)
         layout.setSpacing(10)
@@ -13771,14 +14418,12 @@ class ToolboxWindow(QMainWindow):
         title_label.setStyleSheet("color: #53657E;")
         layout.addWidget(title_label)
 
-        from PyQt5.QtWidgets import QGridLayout
-        btn_layout = QGridLayout()
-        btn_layout.setSpacing(8)
+        btn_layout = FlowLayout(spacing=LAUNCHER_GRID_SPACING)
 
         section_buttons = []  # 记录这个分类包含哪些按钮
-        for i, btn_text in enumerate(buttons):
+        for btn_text in buttons:
             btn = QPushButton(btn_text)
-            btn.setFixedHeight(36)
+            btn.setFixedSize(LAUNCHER_BTN_W, LAUNCHER_BTN_H)
             btn.setCursor(QCursor(Qt.PointingHandCursor))
             tip = TOOL_TIPS.get(btn_text)
             if tip:
@@ -13824,17 +14469,23 @@ class ToolboxWindow(QMainWindow):
                 btn.clicked.connect(lambda _, t=btn_text: self._activate_tool(t))
             self.all_buttons[btn_text] = btn  # 存储按钮引用用于搜索
             section_buttons.append(btn_text)  # 记录到分类按钮列表
-            row = i // 6
-            col = i % 6
-            btn_layout.addWidget(btn, row, col)
+            btn_layout.addWidget(btn)
 
-        for col in range(6):
-            btn_layout.setColumnStretch(col, 1)
         layout.addLayout(btn_layout)
 
         # 存储分类信息：(section_widget, title_label, [button_texts], btn_layout)
         self.sections.append((section, title_label, section_buttons, btn_layout))
         return section
+
+    def _layout_section_buttons(self, section, layout, names):
+        """按名字顺序重新装进流式布局（排序/跨类移动后调用）。"""
+        for i in reversed(range(layout.count())):
+            layout.takeAt(i)
+        for n in names:
+            btn = self.all_buttons.get(n)
+            if btn is not None:
+                layout.addWidget(btn)
+        layout.invalidate()
 
     def set_awake(self, active):
         try:
@@ -14145,6 +14796,7 @@ class ToolboxWindow(QMainWindow):
                 btn._filter_match = True
             for section, title_label, _, _ in self.sections:
                 section.setVisible(True)
+                section.updateGeometry()
             self.tool_count_label.setText("%s 个工具" % len(self.all_buttons))
             self.empty_search_label.hide()
             return
@@ -14165,6 +14817,7 @@ class ToolboxWindow(QMainWindow):
             has_visible = any(self.all_buttons[text]._filter_match 
                             for text in btn_texts if text in self.all_buttons)
             section.setVisible(has_visible)
+            section.updateGeometry()  # 过滤后重新换行，别留下空位
         count = sum(btn._filter_match for btn in self.all_buttons.values())
         self.tool_count_label.setText("找到 %s 个工具" % count)
         self.empty_search_label.setVisible(count == 0)
@@ -14299,7 +14952,9 @@ class ToolboxWindow(QMainWindow):
             hint.setFont(ui_font(10, 12))
             hint.setStyleSheet("color: #9AA7B8;")
             self.history_row.addWidget(hint)
-        available = self.history_widget.contentsRect().width()
+        margins = self.history_widget.layout().contentsMargins()
+        available = max(0, self.history_widget.contentsRect().width()
+                        - margins.left() - margins.right())
         for value in items[:5]:
             btn = QPushButton()
             btn.setFont(ui_font(10, 12))
@@ -14370,7 +15025,32 @@ class ToolboxWindow(QMainWindow):
     def eventFilter(self, obj, event):
         if obj is self.history_widget and event.type() == QEvent.Resize:
             self._refresh_history_display()
+        elif event.type() == QEvent.KeyPress and obj in self.history_tabs.values():
+            if self._switch_history_tab(obj, event):
+                return True
         return super().eventFilter(obj, event)
+
+    def _switch_history_tab(self, button, event):
+        """Tab / Shift+Tab（以及左右方向键）在最近使用与搜索记录之间来回循环切换。
+        循环会把焦点一直留在按钮上，所以用 Esc 交回搜索框，避免键盘出不去。"""
+        modes = ("recent", "search")
+        current = next((m for m, b in self.history_tabs.items() if b is button), None)
+        if current is None:
+            return False
+        key = event.key()
+        if key == Qt.Key_Escape:
+            self.search_input.setFocus(Qt.OtherFocusReason)
+            return True
+        if key in (Qt.Key_Tab, Qt.Key_Backtab):
+            step = -1 if (key == Qt.Key_Backtab or event.modifiers() & Qt.ShiftModifier) else 1
+        elif key in (Qt.Key_Left, Qt.Key_Right):
+            step = -1 if key == Qt.Key_Left else 1
+        else:
+            return False
+        mode = modes[(modes.index(current) + step) % len(modes)]
+        self._set_history_mode(mode)
+        self.history_tabs[mode].setFocus(Qt.TabFocusReason)
+        return True
 
     def apply_section_order(self):
         """按 self.section_order 重排首页分组，并持久化。"""
@@ -14393,10 +15073,7 @@ class ToolboxWindow(QMainWindow):
         for section, title_label, texts, grid in self.sections:
             names = self.tool_order.get(title_label.text(), list(texts))
             texts[:] = names
-            for i, n in enumerate(names):
-                b = self.all_buttons.get(n)
-                if b is not None:
-                    grid.addWidget(b, i // 6, i % 6)
+            self._layout_section_buttons(section, grid, names)
         save_tool_order(self.tool_order)
 
     def reset_section_order(self):
@@ -15264,6 +15941,9 @@ if __name__ == "__main__":
         window = ToolboxWindow()
         window.show()
         write_startup_log("界面已显示")
+        # 后台预热本地 OCR，避免第一次识别时多等引擎初始化
+        if load_ocr_settings().get("local_enabled", True) and rapidocr_available():
+            threading.Thread(target=warm_rapidocr, daemon=True).start()
         exit_code = app.exec_()
     except Exception:
         detail = traceback.format_exc()

@@ -30,14 +30,26 @@ ICON_ASSETS = [(os.path.join("assets", f), "assets")
                for f in ("icon.ico", "icon.icns", "icon.png")
                if os.path.exists(os.path.join("assets", f))]
 
+# 本地 OCR（RapidOCR + onnxruntime）按需收集：未安装时构建仍可成功，程序会自动跳过本地引擎。
+OCR_BINARIES, OCR_DATAS, OCR_HIDDEN = [], [], []
+try:
+    from PyInstaller.utils.hooks import collect_all
+    for package in ("rapidocr", "onnxruntime"):
+        binaries, datas, hiddenimports = collect_all(package)
+        OCR_BINARIES += binaries
+        OCR_DATAS += datas
+        OCR_HIDDEN += hiddenimports
+except Exception as exc:  # noqa: BLE001
+    print("skip local OCR collection:", exc)
+
 a = Analysis(
     ["toolbox.py"],
     pathex=[],
-    binaries=[],
-    datas=ICON_ASSETS,
+    binaries=OCR_BINARIES,
+    datas=ICON_ASSETS + OCR_DATAS,
     # qrcode picks its PIL image backend lazily; make sure it is bundled.
     # cryptography's Rust binding is an extension module the 加解密 pages need at runtime.
-    hiddenimports=["qrcode.pil", "qrcode.image.pil", "cryptography.hazmat.bindings._rust"],
+    hiddenimports=["qrcode.pil", "qrcode.image.pil", "cryptography.hazmat.bindings._rust"] + OCR_HIDDEN,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

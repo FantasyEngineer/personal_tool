@@ -434,6 +434,7 @@ SECTION_ORDER_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", 
 TOOL_ORDER_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "tool_order.json")
 SHORTCUTS_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "shortcuts.json")
 OCR_SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "ocr_settings.json")
+UPDATE_TARGET_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "update_target.json")
 
 
 def load_history(path):
@@ -13558,15 +13559,6 @@ class SettingsWindow(QMainWindow):
         repo_row.addWidget(open_repo)
         layout.addLayout(repo_row)
 
-        layout.addWidget(self._group_title("检查更新"))
-        upd_row = QHBoxLayout()
-        upd_row.setSpacing(8)
-        upd_hint = QLabel("当前版本 v%s" % APP_VERSION)
-        upd_hint.setStyleSheet("color: #57606A; font-size: 12px;")
-        upd_row.addWidget(upd_hint, 1)
-        upd_row.addWidget(self.main.update_btn)
-        layout.addLayout(upd_row)
-
         layout.addStretch()
         self._build_shortcuts_page()
         self._build_ocr_page()
@@ -14278,21 +14270,16 @@ class ToolboxWindow(QMainWindow):
         self.check_thread = None
         QApplication.instance().aboutToQuit.connect(self._stop_update_check)
         self.update_btn = QPushButton("检查更新")
-        self.update_btn.setFixedSize(90, 28)
+        self.update_btn.setFont(ui_font(10, 12))
+        self.update_btn.setFixedSize(76, 30)
         self.update_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self.update_btn.setStyleSheet(_secondary_btn() + "QPushButton { font-size: 12px; }")
-        self.update_btn.clicked.connect(self.check_for_updates)
-
-        exit_btn = QPushButton("退出")
-        exit_btn.setFont(ui_font(10, 12))
-        exit_btn.setFixedSize(56, 30)
-        exit_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        exit_btn.setStyleSheet("""
-            QPushButton { color: #BA5555; background: transparent; border: 1px solid transparent; border-radius: 6px; }
-            QPushButton:hover { color: #B3261E; background: #FFF0EF; border-color: #F2D2D0; }
+        self.update_btn.setToolTip("检查是否有新版本")
+        self.update_btn.setStyleSheet("""
+            QPushButton { color: #53657E; background: #FFFFFF; border: 1px solid #DAE2ED; border-radius: 6px; }
+            QPushButton:hover { color: #1A73E8; background: #EDF4FF; border-color: #AAC8F4; }
         """)
-        exit_btn.clicked.connect(QApplication.instance().quit)
-        bottom_layout.addWidget(exit_btn)
+        self.update_btn.clicked.connect(self.check_for_updates)
+        bottom_layout.addWidget(self.update_btn)
 
         main_layout.addWidget(bottom_bar)
 
@@ -15125,14 +15112,155 @@ class UpdateRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def mac_app_bundle(path=None):
+    """返回可执行文件所在的 .app 路径，不在 .app 内运行时返回空串。"""
+    path = path or sys.executable
+    marker = path.find('.app/')
+    return path[:marker + 4] if marker > 0 else ""
+
+
+def mac_app_translocated(path):
+    """Gatekeeper 会把「下载」里直接运行的 app 挂到只读虚拟目录，这种路径不能原地更新。"""
+    return '/AppTranslocation/' in path
+
+
+def mac_downloads_dir():
+    return os.path.realpath(QStandardPaths.writableLocation(QStandardPaths.DownloadLocation))
+
+
+def mac_applications_dir():
+    """优先系统级「应用程序」目录，不可写时退回用户级 ~/Applications。"""
+    if os.access('/Applications', os.W_OK):
+        return '/Applications'
+    user_applications = os.path.join(os.path.expanduser('~'), 'Applications')
+    try:
+        os.makedirs(user_applications, exist_ok=True)
+    except OSError:
+        return ''
+    return user_applications if os.access(user_applications, os.W_OK) else ''
+
+
+def load_update_target():
+    try:
+        with open(UPDATE_TARGET_PATH, encoding='utf-8') as file:
+            value = json.load(file).get('mac_target')
+    except (OSError, ValueError, AttributeError):
+        return ''
+    return value if isinstance(value, str) and value.endswith('.app') else ''
+
+
+def save_update_target(target):
+    try:
+        os.makedirs(os.path.dirname(UPDATE_TARGET_PATH), exist_ok=True)
+        temp = UPDATE_TARGET_PATH + '.tmp'
+        with open(temp, 'w', encoding='utf-8') as file:
+            json.dump({'mac_target': target}, file, ensure_ascii=False)
+        os.replace(temp, UPDATE_TARGET_PATH)
+    except OSError:
+        pass
+
+
+def mac_update_target():
+    """macOS 安装位置：原地更新 → 记住的位置 → /Applications → ~/Applications → 下载。
+
+    只在可写、且不是 Gatekeeper 虚拟路径或「下载」目录时选择原地更新，
+    避免把更新装回下载文件夹。
+    """
+    bundle = mac_app_bundle()
+    if bundle and not mac_app_translocated(bundle):
+        current = os.path.realpath(bundle)
+        if os.path.commonpath((current, mac_downloads_dir())) != mac_downloads_dir() \
+                and os.access(os.path.dirname(current), os.W_OK):
+            return current
+    remembered = load_update_target()
+    if remembered and os.access(os.path.dirname(remembered), os.W_OK):
+        return remembered
+    applications = mac_applications_dir()
+    if applications:
+        return os.path.join(applications, 'Toolbox.app')
+    return os.path.join(mac_downloads_dir(), 'Toolbox.app')
+
+
 def update_install_target(system):
     if system == "Windows":
         if getattr(sys, "frozen", False):
             return os.path.abspath(sys.executable)
         return os.path.join(os.environ['LOCALAPPDATA'], "PersonalToolbox", "Toolbox.exe")
     if system == "Darwin":
-        return os.path.join(QStandardPaths.writableLocation(QStandardPaths.DownloadLocation), "Toolbox.app")
+        return mac_update_target()
     raise ValueError("应用内更新仅支持 Windows 和 macOS。")
+
+
+def move_mac_app(bundle, target):
+    """把 .app 复制到「应用程序」目录，刷新启动服务，打开新位置并退出当前实例。"""
+    staging = target + '.new'
+    backup = target + '.old'
+    for path in (staging, backup):
+        if os.path.lexists(path):
+            shutil.rmtree(path, ignore_errors=True)
+    shutil.copytree(bundle, staging, symlinks=True)
+    if os.path.lexists(target):
+        os.replace(target, backup)
+    os.replace(staging, target)
+    lsregister = ('/System/Library/Frameworks/CoreServices.framework/Frameworks/'
+                  'LaunchServices.framework/Support/lsregister')
+    for command in ([lsregister, '-f', target], ['/usr/bin/open', '-n', target]):
+        try:
+            subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            pass
+    shutil.rmtree(backup, ignore_errors=True)
+    # 下载目录里的旧副本要等本进程退出后再删，否则会删到正在运行的包
+    old = os.path.realpath(bundle)
+    try:
+        inside_downloads = os.path.commonpath((old, mac_downloads_dir())) == mac_downloads_dir()
+    except ValueError:
+        inside_downloads = False
+    if inside_downloads and old != os.path.realpath(target):
+        subprocess.Popen(['/bin/sh', '-c', 'sleep 3; rm -rf %s' % shlex.quote(old)],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    QApplication.instance().quit()
+
+
+def offer_mac_app_move(parent):
+    """在「下载」或 Gatekeeper 虚拟路径下运行时，提示把应用移到「应用程序」文件夹。"""
+    if platform.system() != 'Darwin' or not getattr(sys, 'frozen', False):
+        return
+    bundle = mac_app_bundle()
+    if not bundle:
+        return
+    translocated = mac_app_translocated(bundle)
+    current = bundle if translocated else os.path.realpath(bundle)
+    if not translocated:
+        try:
+            if os.path.commonpath((current, mac_downloads_dir())) != mac_downloads_dir():
+                return  # 已放在用户选定的位置，不再打扰
+        except ValueError:
+            return
+    applications = mac_applications_dir()
+    if not applications:
+        return
+    target = os.path.join(applications, 'Toolbox.app')
+    if os.path.realpath(target) == current:
+        return
+    box = QMessageBox(parent)
+    box.setWindowTitle('移动工具箱')
+    box.setIcon(QMessageBox.Question)
+    box.setText('工具箱正在「下载」文件夹中运行，是否移动到「应用程序」文件夹？')
+    box.setInformativeText('移动后会出现在启动台和应用列表中，并自动打开新位置的应用，'
+                           '以后更新也直接装到那里。')
+    move_btn = box.addButton('移动到应用程序', QMessageBox.AcceptRole)
+    box.addButton('稍后再说', QMessageBox.RejectRole)
+    box.exec_()
+    if box.clickedButton() is not move_btn:
+        return
+    try:
+        move_mac_app(bundle, target)
+    except (OSError, shutil.Error) as exc:
+        QMessageBox.warning(parent, '移动失败',
+                            '无法移动应用：%s\n可以手动把 Toolbox.app 拖到「应用程序」文件夹。' % exc)
 
 
 def extract_update_package(archive_path, directory, system, cancelled):
@@ -15625,10 +15753,14 @@ class AppUpdateDialog(QDialog):
             self.target = os.path.join(directory, 'Toolbox.exe' if self.system == 'Windows' else 'Toolbox.app')
             self.location.setText(self.target)
             self.location.setToolTip(self.target)
+            if self.system == 'Darwin':
+                save_update_target(self.target)  # 记住位置，下次更新直接装回这里
 
     def _start(self):
         if self._worker is not None or self._phase != 'idle':
             return
+        if self.system == 'Darwin':
+            save_update_target(self.target)
         try:
             if self.system == 'Windows':
                 if os.path.isdir(self.target):
@@ -15879,6 +16011,9 @@ if __name__ == "__main__":
         window = ToolboxWindow()
         window.show()
         write_startup_log("界面已显示")
+        # macOS 若在「下载」里运行，提示迁到「应用程序」，让启动台能索引到
+        if platform.system() == 'Darwin':
+            QTimer.singleShot(600, lambda: offer_mac_app_move(window))
         # 后台预热本地 OCR，避免第一次识别时多等引擎初始化
         if load_ocr_settings().get("local_enabled", True) and rapidocr_available():
             threading.Thread(target=warm_rapidocr, daemon=True).start()

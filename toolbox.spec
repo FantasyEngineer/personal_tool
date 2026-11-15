@@ -30,64 +30,58 @@ ICON_ASSETS = [(os.path.join("assets", f), "assets")
                for f in ("icon.ico", "icon.icns", "icon.png", "tray_template.png")
                if os.path.exists(os.path.join("assets", f))]
 
-# 本地 OCR（RapidOCR + onnxruntime）按需收集：未安装时构建仍可成功，程序会自动跳过本地引擎。
-OCR_BINARIES, OCR_DATAS, OCR_HIDDEN = [], [], []
-# 这些子包只在训练/模型转换时用，运行时不需要。PyInstaller 分析它们会在隔离子进程里
-# 导入 onnxruntime，与 PyQt5 自带的 CRT 冲突而崩溃（exit 3221225477），必须排除。
-OCR_SKIP = (
-    "onnxruntime.quantization", "onnxruntime.transformers", "onnxruntime.tools",
-    "onnxruntime.datasets", "onnxruntime.training",
-    "rapidocr.inference_engine.tensorrt", "rapidocr.inference_engine.pytorch",
-    "rapidocr.inference_engine.paddle", "rapidocr.inference_engine.mnn",
-    "rapidocr.inference_engine.openvino",
-)
-try:
-    from PyInstaller.utils.hooks import collect_all
-    for package in ("rapidocr", "onnxruntime"):
-        binaries, datas, hiddenimports = collect_all(package)
-        OCR_BINARIES += binaries
-        OCR_DATAS += datas
-        OCR_HIDDEN += [name for name in hiddenimports
-                       if not any(name == skip or name.startswith(skip + ".") for skip in OCR_SKIP)]
-except Exception as exc:  # noqa: BLE001
-    print("skip local OCR collection:", exc)
-
-# PyInstaller 的二进制依赖扫描会把 Qt 绑定放在最前面导入，之后再导入 onnxruntime 就会因
-# Qt5/bin 自带的旧版 msvcp140 冲突而崩溃（0xC0000005，导致 Windows 打包失败）。
-# onnxruntime 的 DLL 已由 collect_all 完整收集，无需再让扫描步骤导入它，这里直接跳过。
-import PyInstaller.building.build_main as _build_main
-
-_original_find_binary_dependencies = _build_main.find_binary_dependencies
-
-
-def _find_binary_dependencies(binaries, import_packages, symlink_suppression_patterns):
-    # onnxruntime 及其上层封装在 PyQt5 之后导入都会崩溃，两者都不参与扫描；
-    # 它们的 DLL 由上面的 collect_all 完整收集，运行时直接从包里加载。
-    skip = ("onnxruntime", "rapidocr")
-    safe_packages = [name for name in import_packages
-                     if not any(name == root or name.startswith(root + ".") for root in skip)]
-    return _original_find_binary_dependencies(binaries, safe_packages, symlink_suppression_patterns)
-
-
-_build_main.find_binary_dependencies = _find_binary_dependencies
+# 本地 OCR（RapidOCR + onnxruntime + opencv）不打进安装包：首次识别时按需下载到
+# 用户目录（见 toolbox.py 的 ensure_ocr_runtime），安装包因此保持在几十 MB。
+# 代码里只用 importlib 探测、不写死 import，这里再排除一次，避免构建机装了这些包
+# 之后被顺手打进包里。
+OCR_EXCLUDES = ["rapidocr", "onnxruntime", "cv2"]
 
 a = Analysis(
     ["toolbox.py"],
     pathex=[],
-    binaries=OCR_BINARIES,
-    datas=ICON_ASSETS + OCR_DATAS,
+    binaries=[],
+    datas=ICON_ASSETS,
     # qrcode picks its PIL image backend lazily; make sure it is bundled.
     # cryptography's Rust binding is an extension module the 加解密 pages need at runtime.
-    hiddenimports=["qrcode.image.pil", "cryptography.hazmat.bindings._rust"] + OCR_HIDDEN,
+    # numpy.core 是 numpy 2 给旧代码留的兼容层：按需下载的 cv2 里仍有
+    # import numpy.core.multiarray，构建时没有模块引用它就会被裁掉，导致运行时
+    # 「No module named 'numpy.core.multiarray'」，这里显式带上。
+    # http.cookies 同理：只有运行时下载的 requests 才会用到，应用本身不引用。
+    hiddenimports=["qrcode.image.pil", "cryptography.hazmat.bindings._rust",
+                   "numpy.core", "numpy.core.multiarray", "http.cookies"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["tkinter", "matplotlib", "PyQt5.QtWebEngine", "PyQt5.QtQml"] + list(OCR_SKIP),
+    excludes=["tkinter", "matplotlib", "PyQt5.QtWebEngine", "PyQt5.QtQml",
+              "PyQt5.QtQuick", "PyQt5.QtQuickWidgets"] + OCR_EXCLUDES,
     win_no_prefer_redirects=False,
     noarchive=False,
 )
 
 pyz = PYZ(a.pure)
+
+# 瘦身：剔除运行时用不到的二进制（不改动任何功能，只减体积）。
+#   opengl32sw / d3dcompiler_47 / libEGL / libGLESv2 —— Qt 的软件 OpenGL 与 ANGLE 兜底，
+#   QWidget 程序走 Windows 光栅后端，正常显卡驱动下用不到；
+#   Qt5Quick/Qml 栈 —— 界面全部是 QWidget，没有 QML；
+#   _avif —— Pillow 的 AVIF 插件，没有加载过 AVIF 图片。
+SLIM_PREFIXES = (
+    "opengl32sw",
+    "d3dcompiler_47",
+    "qt5quick",
+    "qt5qml",
+    "libglesv2",
+    "libegl",
+    "_avif",
+)
+
+
+def _keep_binary(entry):
+    name = os.path.basename(entry[0]).lower()
+    return not any(name.startswith(prefix) for prefix in SLIM_PREFIXES)
+
+
+a.binaries = [entry for entry in a.binaries if _keep_binary(entry)]
 
 EXE_OPTS = dict(
     name=APP_NAME,

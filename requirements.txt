@@ -3,12 +3,9 @@ qrcode==8.2
 pillow==11.3.0
 PyYAML==6.0.3
 cryptography==50.0.2
-# 长截图拼接显式依赖 numpy + OpenCV：不靠 rapidocr 间接带入，
-# 否则精简环境（如 mac 源码运行）缺包会在 Qt 槽里抛 ImportError 被 PyQt5 转成 qFatal 闪退。
+# 长截图拼接用纯 numpy 实现：缺包会在 Qt 槽里抛 ImportError 被 PyQt5 转成 qFatal 闪退。
 numpy>=1.19.5,<3.0.0
-opencv-python-headless>=4.5.1.48
 tzdata==2025.3
-rapidocr==3.10.0
-# onnxruntime 按平台区分：1.32.0 仅发布 Windows/mac 之外的 wheel，macOS 最高 1.19.2
-onnxruntime==1.32.0; sys_platform == "win32"
-onnxruntime==1.19.2; sys_platform == "darwin"
+# 本地离线 OCR（rapidocr / onnxruntime / opencv）不再随安装包分发：
+# 首次识别时按需下载到用户目录，见 toolbox.py 的 ensure_ocr_runtime。
+# CI 里的 OCR runtime 任务单独安装这两组固定版本，见 .github/workflows/build.yml。

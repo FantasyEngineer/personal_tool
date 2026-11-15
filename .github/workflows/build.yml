@@ -158,9 +158,82 @@ jobs:
             ${{ matrix.asset_name }}
           generate_release_notes: true
 
+  # 离线 OCR 运行时：单独装一套 rapidocr/onnxruntime/opencv，压缩后随版本一起发布。
+  # 安装包本身不再包含它们（见 toolbox.spec），应用首次识别时才按需下载这份压缩包，
+  # 普通用户不用的话完全不占体积。
+  runtime:
+    name: OCR runtime (${{ matrix.os }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: ocr-runtime-windows
+            asset_name: ocr-runtime-windows.zip
+          - os: macos-latest
+            artifact_name: ocr-runtime-macos
+            asset_name: ocr-runtime-macos.zip
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      # 必须与应用同一个 Python 小版本（spec 未固定，当前构建机是 3.11）：
+      # 扩展模块与解释器 ABI 绑定，版本不符时应用会拒绝加载。
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install OCR packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install --target runtime \
+            rapidocr==3.10.0 \
+            "onnxruntime==1.32.0; sys_platform == 'win32'" \
+            "onnxruntime==1.19.2; sys_platform == 'darwin'"
+          du -sh runtime
+
+      - name: Trim runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          # numpy 由应用自带（PyInstaller 已打包），运行时目录里再放一份会出现两套
+          # ABI；视频解码后端、脚本入口和测试在文字识别里都用不到。
+          rm -rf runtime/numpy runtime/numpy.libs runtime/numpy-*.dist-info
+          rm -rf runtime/bin runtime/Scripts runtime/share
+          find runtime -name '__pycache__' -type d -prune -exec rm -rf {} +
+          find runtime -name 'opencv_videoio_ffmpeg*' -delete
+          find runtime -name 'tests' -type d -prune -exec rm -rf {} +
+          du -sh runtime
+
+      # 用 Python 打 zip：条目统一是「包名/文件」的 POSIX 路径，两个平台产物
+      # 结构一致，应用解压后可直接把该目录加进 sys.path。
+      - name: Package runtime zip
+        shell: python
+        run: |
+          import pathlib
+          import zipfile
+
+          target = pathlib.Path("${{ matrix.asset_name }}")
+          root = pathlib.Path("runtime")
+          with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as bundle:
+              for path in sorted(root.rglob("*")):
+                  if path.is_file():
+                      bundle.write(path, path.relative_to(root).as_posix())
+          print(target, "%.1f MB" % (target.stat().st_size / 1048576))
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.asset_name }}
+          if-no-files-found: error
+
   publish:
     name: Upload to R2 and update version.json
-    needs: build
+    needs: [build, runtime]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     env:
@@ -177,6 +250,35 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+
+      # 离线 OCR 运行时的下载地址与校验值：size/sha256 交给应用下载时校验，
+      # 文件不完整或被人换掉都会被拒绝加载。
+      - name: Read OCR runtime packages
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+
+          tag = os.environ["TAG"]
+          base = os.environ["R2_PUBLIC_BASE_URL"].rstrip("/")
+          runtime = {"version": tag.lstrip("v")}
+          for key, name in (("windows", "ocr-runtime-windows"),
+                            ("macos", "ocr-runtime-macos")):
+              path = pathlib.Path("artifacts") / name / (name + ".zip")
+              if not path.is_file():
+                  raise SystemExit(f"missing OCR runtime artifact: {path}")
+              runtime[key] = {
+                  "url": f"{base}/releases/{tag}/{path.name}",
+                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                  "size": path.stat().st_size,
+              }
+          pathlib.Path("ocr_runtime.json").write_text(
+              json.dumps(runtime, ensure_ascii=False, indent=2), encoding="utf-8")
+          print(json.dumps(runtime, ensure_ascii=False, indent=2))
+          PY
 
       # 由 tag 自动生成 version.json：版本号取自 tag，下载地址指向该 tag 在 R2 上的
       # 安装包，changelog 优先用附注 tag 的说明，其次用提交记录。
@@ -205,11 +307,13 @@ jobs:
           import sys
 
           version, changelog, base = sys.argv[1], sys.argv[2], sys.argv[3]
+          runtime = json.loads(pathlib.Path("ocr_runtime.json").read_text(encoding="utf-8"))
           data = {
               "version": version,
               "mac_url": f"{base}/Toolbox-macos.zip",
               "win_url": f"{base}/Toolbox-windows.zip",
               "changelog": changelog,
+              "ocr_runtime": runtime,
           }
           text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
           pathlib.Path("version.json").write_text(text, encoding="utf-8")
@@ -249,6 +353,8 @@ jobs:
           status=0
           upload_asset Toolbox-macos.zip || status=1
           upload_asset Toolbox-windows.zip || status=1
+          upload_asset ocr-runtime-macos.zip || status=1
+          upload_asset ocr-runtime-windows.zip || status=1
           exit $status
 
       # 上传成功后清理旧版本：R2 上只保留当前 TAG 的安装包，releases/ 下其它

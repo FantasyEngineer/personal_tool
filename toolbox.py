@@ -11,6 +11,7 @@ import ast
 import base64
 import urllib.parse
 import hashlib
+import importlib
 import xml.dom.minidom
 import urllib.request
 import time
@@ -3538,18 +3539,73 @@ def qimage_rgb_array(image):
 
 
 def long_shot_missing_deps():
-    """长截图按需依赖 numpy/opencv。启动前预检，缺包时返回模块名列表。
+    """长截图按需依赖 numpy。启动前预检，缺包时返回模块名列表。
 
     这些 import 发生在 Qt 定时器槽里，一旦抛 ImportError，PyQt5 会调用 qFatal
     直接 abort（表现为闪退），所以必须在进入抓拍流程前先检查并友好提示。
     """
     missing = []
-    for name in ("numpy", "cv2"):
+    for name in ("numpy",):
         try:
             __import__(name)
         except ImportError:
             missing.append(name)
     return missing
+
+
+def gray_array(rgb):
+    """RGB 数组转灰度（float32）。长截图拼接用，不依赖 OpenCV。"""
+    import numpy as np
+    return (rgb[:, :, 0] * 0.299 + rgb[:, :, 1] * 0.587
+            + rgb[:, :, 2] * 0.114).astype(np.float32)
+
+
+def block_mean(gray, factor):
+    """按 factor 做块平均降采样，粗匹配时把计算量降一个量级。"""
+    if factor <= 1:
+        return gray
+    height = gray.shape[0] // factor * factor
+    width = gray.shape[1] // factor * factor
+    if height <= 0 or width <= 0:
+        return gray
+    blocks = gray[:height, :width].reshape(height // factor, factor,
+                                          width // factor, factor)
+    return blocks.mean(axis=(1, 3))
+
+
+def match_score(strip, window):
+    """等尺寸两段的归一化相关系数（等价于 OpenCV 的 TM_CCOEFF_NORMED）。"""
+    import numpy as np
+    a = strip - strip.mean()
+    b = window - window.mean()
+    denominator = float(np.sqrt((a * a).sum() * (b * b).sum()))
+    if denominator <= 1e-6:
+        return 0.0
+    return float((a * b).sum() / denominator)
+
+
+def best_vertical_offset(previous, current, top, threshold=0.7):
+    """在 current 里找 previous[top:] 的最佳位置，返回新增内容的起始行。"""
+    strip = previous[top:]
+    height = strip.shape[0]
+    if height < 10 or height >= current.shape[0] or current.shape[1] != strip.shape[1]:
+        return None
+    best_score, best_offset = -2.0, None
+    for offset in range(0, current.shape[0] - height + 1):
+        score = match_score(strip, current[offset:offset + height])
+        if score > best_score:
+            best_score, best_offset = score, offset
+    if best_offset is None or best_score < threshold:
+        return None
+    return best_offset + height
+
+
+def offset_score(previous, current, top, offset):
+    """previous[top:] 落在 current 的 offset 行时的相关系数。"""
+    strip = previous[top:]
+    if offset < 0 or offset + strip.shape[0] > current.shape[0]:
+        return -2.0
+    return match_score(strip, current[offset:offset + strip.shape[0]])
 
 
 def save_screenshot(parent, image):
@@ -3784,9 +3840,10 @@ _rapidocr_run_lock = threading.Lock()
 
 
 def rapidocr_available():
-    """本地 RapidOCR 是否可用（需要 rapidocr 与 onnxruntime 都已安装）。"""
+    """本地 RapidOCR 是否可用（安装包内置或已按需下载运行时）。"""
     try:
         import importlib.util
+        ocr_runtime_site()
         return (importlib.util.find_spec("rapidocr") is not None
                 and importlib.util.find_spec("onnxruntime") is not None)
     except (ImportError, ValueError):
@@ -3799,6 +3856,299 @@ def rapidocr_version():
         return importlib.metadata.version("rapidocr")
     except Exception:
         return ""
+
+
+# 本地 OCR 运行时不随安装包分发（约 100 MB），首次使用时下载到用户目录，
+# 这样基础安装包可以保持在几十 MB，且不用的用户完全不用承担体积。
+OCR_RUNTIME_FOLDER = "ocr-runtime"
+_ocr_runtime_site_cache = None
+_ocr_runtime_site_checked = False
+_ocr_runtime_prompted = False
+
+
+def ocr_runtime_root():
+    """离线 OCR 运行时的本地目录。"""
+    if platform.system() == "Darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    elif os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(base, "PersonalToolbox", OCR_RUNTIME_FOLDER)
+
+
+def ocr_runtime_site():
+    """已下载且完整的运行时目录；命中时挂到 sys.path 前部，返回目录路径。"""
+    global _ocr_runtime_site_cache, _ocr_runtime_site_checked
+    if _ocr_runtime_site_checked:
+        return _ocr_runtime_site_cache
+    _ocr_runtime_site_checked = True
+    root = ocr_runtime_root()
+    try:
+        names = sorted(os.listdir(root), reverse=True)
+    except OSError:
+        return None
+    current = "%d.%d" % sys.version_info[:2]
+    for name in names:
+        path = os.path.join(root, name)
+        try:
+            with open(os.path.join(path, "runtime.json"), encoding="utf-8") as file:
+                info = json.load(file)
+        except (OSError, ValueError):
+            continue
+        # 扩展模块与解释器版本强绑定，版本不符时宁可不加载
+        if not isinstance(info, dict) or info.get("python") != current:
+            continue
+        if not all(os.path.isdir(os.path.join(path, package))
+                   for package in ("rapidocr", "onnxruntime")):
+            continue
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        _ocr_runtime_site_cache = path
+        return path
+    return None
+
+
+def reset_ocr_runtime_cache():
+    global _ocr_runtime_site_cache, _ocr_runtime_site_checked
+    _ocr_runtime_site_cache = None
+    _ocr_runtime_site_checked = False
+
+
+def fetch_ocr_runtime_info():
+    """从 version.json 取当前平台的离线 OCR 运行时下载信息。"""
+    validate_update_url(UPDATE_CHECK_URL)
+    request = urllib.request.Request(UPDATE_CHECK_URL,
+                                     headers={"User-Agent": "Toolbox/" + APP_VERSION})
+    opener = urllib.request.build_opener(UpdateRedirectHandler())
+    with opener.open(request, timeout=10) as response:
+        content = response.read(1024 * 1024 + 1)
+    if len(content) > 1024 * 1024:
+        raise ValueError("更新信息超出大小限制。")
+    envelope = json.loads(content.decode("utf-8"))
+    if (not isinstance(envelope, dict) or envelope.get("encoding") != "base64"
+            or not isinstance(envelope.get("content"), str)):
+        raise ValueError("更新服务器返回的文件信息无效。")
+    data = json.loads(base64.b64decode(envelope["content"], validate=True).decode("utf-8"))
+    runtime = data.get("ocr_runtime") if isinstance(data, dict) else None
+    if not isinstance(runtime, dict):
+        raise ValueError("当前版本还没有提供离线识别引擎。")
+    key = "macos" if platform.system() == "Darwin" else "windows"
+    item = runtime.get(key)
+    if not isinstance(item, dict) or not isinstance(item.get("url"), str):
+        raise ValueError("没有找到当前平台的下载地址。")
+    validate_update_url(item["url"])
+    try:
+        size = int(item.get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    return {"url": item["url"], "sha256": str(item.get("sha256") or "").lower(),
+            "size": size, "version": str(runtime.get("version") or data.get("version") or "")}
+
+
+def extract_runtime_zip(archive, target):
+    """把运行时压缩包解到 target；跳过越界路径与 macOS 的资源分支目录。"""
+    with zipfile.ZipFile(archive) as bundle:
+        root = os.path.realpath(target)
+        for info in bundle.infolist():
+            name = info.filename.replace("\\", "/").lstrip("/")
+            if not name or name.startswith("__MACOSX/"):
+                continue
+            destination = os.path.realpath(os.path.join(root, name))
+            if destination != root and not destination.startswith(root + os.sep):
+                continue
+            bundle.extract(info, target)
+
+
+class OcrRuntimeDownloadWorker(QThread):
+    """下载并解压离线 OCR 运行时（在后台线程里做，界面走进度条）。"""
+
+    progress = pyqtSignal(int, int)
+    status = pyqtSignal(str)
+    ready = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, info, parent=None):
+        super().__init__(parent)
+        self.info = info
+        self.cancelled = threading.Event()
+
+    def cancel(self):
+        self.cancelled.set()
+
+    def run(self):
+        staging = None
+        try:
+            root = ocr_runtime_root()
+            os.makedirs(root, exist_ok=True)
+            version = self.info.get("version") or "current"
+            staging = tempfile.mkdtemp(prefix=".download-", dir=root)
+            archive = os.path.join(staging, "runtime.zip")
+            self.status.emit("正在下载离线识别引擎…")
+            self._download(archive)
+            if self.cancelled.is_set():
+                raise InterruptedError
+            expected = (self.info.get("sha256") or "").lower()
+            if expected and file_sha256(archive) != expected:
+                raise ValueError("下载文件校验失败，请重试。")
+            self.status.emit("正在解压离线识别引擎…")
+            unpacked = os.path.join(staging, "unpacked")
+            extract_runtime_zip(archive, unpacked)
+            os.remove(archive)
+            marker = {"version": version,
+                      "python": "%d.%d" % sys.version_info[:2],
+                      "platform": "macos" if platform.system() == "Darwin" else "windows"}
+            with open(os.path.join(unpacked, "runtime.json"), "w", encoding="utf-8") as file:
+                json.dump(marker, file)
+            if self.cancelled.is_set():
+                raise InterruptedError
+            target = os.path.join(root, version)
+            shutil.rmtree(target, ignore_errors=True)
+            os.replace(unpacked, target)
+            # 同目录下的旧版本一并删掉，避免用户目录越占越大
+            for name in os.listdir(root):
+                if name != version and not name.startswith("."):
+                    shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+            self.ready.emit(target)
+        except InterruptedError:
+            pass
+        except Exception as exc:  # 网络/磁盘/压缩包异常统一提示，不影响其他功能
+            if not self.cancelled.is_set():
+                self.failed.emit(str(exc)[:300])
+        finally:
+            if staging:
+                shutil.rmtree(staging, ignore_errors=True)
+
+    def _download(self, path):
+        request = urllib.request.Request(self.info["url"], headers={
+            "User-Agent": "Toolbox/" + APP_VERSION,
+            "Accept": "application/zip, application/octet-stream"})
+        opener = urllib.request.build_opener(UpdateRedirectHandler())
+        with opener.open(request, timeout=20) as response, open(path, "wb") as output:
+            validate_update_url(response.geturl())
+            try:
+                total = int(response.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                total = 0
+            if total <= 0:
+                total = int(self.info.get("size") or 0)
+            limit = 512 * 1024 * 1024
+            received, last_progress = 0, 0.0
+            self.progress.emit(0, total)
+            while True:
+                if self.cancelled.is_set():
+                    raise InterruptedError
+                chunk = response.read(256 * 1024)
+                if not chunk:
+                    break
+                received += len(chunk)
+                if received > limit:
+                    raise ValueError("下载内容超出大小限制。")
+                output.write(chunk)
+                if time.monotonic() - last_progress >= 0.1:
+                    self.progress.emit(received, total)
+                    last_progress = time.monotonic()
+            self.progress.emit(received, total)
+            if total and received < total:
+                raise ValueError("下载不完整，请重试。")
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 256), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def ensure_ocr_runtime(parent=None, force=False):
+    """首次使用本地 OCR 时按需下载运行时；返回是否已就绪。
+
+    用户拒绝或下载失败都只是回退系统 OCR，不影响任何其他功能。
+    """
+    global _ocr_runtime_prompted
+    if rapidocr_available():
+        return True
+    if _ocr_runtime_prompted and not force:
+        return False
+    answer = QMessageBox.question(
+        parent, "下载离线识别引擎",
+        "本地离线文字识别需要先下载运行库（约 100 MB，只需一次）。\n"
+        "下载后断网也能识别，其他功能不受影响。\n\n现在下载吗？",
+        QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+    if answer != QMessageBox.Yes:
+        _ocr_runtime_prompted = True
+        return False
+    info, error = None, ""
+    QApplication.setOverrideCursor(Qt.WaitCursor)
+    try:
+        info = fetch_ocr_runtime_info()
+    except Exception as exc:  # 断网、服务器无该文件等
+        error = str(exc)[:200]
+    finally:
+        QApplication.restoreOverrideCursor()
+    if info is None:
+        QMessageBox.warning(parent, "无法下载离线识别引擎",
+                            "获取下载地址失败：%s\n请稍后重试，本次仍可使用系统 OCR。" % error)
+        return False
+    dialog = QProgressDialog("正在准备下载…", "取消", 0, 100, parent)
+    dialog.setWindowTitle("下载离线识别引擎")
+    dialog.setWindowModality(Qt.WindowModal)
+    dialog.setMinimumDuration(0)
+    dialog.setAutoClose(False)
+    dialog.setAutoReset(False)
+    dialog.setValue(0)
+    worker = OcrRuntimeDownloadWorker(info, parent)
+    state = {"ok": False, "error": ""}
+
+    def on_progress(received, total):
+        if total <= 0:
+            return
+        dialog.setMaximum(total)
+        dialog.setValue(min(received, total))
+        dialog.setLabelText("正在下载离线识别引擎… %.1f / %.1f MB"
+                            % (received / 1048576.0, total / 1048576.0))
+
+    def on_ready(_path):
+        state["ok"] = True
+        dialog.reset()
+        dialog.accept()
+
+    def on_failed(message):
+        state["error"] = message
+        dialog.reset()
+        dialog.accept()
+
+    def on_cancel():
+        state["error"] = "已取消下载。"
+        worker.cancel()
+
+    worker.progress.connect(on_progress)
+    worker.status.connect(dialog.setLabelText)
+    worker.ready.connect(on_ready)
+    worker.failed.connect(on_failed)
+    dialog.canceled.connect(on_cancel)
+    worker.start()
+    try:
+        dialog.exec_()
+    finally:
+        if worker.isRunning():
+            worker.cancel()
+        # 取消后最多再等一次 socket 超时（20 秒），避免线程还在跑就析构
+        worker.wait(20000)
+        dialog.reset()
+    if not state["ok"]:
+        if state["error"] and state["error"] != "已取消下载。":
+            QMessageBox.warning(parent, "离线识别引擎下载失败",
+                                "%s\n\n其他功能不受影响，可稍后重试或继续使用系统 OCR。" % state["error"])
+        return False
+    reset_ocr_runtime_cache()
+    importlib.invalidate_caches()
+    if not rapidocr_available():
+        QMessageBox.warning(parent, "离线识别引擎不可用",
+                            "运行库已下载，但当前环境加载失败，将继续使用系统 OCR。")
+        return False
+    return True
 
 
 def _get_rapidocr_engine():
@@ -3820,8 +4170,9 @@ def warm_rapidocr():
     """后台预热引擎，避免第一次识别多等初始化时间。"""
     try:
         _get_rapidocr_engine()
-    except Exception:
-        pass
+    except Exception as exc:
+        # 预热失败不影响使用（识别时会重新尝试并回退系统 OCR），但写进日志便于排查
+        write_startup_log("本地 OCR 预热失败：%s: %s" % (type(exc).__name__, exc))
 
 
 def rapidocr_layout(image_path, cancelled=None):
@@ -4357,6 +4708,9 @@ class CaptureOverlay(QWidget):
             return
         self._confirm_text_editor()
         self._exit_ocr_mode()
+        if load_ocr_settings().get("local_enabled", True):
+            # 本地引擎按需下载：只在首次识别时确认一次，取消或失败自动回退系统 OCR
+            ensure_ocr_runtime(self)
         self.ocr_status.setText("正在识别所选区域文字… · Esc 取消")
         self.ocr_status.show()
         self._set_ocr_busy(True)
@@ -5293,26 +5647,36 @@ class LongShotSession(QObject):
     def _overlap_offset(self, previous, current):
         """返回 current 中新增内容的起始行；找不到可靠重叠返回 None。
 
+        纯 numpy 实现：先块平均降采样做粗匹配，再在原分辨率逐像素精修。
         依次用底部两段条带做匹配（兼容滚动幅度不同的情况），
         每段都要求两处条带结果一致，避免页面元素重复时拼错或丢行。
         """
-        import cv2
-        previous_gray = cv2.cvtColor(previous, cv2.COLOR_RGB2GRAY)
-        current_gray = cv2.cvtColor(current, cv2.COLOR_RGB2GRAY)
-        if previous_gray.shape[1] != current_gray.shape[1]:
+        if previous.shape[1] != current.shape[1]:
             return None
+        previous_gray = gray_array(previous)
+        current_gray = gray_array(current)
+        factor = max(1, min(8, previous_gray.shape[1] // 320))
+        previous_small = block_mean(previous_gray, factor)
+        current_small = block_mean(current_gray, factor)
+        previous_height = previous_gray.shape[0]
         for first_fraction, second_fraction in ((0.6, 0.82), (0.82, 0.92)):
             offsets = []
             for fraction in (first_fraction, second_fraction):
-                top = max(8, int(previous_gray.shape[0] * fraction))
-                strip = previous_gray[top:]
-                if strip.shape[0] < 10 or strip.shape[0] >= current_gray.shape[0]:
+                top = max(8, int(previous_height * fraction))
+                coarse = best_vertical_offset(previous_small, current_small, top // factor)
+                if coarse is None:
                     break
-                result = cv2.matchTemplate(current_gray, strip, cv2.TM_CCOEFF_NORMED)
-                _, score, _, location = cv2.minMaxLoc(result)
-                if score < 0.7:
+                # 粗匹配误差不超过一个降采样块，精修时把附近几个像素都试一遍
+                strip_height = previous_height - top
+                window = coarse * factor - strip_height
+                best_score, best = -2.0, window
+                for candidate in range(window - factor - 2, window + factor + 3):
+                    score = offset_score(previous_gray, current_gray, top, candidate)
+                    if score > best_score:
+                        best_score, best = score, candidate
+                if best_score < 0.7:
                     break
-                offsets.append(location[1] + strip.shape[0])
+                offsets.append(best + strip_height)
             if len(offsets) == 2 and abs(offsets[0] - offsets[1]) <= 2:
                 return offsets[0]
         return None
@@ -14139,7 +14503,16 @@ class SettingsWindow(QMainWindow):
         self.ocr_local_state = QLabel()
         self.ocr_local_state.setWordWrap(True)
         self.ocr_local_state.setStyleSheet("color: #57606A; font-size: 12px;")
-        layout.addWidget(self.ocr_local_state)
+        state_row = QHBoxLayout()
+        state_row.setSpacing(8)
+        state_row.addWidget(self.ocr_local_state, 1)
+        self.ocr_local_download = QPushButton("下载引擎")
+        self.ocr_local_download.setFixedSize(88, 26)
+        self.ocr_local_download.setCursor(QCursor(Qt.PointingHandCursor))
+        self.ocr_local_download.setStyleSheet(_secondary_btn())
+        self.ocr_local_download.clicked.connect(self._download_ocr_runtime)
+        state_row.addWidget(self.ocr_local_download)
+        layout.addLayout(state_row)
 
         self.ocr_enable = QCheckBox("使用大模型识别图片中的文字（优先于本地引擎）")
         layout.addWidget(self.ocr_enable)
@@ -14204,9 +14577,24 @@ class SettingsWindow(QMainWindow):
             self.ocr_local_state.setText("本地引擎已就绪：RapidOCR %s，CPU 离线识别"
                                          % (("v" + version) if version else ""))
             self.ocr_local_state.setStyleSheet("color: #188038; font-size: 12px;")
+            self.ocr_local_download.setVisible(False)
         else:
-            self.ocr_local_state.setText("本地引擎未安装：在终端执行 pip install rapidocr onnxruntime 后重启工具箱。")
+            self.ocr_local_state.setText("本地引擎尚未安装：首次识别时按需下载运行库（约 100 MB），"
+                                         "下载一次即可离线使用。")
             self.ocr_local_state.setStyleSheet("color: #B26A00; font-size: 12px;")
+            self.ocr_local_download.setVisible(True)
+
+    def _download_ocr_runtime(self):
+        self.ocr_local_download.setEnabled(False)
+        try:
+            ok = ensure_ocr_runtime(self, force=True)
+        finally:
+            self.ocr_local_download.setEnabled(True)
+        self._refresh_local_state()
+        self._refresh_ocr_source(load_ocr_settings())
+        if ok:
+            self.ocr_feedback.setText("离线识别引擎已就绪，现在可以断网识别文字。")
+            self.ocr_feedback.setStyleSheet("color: #188038; font-size: 12px;")
 
     def _refresh_ocr_source(self, settings):
         parts = []
@@ -14218,7 +14606,7 @@ class SettingsWindow(QMainWindow):
         parts.append("系统 OCR")
         text = "当前识别顺序：" + " → ".join(parts)
         if local_on and not rapidocr_available():
-            text += "（本地 RapidOCR 未安装，已跳过）"
+            text += "（本地引擎未下载，已跳过）"
         self.ocr_source_label.setText(text)
 
     def _save_ocr(self):
@@ -16682,8 +17070,10 @@ if __name__ == "__main__":
         if platform.system() == 'Darwin':
             QTimer.singleShot(600, lambda: offer_mac_app_move(window))
         # 后台预热本地 OCR，避免第一次识别时多等引擎初始化
-        if load_ocr_settings().get("local_enabled", True) and rapidocr_available():
-            threading.Thread(target=warm_rapidocr, daemon=True).start()
+        if load_ocr_settings().get("local_enabled", True):
+            write_startup_log("本地 OCR：%s" % (ocr_runtime_site() or "未下载运行时"))
+            if rapidocr_available():
+                threading.Thread(target=warm_rapidocr, daemon=True).start()
         exit_code = app.exec_()
     except Exception:
         detail = traceback.format_exc()

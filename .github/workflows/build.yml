@@ -162,27 +162,38 @@ jobs:
   # 安装包本身不再包含它们（见 toolbox.spec），应用首次识别时才按需下载这份压缩包，
   # 普通用户不用的话完全不占体积。
   runtime:
-    name: OCR runtime (${{ matrix.os }})
+    name: OCR runtime (${{ matrix.os }} py${{ matrix.py }})
     if: startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: windows-latest
+            py: "3.11"
             artifact_name: ocr-runtime-windows
             asset_name: ocr-runtime-windows.zip
+          - os: windows-latest
+            py: "3.12"
+            artifact_name: ocr-runtime-windows-312
+            asset_name: ocr-runtime-windows-312.zip
           - os: macos-latest
+            py: "3.11"
             artifact_name: ocr-runtime-macos
             asset_name: ocr-runtime-macos.zip
+          - os: macos-latest
+            py: "3.12"
+            artifact_name: ocr-runtime-macos-312
+            asset_name: ocr-runtime-macos-312.zip
 
     runs-on: ${{ matrix.os }}
 
     steps:
-      # 必须与应用同一个 Python 小版本（spec 未固定，当前构建机是 3.11）：
-      # 扩展模块与解释器 ABI 绑定，版本不符时应用会拒绝加载。
+      # 扩展模块（.pyd/.so）与解释器 ABI 强绑定，所以每个 Python 版本各发一份：
+      # 3.11 那份给安装包（打包机是 3.11），3.12 那份给源码/pip 运行的用户。
+      # 客户端按 sys.version_info 自动挑「平台_主_次」的条目，没有才退回平台默认。
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.py }}
 
       - name: Install OCR packages
         shell: bash
@@ -265,8 +276,15 @@ jobs:
           tag = os.environ["TAG"]
           base = os.environ["R2_PUBLIC_BASE_URL"].rstrip("/")
           runtime = {"version": tag.lstrip("v")}
-          for key, name in (("windows", "ocr-runtime-windows"),
-                            ("macos", "ocr-runtime-macos")):
+          # 「windows/macos」是给安装包用的默认条目（打包机 3.11），带版本后缀的
+          # 条目给同 Python 版本的源码运行用户，客户端优先匹配后者。
+          entries = (("windows", "ocr-runtime-windows"),
+                     ("windows_3_11", "ocr-runtime-windows"),
+                     ("windows_3_12", "ocr-runtime-windows-312"),
+                     ("macos", "ocr-runtime-macos"),
+                     ("macos_3_11", "ocr-runtime-macos"),
+                     ("macos_3_12", "ocr-runtime-macos-312"))
+          for key, name in entries:
               path = pathlib.Path("artifacts") / name / (name + ".zip")
               if not path.is_file():
                   raise SystemExit(f"missing OCR runtime artifact: {path}")
@@ -355,6 +373,8 @@ jobs:
           upload_asset Toolbox-windows.zip || status=1
           upload_asset ocr-runtime-macos.zip || status=1
           upload_asset ocr-runtime-windows.zip || status=1
+          upload_asset ocr-runtime-macos-312.zip || status=1
+          upload_asset ocr-runtime-windows-312.zip || status=1
           exit $status
 
       # 上传成功后清理旧版本：R2 上只保留当前 TAG 的安装包，releases/ 下其它

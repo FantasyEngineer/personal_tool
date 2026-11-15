@@ -68,6 +68,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QScrollArea, QMessageBox, QLineEdit,
                               QGraphicsDropShadowEffect, QTextEdit, QSplitter,
                               QPlainTextEdit, QComboBox, QCheckBox, QStackedWidget,
+                              QRadioButton, QButtonGroup,
                               QGridLayout, QSpinBox, QTabWidget, QColorDialog,
                               QFileDialog, QInputDialog, QListWidget, QListWidgetItem,
                               QProgressDialog, QSystemTrayIcon, QMenu, QAction,
@@ -3864,10 +3865,16 @@ OCR_RUNTIME_FOLDER = "ocr-runtime"
 _ocr_runtime_site_cache = None
 _ocr_runtime_site_checked = False
 _ocr_runtime_prompted = False
+_ocr_runtime_migrated = False
 
 
-def ocr_runtime_root():
-    """离线 OCR 运行时的本地目录。"""
+def cache_root():
+    """配置与缓存目录：Windows / macOS / Linux 统一为 ~/.personal_toolbox。"""
+    return os.path.join(os.path.expanduser("~"), ".personal_toolbox")
+
+
+def _legacy_ocr_runtime_root():
+    """旧版存放位置（Windows: LOCALAPPDATA，macOS: Application Support），仅用于迁移。"""
     if platform.system() == "Darwin":
         base = os.path.expanduser("~/Library/Application Support")
     elif os.name == "nt":
@@ -3877,9 +3884,82 @@ def ocr_runtime_root():
     return os.path.join(base, "PersonalToolbox", OCR_RUNTIME_FOLDER)
 
 
+def _migrate_legacy_ocr_runtime(root):
+    """把旧位置的运行时整目录搬到 ~/.personal_toolbox/ocr-runtime，省掉重新下载。"""
+    global _ocr_runtime_migrated
+    if _ocr_runtime_migrated:
+        return
+    _ocr_runtime_migrated = True
+    legacy = _legacy_ocr_runtime_root()
+    if os.path.normcase(legacy) == os.path.normcase(root):
+        return
+    try:
+        if not os.path.isdir(legacy):
+            return
+        if os.path.isdir(root) and os.listdir(root):
+            return                            # 新位置已经有内容，不覆盖
+        os.makedirs(os.path.dirname(root), exist_ok=True)
+        if os.path.isdir(root):
+            try:
+                os.rmdir(root)                # 空目录先删掉，避免 rename 目标已存在
+            except OSError:
+                return
+        try:
+            os.replace(legacy, root)          # 同一分区时是秒级的目录改名
+        except OSError:
+            shutil.move(legacy, root)         # 跨分区退化为复制后删除
+        # 旧目录空了就顺手清掉，避免 LOCALAPPDATA 下留下空壳
+        parent = os.path.dirname(legacy)
+        try:
+            if os.path.isdir(parent) and not os.listdir(parent):
+                os.rmdir(parent)
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+def ocr_runtime_root():
+    """离线 OCR 运行时的本地目录，与配置缓存同放 ~/.personal_toolbox。"""
+    root = os.path.join(cache_root(), OCR_RUNTIME_FOLDER)
+    _migrate_legacy_ocr_runtime(root)
+    return root
+
+
+def _ocr_runtime_abi_mismatch(path):
+    """运行时目录里编译扩展的 ABI 标签，与当前解释器不一致的返回列表（一致则空）。
+
+    压缩包在发布端按某个 Python 版本编译，扩展模块（.pyd/.so）与解释器强绑定；
+    runtime.json 里的 python 字段是本地解压时写的，不能用来判断兼容性。
+    """
+    current = "cp%d%d" % sys.version_info[:2]
+    found = set()
+    for base, _dirs, files in os.walk(path):
+        for name in files:
+            if not name.endswith((".pyd", ".so")):
+                continue
+            for tag in re.findall(r"cp3\d\d", name):
+                found.add(tag)
+    return sorted(tag for tag in found if tag != current)
+
+
+_ocr_runtime_broken = None  # (目录, 不匹配的标签) —— 已下载但与当前解释器不符
+
+
+def ocr_runtime_abi_issue():
+    """已下载的运行库与当前解释器 ABI 不符时返回给用户看的说明，否则空串。"""
+    ocr_runtime_site()
+    if not _ocr_runtime_broken:
+        return ""
+    tags = " / ".join(_ocr_runtime_broken[1])
+    return ("已下载的离线引擎与当前 Python %d.%d 不匹配（压缩包里是 %s 构建的），"
+            "无法加载。请在设置里重新下载（发布端已下载版本若仍不匹配，请改用系统 OCR）。"
+            % (sys.version_info[0], sys.version_info[1], tags))
+
+
 def ocr_runtime_site():
     """已下载且完整的运行时目录；命中时挂到 sys.path 前部，返回目录路径。"""
-    global _ocr_runtime_site_cache, _ocr_runtime_site_checked
+    global _ocr_runtime_site_cache, _ocr_runtime_site_checked, _ocr_runtime_broken
     if _ocr_runtime_site_checked:
         return _ocr_runtime_site_cache
     _ocr_runtime_site_checked = True
@@ -3902,6 +3982,11 @@ def ocr_runtime_site():
         if not all(os.path.isdir(os.path.join(path, package))
                    for package in ("rapidocr", "onnxruntime")):
             continue
+        mismatch = _ocr_runtime_abi_mismatch(path)
+        if mismatch:
+            # 标记（本地写的）与实际扩展 ABI 对不上，别挂到 sys.path 上
+            _ocr_runtime_broken = (path, mismatch)
+            continue
         if path not in sys.path:
             sys.path.insert(0, path)
         _ocr_runtime_site_cache = path
@@ -3910,9 +3995,10 @@ def ocr_runtime_site():
 
 
 def reset_ocr_runtime_cache():
-    global _ocr_runtime_site_cache, _ocr_runtime_site_checked
+    global _ocr_runtime_site_cache, _ocr_runtime_site_checked, _ocr_runtime_broken
     _ocr_runtime_site_cache = None
     _ocr_runtime_site_checked = False
+    _ocr_runtime_broken = None
 
 
 def fetch_ocr_runtime_info():
@@ -3933,10 +4019,25 @@ def fetch_ocr_runtime_info():
     runtime = data.get("ocr_runtime") if isinstance(data, dict) else None
     if not isinstance(runtime, dict):
         raise ValueError("当前版本还没有提供离线识别引擎。")
-    key = "macos" if platform.system() == "Darwin" else "windows"
-    item = runtime.get(key)
-    if not isinstance(item, dict) or not isinstance(item.get("url"), str):
+    base_key = "macos" if platform.system() == "Darwin" else "windows"
+    # 发布端按 Python 版本各产一份运行库（扩展模块与解释器 ABI 强绑定），
+    # 先找「平台_主_次」这一份，没有再用平台默认那份。
+    keys = ["%s_%d_%d" % (base_key, sys.version_info[0], sys.version_info[1]), base_key]
+    item = None
+    for key in keys:
+        candidate = runtime.get(key)
+        if isinstance(candidate, dict) and isinstance(candidate.get("url"), str):
+            item = candidate
+            break
+    if item is None:
         raise ValueError("没有找到当前平台的下载地址。")
+    if not getattr(sys, "frozen", False) and keys[0] not in runtime:
+        # 源码/pip 运行时的解释器版本常常不是打包机那一版，默认条目对不上 ABI；
+        # 与其下 100 MB 再报错，不如直接告诉用户装到自己的环境里。
+        raise ValueError(
+            "发布端还没有提供 Python %d.%d 版本的离线运行库。\n"
+            "源码运行可以直接在当前环境执行 pip install rapidocr onnxruntime，"
+            "或在设置里改用系统 OCR。" % (sys.version_info[0], sys.version_info[1]))
     validate_update_url(item["url"])
     try:
         size = int(item.get("size") or 0)
@@ -3995,6 +4096,14 @@ class OcrRuntimeDownloadWorker(QThread):
             unpacked = os.path.join(staging, "unpacked")
             extract_runtime_zip(archive, unpacked)
             os.remove(archive)
+            # 压缩包是按某个 Python 版本编译的，先确认里面的 .pyd/.so 与实际解释器
+            # ABI 一致，别装下去等识别时才报「No module named 'xxx._xxx'」
+            mismatch = _ocr_runtime_abi_mismatch(unpacked)
+            if mismatch:
+                raise ValueError(
+                    "运行库与当前 Python %d.%d 不匹配（压缩包里是 %s 构建的）。\n"
+                    "请改用系统 OCR，或稍后重试——若持续出现，说明发布端还没提供该 Python 版本的运行库。"
+                    % (sys.version_info[0], sys.version_info[1], " / ".join(mismatch)))
             marker = {"version": version,
                       "python": "%d.%d" % sys.version_info[:2],
                       "platform": "macos" if platform.system() == "Darwin" else "windows"}
@@ -4062,9 +4171,9 @@ def file_sha256(path):
 
 
 def ensure_ocr_runtime(parent=None, force=False):
-    """首次使用本地 OCR 时按需下载运行时；返回是否已就绪。
+    """由设置页「下载引擎」按钮调用：下载本地 OCR 运行时并返回是否就绪。
 
-    用户拒绝或下载失败都只是回退系统 OCR，不影响任何其他功能。
+    截图识别过程不会调用这里，缺运行库时只提示用户回设置页下载。
     """
     global _ocr_runtime_prompted
     if rapidocr_available():
@@ -4074,7 +4183,7 @@ def ensure_ocr_runtime(parent=None, force=False):
     answer = QMessageBox.question(
         parent, "下载离线识别引擎",
         "本地离线文字识别需要先下载运行库（约 100 MB，只需一次）。\n"
-        "下载后断网也能识别，其他功能不受影响。\n\n现在下载吗？",
+        "下载后断网也能识别。\n\n现在下载吗？",
         QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
     if answer != QMessageBox.Yes:
         _ocr_runtime_prompted = True
@@ -4089,7 +4198,7 @@ def ensure_ocr_runtime(parent=None, force=False):
         QApplication.restoreOverrideCursor()
     if info is None:
         QMessageBox.warning(parent, "无法下载离线识别引擎",
-                            "获取下载地址失败：%s\n请稍后重试，本次仍可使用系统 OCR。" % error)
+                            "获取下载地址失败：%s\n请稍后重试。" % error)
         return False
     dialog = QProgressDialog("正在准备下载…", "取消", 0, 100, parent)
     dialog.setWindowTitle("下载离线识别引擎")
@@ -4140,13 +4249,13 @@ def ensure_ocr_runtime(parent=None, force=False):
     if not state["ok"]:
         if state["error"] and state["error"] != "已取消下载。":
             QMessageBox.warning(parent, "离线识别引擎下载失败",
-                                "%s\n\n其他功能不受影响，可稍后重试或继续使用系统 OCR。" % state["error"])
+                                "%s\n\n可稍后重试，或在设置里改用系统 OCR。" % state["error"])
         return False
     reset_ocr_runtime_cache()
     importlib.invalidate_caches()
     if not rapidocr_available():
         QMessageBox.warning(parent, "离线识别引擎不可用",
-                            "运行库已下载，但当前环境加载失败，将继续使用系统 OCR。")
+                            ocr_runtime_abi_issue() or "运行库已下载，但当前环境加载失败，请检查后重试。")
         return False
     return True
 
@@ -4168,8 +4277,10 @@ def _get_rapidocr_engine():
 
 def warm_rapidocr():
     """后台预热引擎，避免第一次识别多等初始化时间。"""
+    write_startup_log("warm_rapidocr 线程开始")
     try:
         _get_rapidocr_engine()
+        write_startup_log("本地 OCR 预热完成")
     except Exception as exc:
         # 预热失败不影响使用（识别时会重新尝试并回退系统 OCR），但写进日志便于排查
         write_startup_log("本地 OCR 预热失败：%s: %s" % (type(exc).__name__, exc))
@@ -4246,8 +4357,8 @@ LLM_OCR_PROMPT = """请识别这张图片中的所有可见文字，按阅读顺
 
 
 def ocr_llm_ready(settings):
-    return bool(settings.get("enabled") and settings.get("base_url")
-                and settings.get("api_key") and settings.get("model"))
+    return bool(settings.get("base_url") and settings.get("api_key")
+                and settings.get("model"))
 
 
 def llm_ocr_layout(image, settings, timeout=90):
@@ -4314,27 +4425,52 @@ def llm_ocr_layout(image, settings, timeout=90):
     return {"width": 1000.0, "height": 1000.0, "lines": lines}
 
 
+def ocr_mode_hint(mode, settings=None):
+    """选中的引擎缺少前置条件时的操作指引（返回空串表示可用）。
+
+    识别过程只按设置执行，绝不自动下载运行库、也不自动改配置，缺东西就交给用户回设置里处理。
+    """
+    settings = settings if settings is not None else load_ocr_settings()
+    if mode == "rapidocr" and not rapidocr_available():
+        issue = ocr_runtime_abi_issue()
+        if issue:
+            return issue + "（识别过程不会自动下载）"
+        return ("本地离线引擎尚未下载，无法识别。请打开「设置 → 文字识别」点「下载引擎」下载后再试"
+                "（识别过程不会自动下载）。")
+    if mode == "llm" and not ocr_llm_ready(settings):
+        return ("大模型识别尚未配置完整，无法识别。请打开「设置 → 文字识别」填写接口地址、"
+                "API Key 与模型后保存。")
+    return ""
+
+
 def run_ocr(image, cancelled, register_process):
-    """识别图片文字：大模型 → 本地 RapidOCR → 系统 OCR，任一步失败自动降级。"""
+    """按设置中选定的识别引擎执行，不降级、不下载、不改配置。"""
     settings = load_ocr_settings()
-    if ocr_llm_ready(settings):
+    mode = settings.get("mode") or "system"
+    hint = ocr_mode_hint(mode, settings)
+    if hint:
+        return None, OCR_ENGINE_LABELS.get(mode, mode), hint
+    if mode == "llm":
+        label = "大模型 · " + settings["model"]
         try:
-            return llm_ocr_layout(image, settings), "大模型 · " + settings["model"], ""
-        except Exception:  # 网络异常、鉴权失败、返回格式不符等一律回退
+            return llm_ocr_layout(image, settings), label, ""
+        except Exception as exc:  # 网络、鉴权、返回格式异常都如实报给用户
             if cancelled.is_set():
                 return None, "", ""
-    if settings.get("local_enabled", True) and rapidocr_available():
-        layout, _ = execute_rapidocr_layout(image, cancelled)
+            return None, label, "大模型识别失败：%s" % str(exc)[:200]
+    if mode == "rapidocr":
+        layout, error = execute_rapidocr_layout(image, cancelled)
         if layout is not None:
             return layout, "本地 RapidOCR", ""
         if cancelled.is_set():
             return None, "", ""
+        return None, "本地 RapidOCR", error or "本地 RapidOCR 识别失败，请重试。"
     layout, error = execute_ocr_layout(image, cancelled, register_process)
     return layout, "系统 OCR", error
 
 
 class ScreenshotOcrWorker(QThread):
-    """截图所选区域文字识别：大模型 → 本地 RapidOCR → 系统 OCR，返回带词框的版面结果。"""
+    """截图所选区域文字识别：按设置选定的引擎执行，返回带词框的版面结果。"""
 
     result_ready = pyqtSignal(object, str, str)
 
@@ -4708,9 +4844,14 @@ class CaptureOverlay(QWidget):
             return
         self._confirm_text_editor()
         self._exit_ocr_mode()
-        if load_ocr_settings().get("local_enabled", True):
-            # 本地引擎按需下载：只在首次识别时确认一次，取消或失败自动回退系统 OCR
-            ensure_ocr_runtime(self)
+        settings = load_ocr_settings()
+        hint = ocr_mode_hint(settings.get("mode") or "system", settings)
+        if hint:
+            # 缺运行库 / 缺接口参数一律先提示，不在截图里下载或改配置
+            self.ocr_status.setText(hint)
+            self.ocr_status.show()
+            self._position_toolbar()
+            return
         self.ocr_status.setText("正在识别所选区域文字… · Esc 取消")
         self.ocr_status.show()
         self._set_ocr_busy(True)
@@ -13706,12 +13847,23 @@ def save_shortcuts(bindings):
             os.remove(temporary)
 
 
-DEFAULT_OCR_SETTINGS = {"enabled": False, "base_url": "", "api_key": "", "model": "",
-                        "local_enabled": True}
+OCR_ENGINE_MODES = ("system", "rapidocr", "llm")
+OCR_ENGINE_LABELS = {"system": "系统 OCR", "rapidocr": "本地 RapidOCR", "llm": "大模型"}
+DEFAULT_OCR_SETTINGS = {"mode": "system", "base_url": "", "api_key": "", "model": ""}
+
+
+def _legacy_ocr_mode(data):
+    """旧版只有 enabled（大模型）/ local_enabled（本地）两个开关，换算成一个引擎选择。"""
+    fields = [str(data.get(name) or "").strip() for name in ("base_url", "api_key", "model")]
+    if data.get("enabled") and all(fields):
+        return "llm"
+    if data.get("local_enabled", True) and rapidocr_available():
+        return "rapidocr"
+    return "system"
 
 
 def load_ocr_settings():
-    """读取文字识别配置；缺省时用系统 OCR。"""
+    """读取文字识别配置；识别引擎由用户在设置里显式选择，缺省为系统 OCR。"""
     settings = dict(DEFAULT_OCR_SETTINGS)
     try:
         with open(OCR_SETTINGS_PATH, "r", encoding="utf-8") as f:
@@ -13720,12 +13872,12 @@ def load_ocr_settings():
         return settings
     if not isinstance(data, dict):
         return settings
-    settings["enabled"] = bool(data.get("enabled"))
-    settings["local_enabled"] = bool(data.get("local_enabled", True))
     for key in ("base_url", "api_key", "model"):
         value = data.get(key)
         if isinstance(value, str):
             settings[key] = value.strip()
+    mode = data.get("mode")
+    settings["mode"] = mode if mode in OCR_ENGINE_MODES else _legacy_ocr_mode(data)
     return settings
 
 
@@ -14491,32 +14643,45 @@ class SettingsWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 18, 0, 0)
         layout.setSpacing(10)
-        layout.addWidget(self._group_title("图片文字识别"))
-        hint = QLabel("截图识别文字会依次尝试：大模型（配置并启用时）→ 本地 RapidOCR（离线）→ 系统 OCR，\n"
-                      "任一级失败自动降级。接口需兼容 OpenAI 的 chat/completions 并支持图片输入（如 gpt-4o-mini、qwen-vl-max）。")
+        layout.addWidget(self._group_title("识别引擎"))
+        hint = QLabel("截图识别只使用下面选中的那一个引擎：不自动降级，也不会在识别过程中下载任何东西。\n"
+                      "选中的引擎缺少运行库或接口参数时，识别会直接报错并提示回到这里处理。")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #697386; font-size: 12px;")
         layout.addWidget(hint)
 
-        self.ocr_local_check = QCheckBox("启用本地 RapidOCR（离线识别，无需联网）")
-        layout.addWidget(self.ocr_local_check)
+        self.ocr_mode_group = QButtonGroup(self)
+        self.ocr_system_radio = QRadioButton("本地：系统 OCR（本机自带，免下载；中文识别需系统已装中文语言包）")
+        self.ocr_rapidocr_radio = QRadioButton("本地：RapidOCR 离线引擎（需先下载运行库，约 100 MB）")
+        self.ocr_llm_radio = QRadioButton("大模型识别（需填写接口地址 / API Key / 模型，按调用计费）")
+        for radio in (self.ocr_system_radio, self.ocr_rapidocr_radio, self.ocr_llm_radio):
+            radio.setCursor(QCursor(Qt.PointingHandCursor))
+            self.ocr_mode_group.addButton(radio)
+            radio.toggled.connect(self._refresh_ocr_source)
+        layout.addWidget(self.ocr_system_radio)
+        layout.addWidget(self.ocr_rapidocr_radio)
+
+        local_box = QWidget()
+        local_row = QHBoxLayout(local_box)
+        local_row.setContentsMargins(24, 0, 0, 0)
+        local_row.setSpacing(8)
         self.ocr_local_state = QLabel()
         self.ocr_local_state.setWordWrap(True)
         self.ocr_local_state.setStyleSheet("color: #57606A; font-size: 12px;")
-        state_row = QHBoxLayout()
-        state_row.setSpacing(8)
-        state_row.addWidget(self.ocr_local_state, 1)
+        local_row.addWidget(self.ocr_local_state, 1)
         self.ocr_local_download = QPushButton("下载引擎")
         self.ocr_local_download.setFixedSize(88, 26)
         self.ocr_local_download.setCursor(QCursor(Qt.PointingHandCursor))
         self.ocr_local_download.setStyleSheet(_secondary_btn())
         self.ocr_local_download.clicked.connect(self._download_ocr_runtime)
-        state_row.addWidget(self.ocr_local_download)
-        layout.addLayout(state_row)
+        local_row.addWidget(self.ocr_local_download)
+        layout.addWidget(local_box)
 
-        self.ocr_enable = QCheckBox("使用大模型识别图片中的文字（优先于本地引擎）")
-        layout.addWidget(self.ocr_enable)
-
+        layout.addWidget(self.ocr_llm_radio)
+        llm_box = QWidget()
+        llm_layout = QVBoxLayout(llm_box)
+        llm_layout.setContentsMargins(24, 2, 0, 2)
+        llm_layout.setSpacing(8)
         form = QFormLayout()
         form.setSpacing(10)
         form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -14532,10 +14697,16 @@ class SettingsWindow(QMainWindow):
         self.ocr_model_edit.setPlaceholderText("gpt-4o-mini")
         for edit in (self.ocr_base_edit, self.ocr_key_edit, self.ocr_model_edit):
             edit.setStyleSheet(field_style)
+            edit.textChanged.connect(self._refresh_ocr_source)
         form.addRow("接口地址", self.ocr_base_edit)
         form.addRow("API Key", self.ocr_key_edit)
         form.addRow("模型", self.ocr_model_edit)
-        layout.addLayout(form)
+        llm_layout.addLayout(form)
+        self.ocr_llm_state = QLabel()
+        self.ocr_llm_state.setWordWrap(True)
+        self.ocr_llm_state.setStyleSheet("color: #57606A; font-size: 12px;")
+        llm_layout.addWidget(self.ocr_llm_state)
+        layout.addWidget(llm_box)
 
         layout.addWidget(self._group_title("识别结果"))
         self.ocr_source_label = QLabel("当前使用：系统 OCR")
@@ -14560,29 +14731,55 @@ class SettingsWindow(QMainWindow):
         layout.addStretch()
         self._load_ocr()
 
+    def _selected_ocr_mode(self):
+        if self.ocr_rapidocr_radio.isChecked():
+            return "rapidocr"
+        if self.ocr_llm_radio.isChecked():
+            return "llm"
+        return "system"
+
+    def _current_ocr_settings(self):
+        return {"mode": self._selected_ocr_mode(),
+                "base_url": self.ocr_base_edit.text().strip(),
+                "api_key": self.ocr_key_edit.text().strip(),
+                "model": self.ocr_model_edit.text().strip()}
+
     def _load_ocr(self):
         settings = load_ocr_settings()
-        self.ocr_enable.setChecked(settings["enabled"])
-        self.ocr_local_check.setChecked(settings.get("local_enabled", True))
+        radios = {"system": self.ocr_system_radio,
+                  "rapidocr": self.ocr_rapidocr_radio,
+                  "llm": self.ocr_llm_radio}
+        radio = radios.get(settings["mode"], self.ocr_system_radio)
+        radio.setChecked(True)
         self.ocr_base_edit.setText(settings["base_url"])
         self.ocr_key_edit.setText(settings["api_key"])
         self.ocr_model_edit.setText(settings["model"])
         self._refresh_local_state()
-        self._refresh_ocr_source(settings)
+        self._refresh_ocr_source()
         self.ocr_feedback.clear()
 
     def _refresh_local_state(self):
         if rapidocr_available():
             version = rapidocr_version()
-            self.ocr_local_state.setText("本地引擎已就绪：RapidOCR %s，CPU 离线识别"
-                                         % (("v" + version) if version else ""))
+            self.ocr_local_state.setText("已下载：RapidOCR %s，可离线识别" % (("v" + version) if version else ""))
             self.ocr_local_state.setStyleSheet("color: #188038; font-size: 12px;")
             self.ocr_local_download.setVisible(False)
         else:
-            self.ocr_local_state.setText("本地引擎尚未安装：首次识别时按需下载运行库（约 100 MB），"
-                                         "下载一次即可离线使用。")
+            issue = ocr_runtime_abi_issue()
+            if issue:
+                self.ocr_local_state.setText(issue)
+            else:
+                self.ocr_local_state.setText("未下载：选中本地 RapidOCR 时需先点右侧「下载引擎」（约 100 MB）；"
+                                             "截图识别过程中不会自动下载。")
             self.ocr_local_state.setStyleSheet("color: #B26A00; font-size: 12px;")
             self.ocr_local_download.setVisible(True)
+        ready = ocr_llm_ready(self._current_ocr_settings())
+        if ready:
+            self.ocr_llm_state.setText("接口参数已填写完整，可直接识别。")
+            self.ocr_llm_state.setStyleSheet("color: #188038; font-size: 12px;")
+        else:
+            self.ocr_llm_state.setText("接口地址、API Key、模型需全部填写，否则识别时会提示去补。")
+            self.ocr_llm_state.setStyleSheet("color: #B26A00; font-size: 12px;")
 
     def _download_ocr_runtime(self):
         self.ocr_local_download.setEnabled(False)
@@ -14591,39 +14788,46 @@ class SettingsWindow(QMainWindow):
         finally:
             self.ocr_local_download.setEnabled(True)
         self._refresh_local_state()
-        self._refresh_ocr_source(load_ocr_settings())
         if ok:
-            self.ocr_feedback.setText("离线识别引擎已就绪，现在可以断网识别文字。")
+            self.ocr_rapidocr_radio.setChecked(True)
+            self._refresh_ocr_source()
+            self.ocr_feedback.setText("离线识别引擎已就绪，已为你选中「本地 RapidOCR」，点「保存识别设置」生效。")
             self.ocr_feedback.setStyleSheet("color: #188038; font-size: 12px;")
+        else:
+            self._refresh_ocr_source()
 
-    def _refresh_ocr_source(self, settings):
-        parts = []
-        if ocr_llm_ready(settings):
-            parts.append("大模型 · %s" % settings["model"])
-        local_on = settings.get("local_enabled", True)
-        if local_on and rapidocr_available():
-            parts.append("本地 RapidOCR")
-        parts.append("系统 OCR")
-        text = "当前识别顺序：" + " → ".join(parts)
-        if local_on and not rapidocr_available():
-            text += "（本地引擎未下载，已跳过）"
+    def _refresh_ocr_source(self, *_):
+        self._refresh_local_state()
+        settings = self._current_ocr_settings()
+        mode = settings["mode"]
+        text = "当前选择：" + OCR_ENGINE_LABELS.get(mode, mode)
+        if mode == "rapidocr":
+            if not rapidocr_available():
+                text += " · 运行库未下载，识别时会提示先下载"
+        elif mode == "llm":
+            if not ocr_llm_ready(settings):
+                text += " · 接口参数未填全，识别时会提示去补"
+            else:
+                text += " · 模型 %s" % settings["model"]
+        else:
+            text += " · 免下载、无需配置"
         self.ocr_source_label.setText(text)
 
     def _save_ocr(self):
-        settings = {"enabled": self.ocr_enable.isChecked(),
-                    "base_url": self.ocr_base_edit.text().strip(),
-                    "api_key": self.ocr_key_edit.text().strip(),
-                    "model": self.ocr_model_edit.text().strip(),
-                    "local_enabled": self.ocr_local_check.isChecked()}
+        settings = self._current_ocr_settings()
         try:
             save_ocr_settings(settings)
         except OSError as exc:
             self.ocr_feedback.setText("保存失败：%s" % exc)
             self.ocr_feedback.setStyleSheet("color: #C62828; font-size: 12px;")
             return
-        self._refresh_ocr_source(settings)
-        if settings["enabled"] and not ocr_llm_ready(settings):
-            self.ocr_feedback.setText("已保存。接口地址、API Key、模型需全部填写，否则仍使用系统 OCR。")
+        self._refresh_ocr_source()
+        mode = settings["mode"]
+        if mode == "rapidocr" and not rapidocr_available():
+            self.ocr_feedback.setText("已保存。本地运行库尚未下载，识别时会提示，可点上方「下载引擎」下载。")
+            self.ocr_feedback.setStyleSheet("color: #B26A00; font-size: 12px;")
+        elif mode == "llm" and not ocr_llm_ready(settings):
+            self.ocr_feedback.setText("已保存。接口地址、API Key、模型未填全，识别时会提示回这里补全。")
             self.ocr_feedback.setStyleSheet("color: #B26A00; font-size: 12px;")
         else:
             self.ocr_feedback.setText("已保存，下次识别生效。")
@@ -14660,6 +14864,7 @@ class SettingsWindow(QMainWindow):
                         "picker": "启动 / 关闭屏幕放大镜，快速获取颜色",
                         "capture": "像素取色与本地 OCR，框选后调整与标注，直接复制、保存或贴图",
                         "capture_copy": "框选完成后直接复制，不弹出预览",
+                        "long_capture": "框选区域后自动滚动，逐帧拼接成一张长图",
                         "paste_image": "把剪贴板中的图片固定到桌面",
                         "toggle_pins": "统一隐藏或显示全部桌面贴图"}
         for action, name in SHORTCUT_ACTIONS.items():
@@ -14672,7 +14877,7 @@ class SettingsWindow(QMainWindow):
             text = QVBoxLayout()
             text.setSpacing(4)
             text.addWidget(self._group_title(name))
-            description = QLabel(descriptions[action])
+            description = QLabel(descriptions.get(action, name))
             description.setWordWrap(True)
             description.setStyleSheet("color: #697386; font-size: 11px;")
             text.addWidget(description)
@@ -15552,6 +15757,7 @@ class ToolboxWindow(QMainWindow):
         QApplication.quit()
 
     def closeEvent(self, event):
+        write_startup_log(f"主窗口 closeEvent 触发 force_quit={getattr(self, '_force_quit', False)} tray={bool(self.tray_icon)}")
         # 无论哪种退出路径，都做资源清理
         try:
             self.set_awake(False)
@@ -17058,6 +17264,33 @@ if __name__ == "__main__":
     try:
         app = QApplication(sys.argv)
         app.setWindowIcon(app_icon())
+        # ===== 临时 OCR 测试模式（验证冻结环境下 onnxruntime 能否正常加载推理）=====
+        if "--test-ocr" in sys.argv:
+            import numpy as _np
+            import threading as _th
+            _out = []
+            def _run_ocr():
+                try:
+                    _out.append(f"runtime_site={ocr_runtime_site()}")
+                    from rapidocr import RapidOCR as _RapidOCR
+                    _out.append("import rapidocr ok")
+                    _eng = _RapidOCR(params={"Global.log_level": "warning"})
+                    _out.append("engine created ok")
+                    _img = (_np.random.rand(100, 300, 3) * 255).astype(_np.uint8)
+                    _r = _eng(_img)
+                    _out.append(f"infer ok, txts={len(_r.txts or [])}")
+                except Exception as _e:
+                    import traceback as _tb
+                    _out.append(f"FAIL: {_e}\n{_tb.format_exc()[-2000:]}")
+            # 模拟正式启动时的 warm_rapidocr：在 daemon 线程里加载引擎
+            _t = _th.Thread(target=_run_ocr, daemon=True)
+            _t.start()
+            _t.join(timeout=30)
+            _out.append(f"thread_alive_after_join={_t.is_alive()}")
+            _p = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "ocr_test_result.txt")
+            with open(_p, "w", encoding="utf-8") as _f:
+                _f.write("\n".join(_out))
+            sys.exit(0)
         # 下拉框整框可点（挂在 app 上，覆盖之后新建的所有 QComboBox）
         combo_click_filter = _ComboClickFilter(app)
         app.installEventFilter(combo_click_filter)
@@ -17069,12 +17302,22 @@ if __name__ == "__main__":
         # macOS 若在「下载」里运行，提示迁到「应用程序」，让启动台能索引到
         if platform.system() == 'Darwin':
             QTimer.singleShot(600, lambda: offer_mac_app_move(window))
-        # 后台预热本地 OCR，避免第一次识别时多等引擎初始化
-        if load_ocr_settings().get("local_enabled", True):
-            write_startup_log("本地 OCR：%s" % (ocr_runtime_site() or "未下载运行时"))
+        # 只有用户选了本地 RapidOCR 且运行库就绪时才预热，启动阶段不做用户没选的事
+        ocr_settings = load_ocr_settings()
+        write_startup_log("文字识别引擎：%s"
+                          % OCR_ENGINE_LABELS.get(ocr_settings["mode"], ocr_settings["mode"]))
+        if ocr_settings["mode"] == "rapidocr":
+            site = ocr_runtime_site()
+            if site:
+                write_startup_log("本地 OCR：%s" % site)
+            elif rapidocr_available():
+                write_startup_log("本地 OCR：使用当前环境已装的 RapidOCR")
+            else:
+                write_startup_log("本地 OCR：未下载运行时")
             if rapidocr_available():
                 threading.Thread(target=warm_rapidocr, daemon=True).start()
         exit_code = app.exec_()
+        write_startup_log(f"事件循环结束 exit_code={exit_code}")
     except Exception:
         detail = traceback.format_exc()
         write_startup_log("启动失败：\n" + detail)

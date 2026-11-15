@@ -83,6 +83,47 @@ def _keep_binary(entry):
 
 a.binaries = [entry for entry in a.binaries if _keep_binary(entry)]
 
+# 统一 MSVC 运行时版本，避免按需下载的 onnxruntime（用新 MSVC 编译）加载到
+# Qt 自带的旧版 MSVCP140.dll（14.26）后在 MSVCP140.dll 里访问违例闪退。
+# 做法：把系统里 msvcp140 / vcruntime140 / vcruntime140_1 这一组配套 DLL
+# 放到打包根目录，覆盖 PyQt5\Qt5\bin 下的旧副本；根目录在 DLL 搜索顺序里
+# 优先于 Qt 的 bin 目录，所以全进程都会用这一套一致的新版本。
+if os.name == "nt":
+    _RUNTIME_DLLS = ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+
+    def _find_runtime_dll(name):
+        # 优先用仓库里随附的副本（assets/vcrt），其次系统 System32，最后 Python 目录。
+        # PyInstaller onefile 在某些环境下会拒绝直接收集 System32 里的 DLL，
+        # 所以仓库里放一份兜底，本地和 CI 都能稳定打包。
+        for base in (os.path.join(SPECPATH, "assets", "vcrt"),
+                     os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32"),
+                     os.path.dirname(sys.executable)):
+            candidate = os.path.join(base, name)
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
+    _new_runtime = []
+    for _name in _RUNTIME_DLLS:
+        _src = _find_runtime_dll(_name)
+        if _src:
+            # TOC 条目顺序是 (dest_name, src_name, typecode)，dest 放根目录
+            _new_runtime.append((_name, _src, "BINARY"))
+
+    if _new_runtime:
+        _seen = set()
+        _deduped = []
+        for entry in a.binaries:
+            base = os.path.basename(entry[1]).lower()
+            if base in _RUNTIME_DLLS:
+                continue  # 丢掉 Qt 等自带的旧副本
+            if base in _seen:
+                continue
+            _seen.add(base)
+            _deduped.append(entry)
+        _deduped.extend(_new_runtime)
+        a.binaries = _deduped
+
 EXE_OPTS = dict(
     name=APP_NAME,
     debug=False,

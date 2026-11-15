@@ -416,13 +416,23 @@ def tool_win_geometry():
     return x, y, w, h
 
 
-def app_icon():
-    """Window/taskbar icon from assets/, resolved for both dev runs and PyInstaller bundles."""
+def app_asset_path(name):
+    """从源码目录或 PyInstaller 资源目录解析图标资源。"""
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    for name in ("icon.ico", "icon.icns", "icon.png"):
-        path = os.path.join(base, "assets", name)
+    return os.path.join(base, "assets", name)
+
+
+def app_icon():
+    """读取应用主图标。"""
+    names = ("icon.icns", "icon.png", "icon.ico") if platform.system() == "Darwin" else (
+        "icon.ico", "icon.png", "icon.icns"
+    )
+    for name in names:
+        path = app_asset_path(name)
         if os.path.exists(path):
-            return QIcon(path)
+            icon = QIcon(path)
+            if not icon.isNull():
+                return icon
     return QIcon()
 
 
@@ -3438,7 +3448,14 @@ def capture_desktop():
         if hasattr(cg, "CGPreflightScreenCaptureAccess"):
             cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
             if not cg.CGPreflightScreenCaptureAccess():
-                raise ValueError("请在系统设置 → 隐私与安全性 → 屏幕录制中授权工具箱，然后重新启动")
+                # ad-hoc 签名每次发版 cdhash 都会变，旧授权记录可能对新包失效
+                # （系统设置里开关看着是开的，实际仍被拒）。主动请求一次可把授权
+                # 落到当前这个包上，并弹出系统原生授权框。
+                if hasattr(cg, "CGRequestScreenCaptureAccess"):
+                    cg.CGRequestScreenCaptureAccess.restype = ctypes.c_bool
+                    cg.CGRequestScreenCaptureAccess()
+                raise ValueError("请在系统设置 → 隐私与安全性 → 屏幕录制中授权工具箱后重启应用；"
+                                 "若开关已开启仍提示，请先关闭再开启（或移除后重新添加）再重启")
     screens = QApplication.screens()
     geometry = QRect()
     for screen in screens:
@@ -15092,23 +15109,17 @@ class ToolboxWindow(QMainWindow):
             self._rain_saved_awake = None
 
     def _tray_icon(self):
-        """托盘图标：Mac 菜单栏用单色模板图（黑色+透明，自动适配深浅色栏）。"""
-        base = app_icon()
+        """托盘图标：Mac 菜单栏使用透明底单色模板图。"""
         if platform.system() != "Darwin":
-            return base
-        src = base.pixmap(44, 44)
-        if src.isNull():
-            return base
-        # 保留 alpha 形状、RGB 全设为黑，作为 macOS 模板图（SourceIn 一次性合成）
-        img = QImage(src.size(), QImage.Format_ARGB32_Premultiplied)
-        img.fill(QColor(0, 0, 0, 0))
-        painter = QPainter(img)
-        painter.drawPixmap(0, 0, src)
-        painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
-        painter.fillRect(img.rect(), QColor(0, 0, 0, 255))
-        painter.end()
-        pm = QPixmap.fromImage(img)
-        pm.setDevicePixelRatio(2.0)  # 约 22pt 逻辑尺寸
+            return app_icon()
+        path = app_asset_path("tray_template.png")
+        if not os.path.exists(path):
+            return app_icon()
+        pm = QPixmap(path)
+        if pm.isNull():
+            return app_icon()
+        pm = pm.scaled(44, 44, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        pm.setDevicePixelRatio(2.0)
         icon = QIcon(pm)
         icon.setIsMask(True)  # 通知 Qt 作为模板渲染
         return icon

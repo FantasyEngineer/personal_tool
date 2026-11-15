@@ -14,9 +14,11 @@ pip install --upgrade pip
 pip install -r requirements.txt
 pip install pyinstaller
 
-# Generate icons if a master PNG exists but the outputs are missing.
-if [ -f assets/icon.png ]; then
-  [ -f assets/icon.ico ] || python assets/generate_icons.py
+# 缺少平台图标或托盘图时，重新生成全部图标资源。
+if [ -f assets/icon.png ] && {
+  [ ! -f assets/icon.ico ] || [ ! -f assets/icon.icns ] || [ ! -f assets/tray_template.png ]
+}; then
+  python assets/generate_icons.py
 fi
 
 pyinstaller --noconfirm toolbox.spec

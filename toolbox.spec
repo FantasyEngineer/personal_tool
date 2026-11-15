@@ -27,7 +27,7 @@ elif os.name == "nt" and os.path.exists(ICON_WIN):
 
 # Ship the icon files so the running app can load them for the window/taskbar.
 ICON_ASSETS = [(os.path.join("assets", f), "assets")
-               for f in ("icon.ico", "icon.icns", "icon.png")
+               for f in ("icon.ico", "icon.icns", "icon.png", "tray_template.png")
                if os.path.exists(os.path.join("assets", f))]
 
 # 本地 OCR（RapidOCR + onnxruntime）按需收集：未安装时构建仍可成功，程序会自动跳过本地引擎。

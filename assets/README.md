@@ -1,26 +1,19 @@
-# Icons
+# 图标资源
 
-The PyInstaller spec (`toolbox.spec`) looks for these icon files and embeds them
-if present; builds still succeed without them (a default Python icon is used).
+`toolbox.spec` 会把应用图标和菜单栏模板图打入应用包。
 
-- `icon.icns` — macOS bundle icon
-- `icon.ico`  — Windows exe icon
+- `icon.png`：1024 × 1024 的黑白极简应用图标
+- `icon.icns`：macOS 应用包图标
+- `icon.ico`：Windows 应用图标
+- `tray_template.png`：macOS 菜单栏透明底单色模板图
 
-## How to create them
+## 重新生成
 
-1. Drop a **square master image** here as `icon.png` (recommended **1024×1024**, RGBA,
-   transparent background).
-2. Run the generator:
+运行生成脚本会绘制主图标与菜单栏图标，并输出平台格式：
 
-   ```bash
-   pip install pillow
-   python assets/generate_icons.py
-   ```
+```bash
+pip install pillow
+python assets/generate_icons.py
+```
 
-   This writes `icon.ico` (all platforms) and, on macOS, `icon.icns`.
-3. Commit both files so the GitHub Actions build doesn't need to regenerate them.
-
-## Placeholder for now
-
-If you have no artwork yet, you can point at any square PNG and skip the icons —
-the app still builds and runs; it just shows the default icon.
+macOS 上会同时生成 `icon.icns`；其他平台会跳过该格式。托盘图使用独立透明模板，避免将应用图标背景误渲染成菜单栏方块。

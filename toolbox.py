@@ -85,7 +85,7 @@ from PyQt5.QtGui import (QFont, QCursor, QTextCursor, QColor, QPen, QPixmap, QPa
                          QPainterPath, QPolygonF, QFontMetrics)
 
 
-APP_VERSION = "1.0.19"
+APP_VERSION = "1.0.31"
 UPDATE_CHECK_URL = "https://gitee.com/api/v5/repos/jimmy_hou/personal_tool/contents/version.json?ref=main"
 
 

@@ -3466,6 +3466,50 @@ def crop_desktop(desktop, rectangle):
     return image
 
 
+LONG_SHOT_MAX_HEIGHT = 20000
+
+
+def scroll_screen_at(point, notches):
+    """在屏幕指定位置模拟鼠标滚轮（notches 为格数，正数向下滚动）。"""
+    if notches == 0:
+        return
+    system = platform.system()
+    try:
+        if system == "Windows":
+            user32 = ctypes.windll.user32
+            user32.SetCursorPos(int(point.x()), int(point.y()))
+            user32.mouse_event(0x0800, 0, 0, -120 * int(notches), 0)
+        elif system == "Darwin":
+            from ctypes.util import find_library
+            cg = ctypes.cdll.LoadLibrary(find_library("CoreGraphics"))
+
+            class CGPoint(ctypes.Structure):
+                _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+            cg.CGWarpMouseCursorPosition.argtypes = [CGPoint]
+            cg.CGWarpMouseCursorPosition(CGPoint(float(point.x()), float(point.y())))
+            cg.CGEventCreateScrollWheelEvent.restype = ctypes.c_void_p
+            cg.CGEventCreateScrollWheelEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                                         ctypes.c_uint32, ctypes.c_int32]
+            event = cg.CGEventCreateScrollWheelEvent(None, 1, 1, -3 * int(notches))
+            if event:
+                cg.CGEventPost(0, ctypes.c_void_p(event))
+                cg.CFRelease(ctypes.c_void_p(event))
+    except (OSError, AttributeError, ValueError):
+        pass
+
+
+def qimage_rgb_array(image):
+    """QImage 转 RGB numpy 数组（长截图拼接用，numpy 按需导入避免拖慢启动）。"""
+    import numpy as np
+    converted = image.convertToFormat(QImage.Format_RGB888)
+    width, height, stride = converted.width(), converted.height(), converted.bytesPerLine()
+    buffer = converted.bits()
+    buffer.setsize(converted.byteCount())
+    array = np.frombuffer(buffer, np.uint8).reshape(height, stride)[:, :width * 3]
+    return array.reshape(height, width, 3).copy()
+
+
 def save_screenshot(parent, image):
     name = "截图_%s.png" % datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     path, _ = QFileDialog.getSaveFileName(parent, "保存截图", name, "PNG 图片 (*.png)")
@@ -4927,6 +4971,472 @@ class PinnedImageWindow(QWidget):
     def closeEvent(self, event):
         self.closed.emit(self)
         super().closeEvent(event)
+
+
+class LongShotOverlay(QWidget):
+    """长截图选区：拖拽框出区域，之后手动滚动逐帧抓拍。"""
+
+    selected = pyqtSignal(QRect)   # 屏幕逻辑坐标
+    cancelled = pyqtSignal()
+
+    def __init__(self, desktop, geometry):
+        super().__init__(None, Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setGeometry(geometry)
+        self.setCursor(Qt.CrossCursor)
+        self.setMouseTracking(True)
+        self.desktop = desktop
+        self._origin_offset = geometry.topLeft()
+        self._origin = None
+        self._rect = QRect()
+        self._accepted = False
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.drawPixmap(0, 0, self.desktop)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 150))
+        if not self._rect.isEmpty():
+            painter.save()
+            painter.setClipRect(self._rect)
+            painter.drawPixmap(0, 0, self.desktop)
+            painter.restore()
+            painter.setPen(QPen(QColor("#1A73E8"), 2))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(self._rect.adjusted(1, 1, -1, -1))
+            # 四角白色把手，让选中范围一眼可辨
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#FFFFFF"))
+            for corner in (self._rect.topLeft(), self._rect.topRight(),
+                           self._rect.bottomLeft(), self._rect.bottomRight()):
+                painter.drawRect(QRect(corner.x() - 4, corner.y() - 4, 8, 8))
+            painter.setFont(ui_font(9, 12))
+            tag_top = self._rect.top() - 22 if self._rect.top() >= 24 else self._rect.top() + 4
+            tag = QRect(self._rect.left(), tag_top,
+                        min(120, self._rect.width()), 20)
+            painter.setBrush(QColor(255, 255, 255, 230))
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(tag, 3, 3)
+            painter.setPen(QColor("#1A73E8"))
+            painter.drawText(tag.adjusted(5, 0, -5, 0), Qt.AlignLeft | Qt.AlignVCenter,
+                             "%d × %d" % (self._rect.width(), self._rect.height()))
+        painter.setFont(ui_font(10, 13))
+        metrics = painter.fontMetrics()
+        hint = "拖拽框选长截图区域 · 松开后自动滚动拼接 · Esc 取消"
+        width = metrics.horizontalAdvance(hint) + 32
+        bar = QRect((self.width() - width) // 2, 22, width, 40)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(32, 43, 61, 225))
+        painter.drawRoundedRect(bar, 8, 8)
+        painter.setPen(QColor("#FFFFFF"))
+        painter.drawText(bar.adjusted(16, 0, -16, 0), Qt.AlignLeft | Qt.AlignVCenter, hint)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            self.close()
+            return
+        if event.button() != Qt.LeftButton:
+            return
+        self._origin = event.pos()
+        self._rect = QRect(self._origin, self._origin)
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        if self._origin is None:
+            return
+        self._rect = QRect(self._origin, event.pos()).normalized()
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.LeftButton or self._origin is None:
+            return
+        self._origin = None
+        rect = self._rect.normalized().intersected(self.rect())
+        if rect.width() < 30 or rect.height() < 30:
+            self._rect = QRect()
+            self.update()
+            return
+        self._accepted = True
+        # 先隐藏遮罩层再发信号：否则首帧会把变暗的遮罩和选区框一起拍进去
+        self.hide()
+        self.selected.emit(rect.translated(self._origin_offset))
+        self.close()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        if not self._accepted:
+            self.cancelled.emit()
+        super().closeEvent(event)
+
+
+class LongShotSession(QObject):
+    """长截图：自动滚动逐帧抓拍，也可暂停后自己滚动、按空格抓拍。"""
+
+    progress = pyqtSignal(int, int)      # 已拼接高度（设备像素）、帧数
+    notice = pyqtSignal(str)             # 操作提示
+    mode_changed = pyqtSignal(bool)      # True=自动滚动中
+    finished = pyqtSignal(object, str)   # QImage、结果说明
+
+    def __init__(self, rect, parent=None):
+        super().__init__(parent)
+        self.rect = rect                 # 屏幕逻辑坐标
+        self.mask = None                 # 抓屏时临时隐藏的提示条
+        self.auto = True
+        self._rows = []
+        self._last_frame = None
+        self._dpr = 1.0
+        self._done = False
+        self._frames = 0
+        self._busy = False
+        self._notches = 1
+        self._pixels_per_notch = 160.0
+        self._calibrated = False
+        self._still = 0
+        self._cursor = QCursor.pos()
+
+    # ---------- 对外接口 ----------
+    def start(self):
+        """抓首帧，随后按 auto 状态自动滚动或等待手动抓拍。"""
+        if self._last_frame is not None or self._busy or self._done:
+            return
+        self._request_grab(first=True)
+
+    def capture(self):
+        """手动抓一帧（会自动暂停自动滚动）。"""
+        if self._busy or self._done or self._last_frame is None:
+            return
+        self.set_auto(False)
+        self._request_grab(first=False)
+
+    def set_auto(self, enabled):
+        if self._done or self.auto == enabled:
+            return
+        self.auto = enabled
+        self.mode_changed.emit(enabled)
+        if enabled:
+            QTimer.singleShot(200, self._auto_step)
+
+    def finish(self):
+        """结束拼接并输出结果。"""
+        if self._last_frame is None:
+            self._finish("还没有抓拍到画面", ok=False)
+            return
+        self._finish("共 %d 帧" % self._frames)
+
+    def cancel(self):
+        if not self._done:
+            self._done = True
+            QCursor.setPos(self._cursor)
+            self.finished.emit(None, "已取消长截图")
+
+    # ---------- 自动滚动 ----------
+    def _auto_step(self):
+        if self._done or not self.auto or self._busy:
+            return
+        if self._total_height() >= LONG_SHOT_MAX_HEIGHT:
+            self._finish("已达到最大长度 %d 像素" % LONG_SHOT_MAX_HEIGHT)
+            return
+        if not self._rows:
+            return
+        frame_height = self._rows[0].shape[0]
+        if self._calibrated:
+            target = max(60, int(frame_height * 0.45))
+            notches = max(1, int(round(target / self._pixels_per_notch)))
+            # 单次滚动不超过选区高度的 70%，保证两帧之间总有重叠
+            limit = max(1, int(frame_height * 0.7 / self._pixels_per_notch))
+            notches = min(notches, limit, 12)
+        else:
+            # 第一格先只滚一格，实测出「一格滚多少像素」后再按比例加速
+            notches = 1
+        self._notches = notches
+        scroll_screen_at(self.rect.center(), notches)
+        QTimer.singleShot(320, lambda: self._request_grab(first=False))
+
+    # ---------- 抓屏与拼接 ----------
+    def _request_grab(self, first):
+        if self._done or self._busy:
+            return
+        self._busy = True
+        if self.mask is not None:
+            self.mask.hide()
+        QTimer.singleShot(160, lambda: self._do_grab(first))
+
+    def _do_grab(self, first):
+        self._busy = False
+        if self._done:
+            return
+        appended = self._take(first)
+        if self._done:
+            return
+        self._show_mask()
+        if self.auto:
+            QTimer.singleShot(150 if appended else 350, self._auto_step)
+
+    def _show_mask(self):
+        if self.mask is None:
+            return
+        self.mask.show()
+        self.mask.raise_()
+        self.mask.activateWindow()
+        self.mask.setFocus()
+        QTimer.singleShot(40, self.mask._refocus)
+
+    def _take(self, first):
+        image = self._grab()
+        if image is None:
+            self._finish("无法读取屏幕，请检查系统的屏幕录制权限", ok=False)
+            return False
+        current = qimage_rgb_array(image)
+        if first:
+            self._rows = [current]
+            self._last_frame = current
+            self._frames = 1
+            self.progress.emit(current.shape[0], self._frames)
+            return True
+        import numpy as np
+        if np.array_equal(current, self._last_frame):
+            if self.auto:
+                self._still += 1
+                # 连续两次画面不动就认为到底了，自动完成
+                if self._still >= 2:
+                    self._finish("共 %d 帧（已到底部）" % self._frames)
+                return False
+            self.notice.emit("画面没有变化：请先滚动页面再按空格")
+            return False
+        start = self._overlap_offset(self._last_frame, current)
+        if start is None:
+            if self.auto:
+                self.set_auto(False)
+                self.notice.emit("自动滚动没找到重叠部分，已暂停 · 手动滚动后按空格继续")
+            else:
+                self.notice.emit("找不到重叠部分：滚动幅度请控制在选区高度的 80% 以内再按空格")
+            return False
+        tail = current[start:]
+        remaining = LONG_SHOT_MAX_HEIGHT - self._total_height()
+        if tail.shape[0] > remaining:
+            tail = tail[:max(0, remaining)]
+        if tail.shape[0] == 0:
+            if self._total_height() >= LONG_SHOT_MAX_HEIGHT:
+                self._finish("已达到最大长度 %d 像素" % LONG_SHOT_MAX_HEIGHT)
+            elif self.auto:
+                self.set_auto(False)
+                self.notice.emit("画面没有新增内容，已暂停自动滚动 · 继续滚动后按空格抓拍")
+            else:
+                self.notice.emit("画面没有新增内容：请继续滚动后再按空格")
+            return False
+        self._rows.append(tail)
+        self._last_frame = current
+        self._frames += 1
+        self._still = 0
+        if start > 0:
+            self._pixels_per_notch = max(20.0, float(start) / max(1, self._notches))
+            self._calibrated = True
+        self.progress.emit(self._total_height(), self._frames)
+        return True
+
+    def _grab(self):
+        try:
+            desktop, geometry = capture_desktop()
+        except (OSError, ValueError):
+            return None
+        self._dpr = desktop.devicePixelRatio() or 1.0
+        rectangle = QRect(self.rect.topLeft() - geometry.topLeft(), self.rect.size())
+        cropped = crop_desktop(desktop, rectangle)
+        return None if cropped.isNull() else cropped.toImage()
+
+    def _overlap_offset(self, previous, current):
+        """返回 current 中新增内容的起始行；找不到可靠重叠返回 None。
+
+        依次用底部两段条带做匹配（兼容滚动幅度不同的情况），
+        每段都要求两处条带结果一致，避免页面元素重复时拼错或丢行。
+        """
+        import cv2
+        previous_gray = cv2.cvtColor(previous, cv2.COLOR_RGB2GRAY)
+        current_gray = cv2.cvtColor(current, cv2.COLOR_RGB2GRAY)
+        if previous_gray.shape[1] != current_gray.shape[1]:
+            return None
+        for first_fraction, second_fraction in ((0.6, 0.82), (0.82, 0.92)):
+            offsets = []
+            for fraction in (first_fraction, second_fraction):
+                top = max(8, int(previous_gray.shape[0] * fraction))
+                strip = previous_gray[top:]
+                if strip.shape[0] < 10 or strip.shape[0] >= current_gray.shape[0]:
+                    break
+                result = cv2.matchTemplate(current_gray, strip, cv2.TM_CCOEFF_NORMED)
+                _, score, _, location = cv2.minMaxLoc(result)
+                if score < 0.7:
+                    break
+                offsets.append(location[1] + strip.shape[0])
+            if len(offsets) == 2 and abs(offsets[0] - offsets[1]) <= 2:
+                return offsets[0]
+        return None
+
+    def _total_height(self):
+        return sum(row.shape[0] for row in self._rows)
+
+    def _finish(self, message, ok=True):
+        if self._done:
+            return
+        self._done = True
+        QCursor.setPos(self._cursor)
+        if not ok or not self._rows:
+            self.finished.emit(None, message)
+            return
+        import numpy as np
+        merged = np.vstack(self._rows)
+        height, width = merged.shape[0], merged.shape[1]
+        image = QImage(merged.tobytes(), width, height, width * 3, QImage.Format_RGB888).copy()
+        image.setDevicePixelRatio(self._dpr)
+        self.finished.emit(image, message)
+
+
+class LongShotStatus(QWidget):
+    """长截图进行中的悬浮状态条（自动滚动 / 手动抓拍）。"""
+
+    capture_requested = pyqtSignal()
+    finish_requested = pyqtSignal()
+    cancel_requested = pyqtSignal()
+    auto_toggled = pyqtSignal(bool)
+
+    def __init__(self):
+        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, False)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setStyleSheet("QWidget { background: #202B3D; border-radius: 10px; }"
+                           "QLabel { color: #FFFFFF; background: transparent; }"
+                           "QPushButton { color: #FFFFFF; background: #38465C; border: none;"
+                           " border-radius: 6px; padding: 5px 14px; }"
+                           "QPushButton:hover { background: #46566F; }")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 10, 12, 10)
+        layout.setSpacing(10)
+        self.label = QLabel("正在自动滚动，逐帧拼接长图")
+        self.label.setFont(ui_font(10, 13))
+        layout.addWidget(self.label)
+        self._height = 0
+        self._frames = 0
+        self._auto = True
+        self.auto_btn = QPushButton("暂停自动 · 空格")
+        self.auto_btn.setCursor(Qt.PointingHandCursor)
+        self.auto_btn.clicked.connect(lambda: self.auto_toggled.emit(not self._auto))
+        layout.addWidget(self.auto_btn)
+        for text, signal in (("完成 · 回车", self.finish_requested),
+                             ("取消 · Esc", self.cancel_requested)):
+            button = QPushButton(text)
+            button.setCursor(Qt.PointingHandCursor)
+            button.clicked.connect(signal.emit)
+            layout.addWidget(button)
+        self.adjustSize()
+        self._place()
+
+    def _place(self):
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.move(screen.center().x() - self.width() // 2, screen.top() + 90)
+
+    def _text(self):
+        if self._auto:
+            return "正在自动滚动 · 已拼 %d 像素 · %d 帧" % (self._height, self._frames)
+        return "已暂停 · 已拼 %d 像素 · %d 帧 · 自己滚动后按空格抓拍" % (self._height, self._frames)
+
+    def set_progress(self, height, frames):
+        self._height, self._frames = height, frames
+        self.label.setText(self._text())
+        self.adjustSize()
+        self._place()
+
+    def set_auto(self, enabled):
+        self._auto = enabled
+        self.auto_btn.setText("暂停自动 · 空格" if enabled else "继续自动")
+        self.label.setText(self._text())
+        self.adjustSize()
+        self._place()
+        self._refocus()
+
+    def set_notice(self, text):
+        self.label.setText(text)
+        self.adjustSize()
+        self._place()
+        self._refocus()
+
+    def _refocus(self):
+        self.raise_()
+        self.activateWindow()
+        self.setFocus()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Space:
+            self.capture_requested.emit()
+        elif event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self.finish_requested.emit()
+        elif event.key() == Qt.Key_Escape:
+            self.cancel_requested.emit()
+        else:
+            super().keyPressEvent(event)
+
+
+class LongShotPreview(QDialog):
+    """长截图结果预览：可滚动查看、复制或保存。"""
+
+    def __init__(self, image, message="", parent=None):
+        super().__init__(parent)
+        self.image = image
+        self.setWindowTitle("长截图预览")
+        self.resize(880, 640)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(10)
+        dpr = image.devicePixelRatio() or 1.0
+        info = QLabel("尺寸：%d × %d%s" % (round(image.width() / dpr), round(image.height() / dpr),
+                                        ("  ·  " + message) if message else ""))
+        info.setStyleSheet("color: #53657E;")
+        layout.addWidget(info)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: 1px solid #E4EAF2; border-radius: 8px; background: #F5F7FB; }")
+        label = QLabel()
+        label.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+        pixmap = QPixmap.fromImage(image)
+        viewport_width = 820
+        if pixmap.width() > viewport_width:
+            pixmap = pixmap.scaledToWidth(viewport_width, Qt.SmoothTransformation)
+        label.setPixmap(pixmap)
+        scroll.setWidget(label)
+        layout.addWidget(scroll, 1)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        copy_btn = QPushButton("复制到剪贴板 · Ctrl+C")
+        copy_btn.clicked.connect(self._copy)
+        save_btn = QPushButton("保存 PNG · Ctrl+S")
+        save_btn.clicked.connect(self._save)
+        close_btn = QPushButton("关闭 · Esc")
+        close_btn.clicked.connect(self.close)
+        for button in (copy_btn, save_btn, close_btn):
+            button.setCursor(Qt.PointingHandCursor)
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+
+    def _copy(self):
+        QApplication.clipboard().setImage(self.image)
+        self.setWindowTitle("长截图预览 · 已复制")
+
+    def _save(self):
+        if save_screenshot(self, self.image):
+            self.setWindowTitle("长截图预览 · 已保存")
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+        elif event.key() == Qt.Key_C and event.modifiers() & Qt.ControlModifier:
+            self._copy()
+        elif event.key() == Qt.Key_S and event.modifiers() & Qt.ControlModifier:
+            self._save()
+        else:
+            super().keyPressEvent(event)
 
 
 class ScreenshotTool(QObject):
@@ -12138,6 +12648,7 @@ TOOL_TIPS = {
     "颜色": "功能：颜色选择器 · HEX / RGB / HSL 互转",
     "取色器": "功能：屏幕取色 · 全屏放大镜 · C 复制并退出 · X 切换 HEX/RGB · 左键/ESC 退出",
     "截图贴图": "功能：区域截屏 · 识别文字 · 识别后框内拖选即复制 · 像素放大镜 · HEX / RGB 取色 · 复制颜色 · 调整选区 · 矩形 / 箭头 / 画笔 / 文字标注 · 截图自动复制 · 剪贴板贴图 · 桌面置顶 · 缩放 / 透明度 · 隐藏显示全部贴图",
+    "长截图": "功能：框选区域后自动滚动逐帧抓拍并拼成长图 · 可暂停自动滚动自己滚，空格抓拍 · 回车完成 · Esc 取消 · 结果可复制或保存 PNG",
     "文本工具": "页签：处理与统计（排序 · 去重 · uniq -c · 命名风格 · 合并拆分 · SQL IN · 选区实时统计 · 编码字节 · 不可见字符）/ 文本对比（行内高亮 · 忽略空白/大小写 · 差异跳转 · unified diff）",
     "Cron 表达式": "页签：执行计划 / 书写规范",
     "哈希计算": "页签：文本哈希 / 文件哈希（MD5 / SHA1 / SHA256 / SHA512）",
@@ -12197,6 +12708,9 @@ PINYIN_MAP = {
     "jietutietu": ["截图贴图"],
     "quwenzi": ["截图贴图"],
     "zhuawen": ["截图贴图"],
+    "changjietu": ["长截图"],
+    "gundongjietu": ["长截图"],
+    "scrollshot": ["长截图"],
     "shijianchuo": ["日期时间"],
     "timestamp": ["日期时间"],
     "unix": ["日期时间"],
@@ -12687,14 +13201,14 @@ _CARBON_HANDLER = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_void_p, ctypes.c_voi
 
 
 SHORTCUT_ACTIONS = {"rain": "文字雨", "picker": "取色器", "capture": "截屏",
-                    "capture_copy": "截屏并自动复制",
+                    "capture_copy": "截屏并自动复制", "long_capture": "长截图",
                     "paste_image": "贴图", "toggle_pins": "隐藏 / 显示所有贴图"}
 
 
 def default_shortcuts():
     modifier = "Meta+Alt+" if platform.system() == "Darwin" else "Ctrl+Alt+"
     return {"rain": modifier + "O", "picker": modifier + "C", "capture": modifier + "S",
-            "capture_copy": modifier + "Shift+S",
+            "capture_copy": modifier + "Shift+S", "long_capture": modifier + "L",
             "paste_image": modifier + "V", "toggle_pins": modifier + "H"}
 
 
@@ -13971,6 +14485,11 @@ class ToolboxWindow(QMainWindow):
         self.divmod_window = None
         self.color_window = None
         self.screenshot_tool = None
+        self._long_overlay = None
+        self._long_session = None
+        self._long_status = None
+        self._long_preview = None
+        self._long_restore = False
         self._screen_pick_overlay = None
         self._screen_pick_prev_pid = None
         self._screen_pick_silent_exit = False
@@ -14111,12 +14630,13 @@ class ToolboxWindow(QMainWindow):
         self._tool_callbacks = {}
 
         self.create_section("系统与桌面", [
-            "网络诊断", "进程管理", "配置", "截图贴图", "取色器", "图片处理", "防黑屏", "文字雨"
+            "网络诊断", "进程管理", "配置", "截图贴图", "长截图", "取色器", "图片处理", "防黑屏", "文字雨"
         ], {
             "网络诊断": self.show_network,
             "进程管理": self.show_process_search,
             "配置": self.show_config,
             "截图贴图": self.show_screenshots,
+            "长截图": self.show_long_shot,
             "取色器": self.show_screen_pick,
             "图片处理": self.show_image_tool
         }, {
@@ -14311,6 +14831,8 @@ class ToolboxWindow(QMainWindow):
                 self._screen_pick_overlay.close()
             else:
                 self._record_usage_and_call(self.show_screen_pick)
+        elif action == "long_capture":
+            self.show_long_shot()
         elif action in ("capture", "capture_copy", "paste_image", "toggle_pins"):
             self._add_to_history("截图贴图")
             tool = self._get_screenshot_tool()
@@ -14326,6 +14848,74 @@ class ToolboxWindow(QMainWindow):
 
     def show_screenshots(self):
         self._get_screenshot_tool().capture()
+
+    def show_long_shot(self):
+        """长截图：框选区域后自动滚动逐帧抓拍并拼接成一张长图。"""
+        self._add_to_history("长截图")
+        if self._long_overlay is not None:
+            self._long_overlay.close()
+            return
+        self._long_restore = self.isVisible()
+        if self._long_restore:
+            self.hide()
+        QTimer.singleShot(200, self._open_long_shot_overlay)
+
+    def _open_long_shot_overlay(self):
+        try:
+            desktop, geometry = capture_desktop()
+        except (OSError, ValueError) as exc:
+            self._restore_after_long_shot()
+            QMessageBox.warning(self, "长截图失败", str(exc))
+            return
+        overlay = LongShotOverlay(desktop, geometry)
+        overlay.selected.connect(self._start_long_shot)
+        overlay.cancelled.connect(self._restore_after_long_shot)
+        self._long_overlay = overlay
+        overlay.show()
+        overlay.raise_()
+        overlay.activateWindow()
+        overlay.setFocus()
+
+    def _start_long_shot(self, rect):
+        self._long_overlay = None
+        status = LongShotStatus()
+        session = LongShotSession(rect, self)
+        session.mask = status
+        session.progress.connect(status.set_progress)
+        session.notice.connect(status.set_notice)
+        session.mode_changed.connect(status.set_auto)
+        session.finished.connect(self._finish_long_shot)
+        status.capture_requested.connect(session.capture)
+        status.auto_toggled.connect(session.set_auto)
+        status.finish_requested.connect(session.finish)
+        status.cancel_requested.connect(session.cancel)
+        self._long_status = status
+        self._long_session = session
+        status.show()
+        status.raise_()
+        status.activateWindow()
+        status.setFocus()
+        session.start()
+
+    def _finish_long_shot(self, image, message):
+        if self._long_status is not None:
+            self._long_status.close()
+            self._long_status = None
+        self._long_session = None
+        self._restore_after_long_shot()
+        if image is None:
+            QMessageBox.information(self, "长截图", message or "没有截取到内容")
+            return
+        preview = LongShotPreview(image, message, self)
+        self._long_preview = preview
+        preview.show()
+        preview.raise_()
+        preview.activateWindow()
+
+    def _restore_after_long_shot(self):
+        if self._long_restore:
+            self._long_restore = False
+            self.show()
 
     def refresh_stats(self):
         cpu_pct, mem_pct, used_gb, total_gb = get_system_stats()

@@ -3358,13 +3358,15 @@ class ScreenPickOverlay(QWidget):
         screen = QApplication.screenAt(self._pos) or QApplication.primaryScreen()
         geo = screen.geometry()
         half = self.SRC // 2
-        # QCursor.pos() 是逻辑坐标，而 grabWindow 按物理像素取图；
-        # Windows 显示缩放≠100% 时两者错位，需换算到该屏内的物理像素坐标，
-        # 同时减去屏幕原点以支持多显示器（副屏原点可能非 0,0）。
+        # grabWindow 坐标空间各平台不同：macOS 用逻辑坐标，Windows 缩放≠100% 用物理像素；
+        # 统一减去屏幕原点以支持多显示器（副屏原点可能非 0,0）。
         dpr = screen.devicePixelRatio()
         local = self._pos - geo.topLeft()
-        px = int(round(local.x() * dpr))
-        py = int(round(local.y() * dpr))
+        if platform.system() == "Darwin":
+            px, py = local.x(), local.y()
+        else:
+            px = int(round(local.x() * dpr))
+            py = int(round(local.y() * dpr))
         grab = screen.grabWindow(0, px - half, py - half, self.SRC, self.SRC)
         grab.setDevicePixelRatio(1.0)
         loupe = self.SRC * self.ZOOM
@@ -3386,7 +3388,7 @@ class ScreenPickOverlay(QWidget):
             return
 
         img = grab.toImage()
-        self._center = img.pixelColor(half, half)
+        self._center = img.pixelColor(img.width() // 2, img.height() // 2)
         mag = img.scaled(loupe, loupe, Qt.IgnoreAspectRatio, Qt.FastTransformation)
         painter.drawImage(box, mag)
 
@@ -3488,13 +3490,21 @@ def scroll_screen_at(point, notches):
 
             cg.CGWarpMouseCursorPosition.argtypes = [CGPoint]
             cg.CGWarpMouseCursorPosition(CGPoint(float(point.x()), float(point.y())))
-            cg.CGEventCreateScrollWheelEvent.restype = ctypes.c_void_p
-            cg.CGEventCreateScrollWheelEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
-                                                         ctypes.c_uint32, ctypes.c_int32]
-            event = cg.CGEventCreateScrollWheelEvent(None, 1, 1, -3 * int(notches))
+            # CGEventCreateScrollWheelEvent 是可变参数函数，ctypes 在 Apple Silicon
+            # 上无法正确传递可变参（滚轮量会读到栈上垃圾值），改用非可变的
+            # CGEventCreate + CGEventSetType + CGEventSetIntegerValueField 组合。
+            cg.CGEventCreate.restype = ctypes.c_void_p
+            cg.CGEventCreate.argtypes = [ctypes.c_void_p]
+            cg.CGEventSetType.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            cg.CGEventSetIntegerValueField.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int64]
+            cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+            cg.CFRelease.argtypes = [ctypes.c_void_p]
+            event = cg.CGEventCreate(None)
             if event:
-                cg.CGEventPost(0, ctypes.c_void_p(event))
-                cg.CFRelease(ctypes.c_void_p(event))
+                cg.CGEventSetType(event, 22)  # kCGEventScrollWheel
+                cg.CGEventSetIntegerValueField(event, 11, -3 * int(notches))  # kCGScrollWheelEventDeltaAxis1
+                cg.CGEventPost(0, event)
+                cg.CFRelease(event)
     except (OSError, AttributeError, ValueError):
         pass
 
@@ -3508,6 +3518,21 @@ def qimage_rgb_array(image):
     buffer.setsize(converted.byteCount())
     array = np.frombuffer(buffer, np.uint8).reshape(height, stride)[:, :width * 3]
     return array.reshape(height, width, 3).copy()
+
+
+def long_shot_missing_deps():
+    """长截图按需依赖 numpy/opencv。启动前预检，缺包时返回模块名列表。
+
+    这些 import 发生在 Qt 定时器槽里，一旦抛 ImportError，PyQt5 会调用 qFatal
+    直接 abort（表现为闪退），所以必须在进入抓拍流程前先检查并友好提示。
+    """
+    missing = []
+    for name in ("numpy", "cv2"):
+        try:
+            __import__(name)
+        except ImportError:
+            missing.append(name)
+    return missing
 
 
 def save_screenshot(parent, image):
@@ -14851,6 +14876,12 @@ class ToolboxWindow(QMainWindow):
 
     def show_long_shot(self):
         """长截图：框选区域后自动滚动逐帧抓拍并拼接成一张长图。"""
+        missing = long_shot_missing_deps()
+        if missing:
+            QMessageBox.warning(self, "长截图缺少依赖",
+                                "长截图需要以下 Python 依赖：%s。\n请先执行：pip install -r requirements.txt"
+                                % "、".join(missing))
+            return
         self._add_to_history("长截图")
         if self._long_overlay is not None:
             self._long_overlay.close()

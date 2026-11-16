@@ -8,6 +8,7 @@ import os
 import ssl
 import sys
 import tempfile
+import os
 import unittest
 import zoneinfo
 
@@ -407,6 +408,39 @@ class AdbKitTest(unittest.TestCase):
         self.assertTrue(adbkit.is_network_address("10.0.0.2"))
         self.assertFalse(adbkit.is_network_address("RF8M1234ABC"))
         self.assertFalse(adbkit.is_network_address(""))
+
+    def test_record_filename(self):
+        name = adbkit.record_filename("mp4", "192.168.1.7:5555")
+        self.assertTrue(name.startswith("adb-192.168.1.7_5555-"))
+        self.assertTrue(name.endswith(".mp4"))
+        self.assertNotIn(":", name)
+        self.assertTrue(adbkit.record_filename("png").endswith(".png"))
+
+    def test_screen_recorder_args(self):
+        recorder = adbkit.ScreenRecorder(
+            "/tmp/adb", serial="RF8M1234ABC", remote="/sdcard/a.mp4",
+            size="720x1280", bitrate="8M", time_limit=60)
+        args = recorder.build_args()
+        self.assertEqual(args[:5], ["/tmp/adb", "-s", "RF8M1234ABC", "shell", "screenrecord"])
+        self.assertEqual(args[5:], ["--time-limit", "60", "--size", "720x1280",
+                                    "--bit-rate", "8M", "/sdcard/a.mp4"])
+
+    def test_screen_recorder_defaults_and_clamp(self):
+        recorder = adbkit.ScreenRecorder("/tmp/adb", remote="/sdcard/a.mp4", time_limit=0)
+        self.assertEqual(recorder.time_limit, adbkit.ScreenRecorder.MAX_SECONDS)
+        args = recorder.build_args()
+        self.assertNotIn("--size", args)
+        self.assertNotIn("--bit-rate", args)
+        self.assertEqual(args[-1], "/sdcard/a.mp4")
+        recorder = adbkit.ScreenRecorder("/tmp/adb", remote="/sdcard/a.mp4", time_limit=999)
+        self.assertEqual(recorder.time_limit, 180)
+        recorder = adbkit.ScreenRecorder("/tmp/adb", remote="/sdcard/a.mp4", time_limit="abc")
+        self.assertEqual(recorder.time_limit, 180)
+        self.assertFalse(recorder.running())
+
+    def test_default_record_dir(self):
+        folder = adbkit.default_record_dir()
+        self.assertTrue(os.path.isdir(folder))
 
 
 if __name__ == "__main__":

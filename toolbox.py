@@ -4777,6 +4777,10 @@ class AdbWindow(QMainWindow):
         self._devices = []
         self._refreshing = False
         self._download_worker = None
+        self._recorder = None
+        self._record_timer = QTimer(self)
+        self._record_timer.setInterval(1000)
+        self._record_timer.timeout.connect(self._record_tick)
         self._init_ui()
         self._poll = QTimer(self)
         self._poll.setInterval(self.POLL_INTERVAL)
@@ -4795,6 +4799,7 @@ class AdbWindow(QMainWindow):
         layout.addWidget(self._build_device_box())
         layout.addWidget(self._build_install_box())
         layout.addWidget(self._build_uninstall_box())
+        layout.addWidget(self._build_capture_box())
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setFont(QFont("Menlo", 12))
@@ -4933,6 +4938,67 @@ class AdbWindow(QMainWindow):
         box.addLayout(row)
         return frame
 
+    def _build_capture_box(self):
+        frame, box = self._card("记录与抓屏")
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(self._tiny_label("尺寸"))
+        self.size_combo = QComboBox()
+        self.size_combo.addItems(["原尺寸", "720x1280", "540x960", "1080x1920"])
+        self.size_combo.setStyleSheet(_combo_style())
+        row.addWidget(self.size_combo)
+        row.addWidget(self._tiny_label("码率"))
+        self.bitrate_combo = QComboBox()
+        self.bitrate_combo.addItems(["8M", "4M", "16M", "2M"])
+        self.bitrate_combo.setStyleSheet(_combo_style())
+        row.addWidget(self.bitrate_combo)
+        row.addWidget(self._tiny_label("最长"))
+        self.duration_combo = QComboBox()
+        self.duration_combo.addItems(["180 秒（设备上限）", "120 秒", "60 秒", "30 秒"])
+        self.duration_combo.setStyleSheet(_combo_style())
+        row.addWidget(self.duration_combo)
+        row.addStretch()
+        box.addLayout(row)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.save_edit = QLineEdit(adbkit.default_record_dir())
+        self.save_edit.setReadOnly(True)
+        self.save_edit.setPlaceholderText("录屏与截图保存目录")
+        pick_dir = QPushButton("选择目录…")
+        pick_dir.setCursor(Qt.PointingHandCursor)
+        pick_dir.setStyleSheet(_secondary_btn())
+        pick_dir.clicked.connect(self.pick_record_dir)
+        row.addWidget(self.save_edit, 1)
+        row.addWidget(pick_dir)
+        box.addLayout(row)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.record_btn = QPushButton("开始录屏")
+        self.record_btn.setCursor(Qt.PointingHandCursor)
+        self.record_btn.setStyleSheet(_primary_btn())
+        self.record_btn.clicked.connect(self.toggle_record)
+        self.shot_btn = QPushButton("截图 PNG")
+        self.shot_btn.setCursor(Qt.PointingHandCursor)
+        self.shot_btn.setStyleSheet(_secondary_btn())
+        self.shot_btn.clicked.connect(self.screenshot)
+        row.addWidget(self.record_btn)
+        row.addWidget(self.shot_btn)
+        row.addStretch()
+        box.addLayout(row)
+        hint = QLabel("录屏用手机自带的 screenrecord（不占安装包体积），只录画面不录声音；"
+                      "停止时会让手机端正常收尾，录完自动拉回上面目录。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #8290A5; border: none; font-size: 11px;")
+        box.addWidget(hint)
+        return frame
+
+    def _tiny_label(self, text):
+        label = QLabel(text)
+        label.setStyleSheet("color: #8290A5; border: none; font-size: 11px;")
+        return label
+
     # ---------- 通用 ----------
     def showEvent(self, event):
         super().showEvent(event)
@@ -4945,6 +5011,13 @@ class AdbWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._poll.stop()
+        self._record_timer.stop()
+        if self._recorder is not None:
+            try:
+                self._recorder.stop()
+            except Exception:
+                pass
+            self._recorder = None
         if self._download_worker is not None:
             self._download_worker.cancel()
         for worker in list(self._workers):
@@ -5226,6 +5299,113 @@ class AdbWindow(QMainWindow):
     def _after_uninstall(self, result):
         self._report(result)
         self.refresh_devices()
+
+    # ---------- 录屏 / 截图 ----------
+    def _record_folder(self):
+        folder = self.save_edit.text().strip() or adbkit.default_record_dir()
+        if not os.path.isdir(folder):
+            try:
+                os.makedirs(folder, exist_ok=True)
+            except Exception as exc:
+                QMessageBox.warning(self, "保存目录不可用", "%s\n%s" % (folder, exc))
+                return ""
+        return folder
+
+    def pick_record_dir(self):
+        path = QFileDialog.getExistingDirectory(self, "选择保存目录", self.save_edit.text())
+        if path:
+            self.save_edit.setText(path)
+
+    def toggle_record(self):
+        if self._recorder is not None:
+            self.stop_record()
+        else:
+            self.start_record()
+
+    def start_record(self):
+        if not adbkit.adb_path():
+            QMessageBox.information(self, "开始录屏", "还没有 adb，先在上面下载 platform-tools。")
+            return
+        serial = self._current_serial()
+        if serial is None:
+            return
+        folder = self._record_folder()
+        if not folder:
+            return
+        size = self.size_combo.currentText()
+        size = "" if size == "原尺寸" else size
+        seconds = int(self.duration_combo.currentText().split()[0])
+        remote = "/sdcard/toolbox-%s.mp4" % time.strftime("%Y%m%d-%H%M%S")
+        local = os.path.join(folder, adbkit.record_filename("mp4", serial))
+        recorder = adbkit.ScreenRecorder(adbkit.adb_path(), serial=serial, remote=remote,
+                                         size=size,
+                                         bitrate=self.bitrate_combo.currentText(),
+                                         time_limit=seconds)
+        try:
+            recorder.start()
+        except Exception as exc:
+            QMessageBox.warning(self, "开始录屏失败", str(exc)[:300])
+            return
+        self._recorder = recorder
+        self._recorder_local = local
+        self.record_btn.setText("停止录屏（0s）")
+        self._record_timer.start()
+        self._log("» 开始录屏：%s × %s，最长 %d 秒" % (size or "原尺寸",
+                                                  self.bitrate_combo.currentText(), seconds))
+
+    def _record_tick(self):
+        if self._recorder is None:
+            self._record_timer.stop()
+            return
+        if self._recorder.running():
+            self.record_btn.setText("停止录屏（%ds）" % self._recorder.elapsed)
+        else:
+            self._record_timer.stop()
+            self.finish_record("时间到，手机端已自动停止")
+
+    def stop_record(self):
+        if self._recorder is None:
+            return
+        self._record_timer.stop()
+        self._log("» 停止录屏，等手机端收尾…")
+        try:
+            self._recorder.stop()
+        except Exception as exc:
+            self._log("停止时出错：%s" % str(exc)[:200])
+        self.finish_record("已手动停止")
+
+    def finish_record(self, reason):
+        recorder = self._recorder
+        if recorder is None:
+            return
+        self._recorder = None
+        self.record_btn.setText("开始录屏")
+        output = recorder.output()
+        if output:
+            self._log(output[:300])
+        local = getattr(self, "_recorder_local", "")
+        adb = adbkit.adb_path()
+        self._log("» 拉回录像（%s）" % reason)
+        status, text = adbkit.pull(adb, serial=recorder.serial, remote=recorder.remote,
+                                   local=local)
+        self._report((status, text))
+        adbkit.remove_remote(adb, serial=recorder.serial, remote=recorder.remote)
+
+    def screenshot(self):
+        if not adbkit.adb_path():
+            QMessageBox.information(self, "截图", "还没有 adb，先在上面下载 platform-tools。")
+            return
+        serial = self._current_serial()
+        if serial is None:
+            return
+        folder = self._record_folder()
+        if not folder:
+            return
+        dest = os.path.join(folder, adbkit.record_filename("png", serial))
+        self._run("截屏 → %s" % dest,
+                  lambda: ("ok", "已保存：%s" % adbkit.screencap(adbkit.adb_path(), serial=serial or None,
+                                                                 dest=dest)),
+                  self._report)
 
 
 class ColorWindow(QMainWindow):

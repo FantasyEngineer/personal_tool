@@ -5,7 +5,7 @@
 """
 import os
 
-APP_VERSION = "1.0.41"
+APP_VERSION = "1.0.42"
 UPDATE_CHECK_URL = "https://gitee.com/api/v5/repos/jimmy_hou/personal_tool/contents/version.json?ref=main"
 
 TOOL_WIN_W = 720
@@ -35,6 +35,7 @@ TOOL_RENAMES = {
     "JSON/XML": "数据格式", "JSON-YAML": "数据格式", "格式转换": "数据格式",
     "进制转换": "数字转换", "罗马数字": "数字转换", "金额大写": "数字转换",
     "命令速查": "开发速查", "HTTP 状态码": "开发速查",
+    "颜色": "颜色转换",
 }
 SECTION_RENAMES = {
     "系统工具": "系统与桌面", "加解密/编解码": "编码与安全", "文本处理": "文本与数据",

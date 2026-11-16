@@ -10848,7 +10848,7 @@ TOOL_TIPS = {
     "加解密": "页签：JWT / AES / RSA / HMAC / 口令哈希 / 随机密钥",
     "正则测试": "功能：常用正则预设 · 实时匹配与高亮",
     "生成器": "页签：二维码 / 条形码 / UUID / 随机数",
-    "颜色": "功能：颜色选择器 · HEX / RGB / HSL 互转",
+    "颜色转换": "功能：颜色选择器 · HEX / RGB / RGBA / HSL / HSV / CMYK 互转",
     "取色器": "功能：屏幕取色 · 全屏放大镜 · C 复制并退出 · X 切换 HEX/RGB · 左键/ESC 退出",
     "截图贴图": "功能：区域截屏 · 识别文字 · 识别后框内拖选即复制 · 像素放大镜 · HEX / RGB 取色 · 复制颜色 · 调整选区 · 矩形 / 箭头 / 画笔 / 文字标注 · 截图自动复制 · 剪贴板贴图 · 桌面置顶 · 缩放 / 透明度 · 隐藏显示全部贴图",
     "长截图": "功能：框选区域后自动滚动逐帧抓拍并拼成长图 · 可暂停自动滚动自己滚，空格抓拍 · 回车完成 · Esc 取消 · 结果可复制或保存 PNG",
@@ -10898,7 +10898,8 @@ PINYIN_MAP = {
     "uuid": ["生成器"],
     "geshi": ["数据格式"],
     "shuju": ["数据格式"],
-    "yanse": ["颜色"],
+    "yanse": ["颜色转换"],
+    "yansezhuanhuan": ["颜色转换"],
     "quse": ["取色器", "截图贴图"],
     "quseqi": ["取色器", "截图贴图"],
     "fangdajing": ["取色器", "截图贴图"],
@@ -12734,11 +12735,11 @@ class ToolboxWindow(QMainWindow):
             "房贷计算器": self.show_mortgage
         })
 
-        self.create_section("开发辅助", ["开发速查", "ADB 调试", "chmod 权限", "颜色", "生成器"], {
+        self.create_section("开发辅助", ["开发速查", "ADB 调试", "chmod 权限", "颜色转换", "生成器"], {
             "开发速查": self.show_dev_reference,
             "ADB 调试": self.show_adb,
             "chmod 权限": self.show_chmod,
-            "颜色": self.show_color,
+            "颜色转换": self.show_color,
             "生成器": self.show_generator
         })
 
@@ -12762,6 +12763,8 @@ class ToolboxWindow(QMainWindow):
         self.tool_order = {cat: [] for cat in self.section_order}
         for cat in self.section_order:
             for n in saved_tools.get(cat, []):
+                if n == "颜色" and "颜色转换" in all_names:
+                    n = "颜色转换"  # 旧存档里的名字，改名后接着用
                 if n in all_names and n not in assigned:
                     assigned.add(n)
                     self.tool_order[cat].append(n)
@@ -13578,12 +13581,12 @@ class ToolboxWindow(QMainWindow):
         for value in items[:5]:
             btn = QPushButton()
             btn.setFont(ui_font(10, 12))
-            width = min(160, btn.fontMetrics().horizontalAdvance(value) + 24)
+            width = min(168, btn.fontMetrics().horizontalAdvance(value) + 26)
             if width > available and self.history_row.count():
                 btn.deleteLater()
                 break
             width = min(width, max(40, available))
-            btn.setText(btn.fontMetrics().elidedText(value, Qt.ElideRight, width - 24).replace("&", "&&"))
+            btn.setText(btn.fontMetrics().elidedText(value, Qt.ElideRight, width - 22).replace("&", "&&"))
             btn.setFixedSize(width, 28)
             btn.setProperty("historyValue", value)
             btn.setToolTip(value + "\n" + ("点击打开工具" if mode == "recent" else "点击重新搜索") + " · 右键移除")

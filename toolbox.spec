@@ -5,6 +5,7 @@
 #         macOS:   dist/Toolbox/Toolbox.app (one-dir bundle)
 
 import os
+import shutil
 import sys
 
 APP_NAME = "Toolbox"
@@ -30,6 +31,37 @@ ICON_ASSETS = [(os.path.join("assets", f), "assets")
                for f in ("icon.ico", "icon.icns", "icon.png", "tray_template.png")
                if os.path.exists(os.path.join("assets", f))]
 
+
+# 打包后的 OpenSSL 找不到默认证书库：python.org 解释器的 etc/openssl/cert.pem
+# 不会被 PyInstaller 带走，而 libssl 里写死的默认路径在用户机上不存在，于是所有
+# HTTPS 都报 "unable to get local issuer certificate"（离线 OCR 引擎下载、检查
+# 更新、大模型识别都受影响）。随包带一份 Mozilla CA 库，运行时由
+# toolbox_app/kit/netkit.py 优先使用。
+def _ca_bundle_source():
+    try:
+        import certifi  # 构建机一般不缺
+        return certifi.where()
+    except Exception:
+        pass
+    for path in ("/opt/homebrew/etc/ca-certificates/cert.pem",
+                 "/usr/local/etc/ca-certificates/cert.pem",
+                 "/etc/ssl/cert.pem"):
+        if os.path.exists(path):
+            return path
+    return None
+
+
+_ca_source = _ca_bundle_source()
+BUNDLED_DATAS = list(ICON_ASSETS)
+if _ca_source:
+    _ca_dir = os.path.join(SPECPATH, "build")
+    os.makedirs(_ca_dir, exist_ok=True)
+    _ca_dest = os.path.join(_ca_dir, "cacert.pem")
+    shutil.copyfile(_ca_source, _ca_dest)
+    BUNDLED_DATAS.append((_ca_dest, "assets"))
+else:
+    print("WARNING: 没找到可用的 CA 证书库，打包后 HTTPS 会校验失败")
+
 # 本地 OCR（RapidOCR + onnxruntime + opencv）不打进安装包：首次识别时按需下载到
 # 用户目录（见 toolbox.py 的 ensure_ocr_runtime），安装包因此保持在几十 MB。
 # 代码里只用 importlib 探测、不写死 import，这里再排除一次，避免构建机装了这些包
@@ -40,7 +72,7 @@ a = Analysis(
     ["toolbox.py"],
     pathex=[],
     binaries=[],
-    datas=ICON_ASSETS,
+    datas=BUNDLED_DATAS,
     # qrcode picks its PIL image backend lazily; make sure it is bundled.
     # cryptography's Rust binding is an extension module the 加解密 pages need at runtime.
     # numpy.core 是 numpy 2 给旧代码留的兼容层：按需下载的 cv2 里仍有

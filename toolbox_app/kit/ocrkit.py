@@ -25,6 +25,7 @@ from toolbox_app.constants import APP_VERSION, UPDATE_CHECK_URL, OCR_SETTINGS_PA
 from toolbox_app.natives import win_no_console
 from toolbox_app.storage import cache_root
 from toolbox_app.kit.updatekit import validate_update_url, UpdateRedirectHandler
+from toolbox_app.kit.netkit import https_context
 
 OCR_ENGINE_MODES = ("system", "rapidocr", "llm")
 OCR_ENGINE_LABELS = {"system": "系统 OCR", "rapidocr": "本地 RapidOCR", "llm": "大模型"}
@@ -494,7 +495,8 @@ def fetch_ocr_runtime_info():
     validate_update_url(UPDATE_CHECK_URL)
     request = urllib.request.Request(UPDATE_CHECK_URL,
                                      headers={"User-Agent": "Toolbox/" + APP_VERSION})
-    opener = urllib.request.build_opener(UpdateRedirectHandler())
+    opener = urllib.request.build_opener(
+        UpdateRedirectHandler(), urllib.request.HTTPSHandler(context=https_context()))
     with opener.open(request, timeout=10) as response:
         content = response.read(1024 * 1024 + 1)
     if len(content) > 1024 * 1024:
@@ -597,7 +599,7 @@ def llm_ocr_layout(image, settings, timeout=90):
         headers={"Content-Type": "application/json",
                  "Authorization": "Bearer " + settings["api_key"]},
         method="POST")
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(request, timeout=timeout, context=https_context()) as response:
         data = json.loads(response.read().decode("utf-8"))
     content = data["choices"][0]["message"]["content"]
     if isinstance(content, list):

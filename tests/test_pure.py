@@ -5,6 +5,7 @@
 import datetime
 import hashlib
 import os
+import ssl
 import sys
 import unittest
 import zoneinfo
@@ -13,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import toolbox
 from toolbox_app.kit import (barcodekit, convertkit, cronkit, cryptokit, datetimekit,
-                             diffkit, reminderkit, screenkit, updatekit)
+                             diffkit, netkit, reminderkit, screenkit, updatekit)
 
 try:
     import numpy as np
@@ -136,6 +137,26 @@ class UpdateKitTest(unittest.TestCase):
                     "https://example.com/a.zip#frag", "https://exa mple.com/a.zip", 123):
             with self.assertRaises(ValueError):
                 updatekit.validate_update_url(bad)
+
+
+class NetKitTest(unittest.TestCase):
+    """打包后证书库兜底：一定要落到一个真实存在的 PEM 上。"""
+
+    def test_ca_file_points_to_existing_pem(self):
+        path = netkit.ca_file()
+        self.assertTrue(os.path.isfile(path), path)
+        with open(path, "rb") as bundle:
+            self.assertIn(b"BEGIN CERTIFICATE", bundle.read(4096))
+
+    def test_missing_env_path_is_skipped(self):
+        os.environ["SSL_CERT_FILE"] = "/definitely/not/here.pem"
+        try:
+            self.assertNotEqual(netkit.ca_file(), "/definitely/not/here.pem")
+        finally:
+            os.environ.pop("SSL_CERT_FILE", None)
+
+    def test_https_context_verifies(self):
+        self.assertEqual(netkit.https_context().verify_mode, ssl.CERT_REQUIRED)
 
 
 class ReminderKitTest(unittest.TestCase):

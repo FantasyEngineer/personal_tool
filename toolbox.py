@@ -122,6 +122,7 @@ from toolbox_app.kit.updatekit import (
     save_update_target, update_install_target,
     extract_update_package,
 )
+from toolbox_app.kit.netkit import https_context
 from toolbox_app.kit.ocrkit import (
     OCR_ENGINE_LABELS, rapidocr_available, rapidocr_version, ocr_runtime_root,
     ocr_runtime_abi_issue, reset_ocr_runtime_cache, fetch_ocr_runtime_info,
@@ -2910,7 +2911,8 @@ class OcrRuntimeDownloadWorker(QThread):
         request = urllib.request.Request(self.info["url"], headers={
             "User-Agent": "Toolbox/" + APP_VERSION,
             "Accept": "application/zip, application/octet-stream"})
-        opener = urllib.request.build_opener(UpdateRedirectHandler())
+        opener = urllib.request.build_opener(
+            UpdateRedirectHandler(), urllib.request.HTTPSHandler(context=https_context()))
         with opener.open(request, timeout=20) as response, open(path, "wb") as output:
             validate_update_url(response.geturl())
             try:
@@ -7051,7 +7053,8 @@ class SpeedTestWorker(QThread):
 
     def _measure(self, url):
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        response = urllib.request.urlopen(req, timeout=self.SOCKET_TIMEOUT)
+        response = urllib.request.urlopen(req, timeout=self.SOCKET_TIMEOUT,
+                                          context=https_context())
         total = 0
         start = time.perf_counter()
         last_report = start
@@ -13122,7 +13125,8 @@ class UpdateDownloadWorker(QThread):
             archive_path = os.path.join(directory, 'update.zip')
             request = urllib.request.Request(self.url, headers={
                 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/zip, application/octet-stream'})
-            opener = urllib.request.build_opener(UpdateRedirectHandler())
+            opener = urllib.request.build_opener(
+                UpdateRedirectHandler(), urllib.request.HTTPSHandler(context=https_context()))
             with opener.open(request, timeout=15) as response, open(archive_path, 'wb') as output:
                 validate_update_url(response.geturl())
                 total = int(response.headers.get('Content-Length', '0'))
@@ -13613,7 +13617,8 @@ class CheckUpdateThread(QThread):
         try:
             validate_update_url(UPDATE_CHECK_URL)
             req = urllib.request.Request(UPDATE_CHECK_URL, headers={'User-Agent': f'Toolbox/{APP_VERSION}'})
-            opener = urllib.request.build_opener(UpdateRedirectHandler())
+            opener = urllib.request.build_opener(
+                UpdateRedirectHandler(), urllib.request.HTTPSHandler(context=https_context()))
             with opener.open(req, timeout=10) as response:
                 validate_update_url(response.geturl())
                 content = response.read(1024 * 1024 + 1)

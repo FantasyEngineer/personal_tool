@@ -288,6 +288,11 @@ def _get_rapidocr_engine():
     return _rapidocr_engine
 
 
+def rapidocr_engine():
+    """取本地引擎实例（首次调用才初始化，之后复用）。"""
+    return _get_rapidocr_engine()
+
+
 def rapidocr_layout(image_path, cancelled=None):
     """用本地 RapidOCR 识别图片，返回与系统 OCR 相同的版面结构。
 
@@ -430,6 +435,11 @@ def _ocr_runtime_abi_mismatch(path):
             for tag in re.findall(r"cp3\d\d", name):
                 found.add(tag)
     return sorted(tag for tag in found if tag != current)
+
+
+def ocr_runtime_mismatch(path):
+    """解压目录里与当前解释器 ABI 不符的标签；一致时返回空列表。"""
+    return _ocr_runtime_abi_mismatch(path)
 
 
 _ocr_runtime_broken = None  # (目录, 不匹配的标签) —— 已下载但与当前解释器不符

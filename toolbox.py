@@ -125,7 +125,8 @@ from toolbox_app.kit.updatekit import (
 from toolbox_app.kit.netkit import https_context
 from toolbox_app.kit.ocrkit import (
     OCR_ENGINE_LABELS, rapidocr_available, rapidocr_version, ocr_runtime_root,
-    ocr_runtime_abi_issue, reset_ocr_runtime_cache, fetch_ocr_runtime_info,
+    ocr_runtime_abi_issue, ocr_runtime_site, ocr_runtime_mismatch, rapidocr_engine,
+    reset_ocr_runtime_cache, fetch_ocr_runtime_info,
     extract_runtime_zip, file_sha256, join_ocr_spans, run_ocr, ocr_mode_hint,
     ocr_llm_ready, load_ocr_settings, save_ocr_settings,
 )
@@ -2877,7 +2878,7 @@ class OcrRuntimeDownloadWorker(QThread):
             os.remove(archive)
             # 压缩包是按某个 Python 版本编译的，先确认里面的 .pyd/.so 与实际解释器
             # ABI 一致，别装下去等识别时才报「No module named 'xxx._xxx'」
-            mismatch = _ocr_runtime_abi_mismatch(unpacked)
+            mismatch = ocr_runtime_mismatch(unpacked)
             if mismatch:
                 raise ValueError(
                     "运行库与当前 Python %d.%d 不匹配（压缩包里是 %s 构建的）。\n"
@@ -3039,7 +3040,7 @@ def warm_rapidocr():
     """后台预热引擎，避免第一次识别多等初始化时间。"""
     write_startup_log("warm_rapidocr 线程开始")
     try:
-        _get_rapidocr_engine()
+        rapidocr_engine()
         write_startup_log("本地 OCR 预热完成")
     except Exception as exc:
         # 预热失败不影响使用（识别时会重新尝试并回退系统 OCR），但写进日志便于排查
@@ -11129,6 +11130,16 @@ class ReminderWindow(QMainWindow):
             self.delete_rule()
         else:
             super().keyPressEvent(event)
+
+
+class _DragTree(QTreeWidget):
+    """拖动排序用的树：移动完成后通知一次，界面据此保存新顺序。"""
+
+    orderChanged = pyqtSignal()
+
+    def dropEvent(self, event):
+        super().dropEvent(event)
+        self.orderChanged.emit()
 
 
 class SectionOrderWindow(QMainWindow):

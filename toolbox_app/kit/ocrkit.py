@@ -125,14 +125,30 @@ function run(argv) {
     request.recognitionLevel = $.VNRequestTextRecognitionLevelAccurate;
     request.usesLanguageCorrection = true;
     var error = Ref();
-    var supported = ObjC.deepUnwrap($.VNRecognizeTextRequest.supportedRecognitionLanguagesForRecognitionLevelRevisionError(
-        request.recognitionLevel, request.revision, error));
-    request.recognitionLanguages = supported.filter(function(language) {
-        return language === 'zh-Hans' || language === 'en-US';
+    // 选择器全名是 ...ForTextRecognitionLevel:revision:error:，漏掉 Text 在 JXA 里
+    // 会直接 TypeError: supportedRecognitionLanguagesForRecognitionLevel... is not a function
+    var supported = $.VNRecognizeTextRequest.supportedRecognitionLanguagesForTextRecognitionLevelRevisionError(
+        request.recognitionLevel, request.revision, error);
+    var available = supported.isNil() ? [] : ObjC.deepUnwrap(supported);
+    // 顺序很关键：['en-US','zh-Hans'] 会把中文整行漏掉，zh-Hans 要排前面
+    var wanted = [];
+    ['zh-Hans', 'en-US'].forEach(function(language) {
+        if (available.indexOf(language) !== -1 && wanted.indexOf(language) === -1) {
+            wanted.push(language);
+        }
     });
+    // 该 revision 不支持中文时（列表里没有 zh-Hans）退回系统默认，避免整页识别报错
+    if (wanted.length > 0) {
+        request.recognitionLanguages = wanted;
+        if (request.respondsToSelector('setAutomaticallyDetectsLanguage:')) {
+            request.automaticallyDetectsLanguage = true;
+        }
+    }
     var handler = $.VNImageRequestHandler.alloc.initWithURLOptions(
         $.NSURL.fileURLWithPath(argv[0]), $.NSDictionary.dictionary);
-    if (!handler.performRequestsError([request], error)) {
+    // 必须传 NSArray：直接给 JS 数组 [request] 会触发
+    // "exception raised by object: -[__NSDictionaryM frameworkClass]"
+    if (!handler.performRequestsError($.NSArray.arrayWithObject(request), error)) {
         throw new Error(ObjC.unwrap(error[0].localizedDescription));
     }
     var lines = [];

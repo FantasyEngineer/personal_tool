@@ -12,7 +12,12 @@ import zoneinfo
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import toolbox
-from toolbox_app.kit import convertkit, cryptokit, datetimekit, diffkit
+from toolbox_app.kit import convertkit, cryptokit, datetimekit, diffkit, screenkit
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 UTC = zoneinfo.ZoneInfo("UTC")
 
@@ -167,6 +172,50 @@ class ConvertKitTest(unittest.TestCase):
         to_base, from_base = convertkit.temp_converters()
         self.assertAlmostEqual(to_base[1](212), 100)          # ℉ -> ℃
         self.assertAlmostEqual(from_base[2](100), 373.15)     # ℃ -> K
+
+
+@unittest.skipIf(np is None, "长截图拼接依赖 numpy")
+class ScreenKitTest(unittest.TestCase):
+    """长截图拼接：灰度化、块降采样与相关系数配准。"""
+
+    @staticmethod
+    def _rows(values):
+        """把一维灰度序列铺成 (H, 1) 的二维数组，贴近真实调用形状。"""
+        return np.asarray(values, dtype=np.float32)[:, None]
+
+    def test_gray_array(self):
+        rgb = np.zeros((4, 4, 3), dtype=np.uint8)
+        rgb[:, :, 0] = 255                       # 纯红 -> 0.299 * 255
+        gray = screenkit.gray_array(rgb)
+        self.assertEqual(gray.shape, (4, 4))
+        self.assertAlmostEqual(float(gray[0, 0]), 76.245, places=3)
+
+    def test_block_mean(self):
+        gray = np.arange(16, dtype=np.float32).reshape(4, 4)
+        self.assertEqual(screenkit.block_mean(gray, 1).shape, (4, 4))
+        small = screenkit.block_mean(gray, 2)
+        self.assertEqual(small.shape, (2, 2))
+        self.assertAlmostEqual(float(small[0, 0]), 2.5)      # mean(0, 1, 4, 5)
+
+    def test_match_score(self):
+        strip = self._rows(range(20))
+        self.assertAlmostEqual(screenkit.match_score(strip, strip), 1.0, places=6)
+        self.assertAlmostEqual(screenkit.match_score(strip, -strip), -1.0, places=6)
+        self.assertEqual(screenkit.match_score(strip, strip * 0), 0.0)
+
+    def test_best_vertical_offset_and_score(self):
+        previous = np.zeros((60, 1), dtype=np.float32)
+        previous[10:] = self._rows(range(50))
+        current = np.zeros((70, 1), dtype=np.float32)
+        current[:50] = self._rows(range(50))
+        # previous[10:] 与 current[0:50] 完全一致，新增内容从第 50 行开始
+        self.assertEqual(screenkit.best_vertical_offset(previous, current, 10), 50)
+        self.assertAlmostEqual(screenkit.offset_score(previous, current, 10, 0),
+                               1.0, places=6)
+        self.assertEqual(screenkit.offset_score(previous, current, 10, 60), -2.0)
+
+    def test_long_shot_missing_deps(self):
+        self.assertEqual(screenkit.long_shot_missing_deps(), [])
 
 
 if __name__ == "__main__":

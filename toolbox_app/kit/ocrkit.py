@@ -432,8 +432,13 @@ def _ocr_runtime_abi_mismatch(path):
         for name in files:
             if not name.endswith((".pyd", ".so")):
                 continue
-            for tag in re.findall(r"cp3\d\d", name):
-                found.add(tag)
+            # 两个平台的扩展名后缀不同，两种都要认：
+            #   macOS   x.cpython-311-darwin.so
+            #   Windows x.cp311-win_amd64.pyd
+            for digits in re.findall(r"cpython-([0-9]+)", name):
+                found.add("cp" + digits)
+            for digits in re.findall(r"cp([0-9]{2,3})", name):
+                found.add("cp" + digits)
     return sorted(tag for tag in found if tag != current)
 
 

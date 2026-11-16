@@ -7,6 +7,7 @@ import hashlib
 import os
 import ssl
 import sys
+import tempfile
 import unittest
 import zoneinfo
 
@@ -14,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import toolbox
 from toolbox_app.kit import (barcodekit, convertkit, cronkit, cryptokit, datetimekit,
-                             diffkit, netkit, reminderkit, screenkit, updatekit)
+                             diffkit, netkit, ocrkit, reminderkit, screenkit, updatekit)
 
 try:
     import numpy as np
@@ -157,6 +158,37 @@ class NetKitTest(unittest.TestCase):
 
     def test_https_context_verifies(self):
         self.assertEqual(netkit.https_context().verify_mode, ssl.CERT_REQUIRED)
+
+
+class OcrRuntimeAbiTest(unittest.TestCase):
+    """下载的运行库与解释器 ABI 是否一致的判定：mac / win 两种后缀都要认。"""
+
+    def setUp(self):
+        current = "cp%d%d" % sys.version_info[:2]
+        self.other = "cp312" if current != "cp312" else "cp311"
+
+    def _runtime_dir(self, names):
+        folder = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(folder, ignore_errors=True))
+        for name in names:
+            open(os.path.join(folder, name), "wb").close()
+        return folder
+
+    def test_macos_suffix_is_caught(self):
+        digits = self.other[2:]
+        folder = self._runtime_dir(["a.cpython-%s-darwin.so" % digits])
+        self.assertEqual(ocrkit.ocr_runtime_mismatch(folder), [self.other])
+
+    def test_windows_suffix_is_caught(self):
+        digits = self.other[2:]
+        folder = self._runtime_dir(["a.cp%s-win_amd64.pyd" % digits])
+        self.assertEqual(ocrkit.ocr_runtime_mismatch(folder), [self.other])
+
+    def test_matching_interpreter_is_empty(self):
+        digits = "%d%d" % sys.version_info[:2]
+        folder = self._runtime_dir(["a.cpython-%s-darwin.so" % digits,
+                                    "b.cp%s-win_amd64.pyd" % digits])
+        self.assertEqual(ocrkit.ocr_runtime_mismatch(folder), [])
 
 
 class ReminderKitTest(unittest.TestCase):

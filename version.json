@@ -1,38 +1,38 @@
 {
-  "version": "1.0.32",
-  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.32/Toolbox-macos.zip",
-  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.32/Toolbox-windows.zip",
-  "changelog": "- CI 版本注入改为写入 toolbox_app/constants.py\n- 版本号改为 1.0.32\n- toolbox.py 接入全部 kit 模块并清理拆分遗留的未使用导入\n- 抽取 gitkit/mirrorkit/sshkit：配置文件工具的纯逻辑\n- 抽取 envkit：用户环境变量读写（注册表 / rc 文件）\n- 抽取 reminderkit：提醒规则时间计算与持久化\n- 抽取 ocrkit：系统 OCR 命令构造、版面归一化与离线运行时管理\n- 抽取 updatekit：版本号解析、下载地址校验与更新包解压\n- 抽取 barcodekit：Code 128 编码、校验位与条空宽度的纯计算\n- 抽取 cronkit：cron 字段解析与执行计划的纯计算\n- 抽取 screenkit：长截图拼接与屏幕取图的纯计算\n- 抽取 convertkit：单位换算与进制换算的纯逻辑\n- 拆分单文件代码库：抽出 toolbox_app 包与纯逻辑 kit 模块\n- 版本号改为 1.0.31\n- chore: update version.json for v1.0.31 [skip ci]",
+  "version": "1.0.33",
+  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.33/Toolbox-macos.zip",
+  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.33/Toolbox-windows.zip",
+  "changelog": "- 修复打包后 HTTPS 全部校验失败（离线引擎下载报 unable to get local issuer certificate）",
   "ocr_runtime": {
-    "version": "1.0.32",
+    "version": "1.0.33",
     "windows": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.32/ocr-runtime-windows.zip",
-      "sha256": "d191c94377f4eeb49cfaa189befe4555218fe8b111a555a1254a864ab9272160",
-      "size": 85492864
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.33/ocr-runtime-windows.zip",
+      "sha256": "a23dcd8d968f43bbb670961af5fa88c133ec9c89a55638ff0ee9db74efa1cf13",
+      "size": 85492863
     },
     "windows_3_11": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.32/ocr-runtime-windows.zip",
-      "sha256": "d191c94377f4eeb49cfaa189befe4555218fe8b111a555a1254a864ab9272160",
-      "size": 85492864
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.33/ocr-runtime-windows.zip",
+      "sha256": "a23dcd8d968f43bbb670961af5fa88c133ec9c89a55638ff0ee9db74efa1cf13",
+      "size": 85492863
     },
     "windows_3_12": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.32/ocr-runtime-windows-312.zip",
-      "sha256": "d837ec3ceee8f6ca3ab1073adc476a5a7bedde630931077e8ee42ce674fc29ad",
-      "size": 85474576
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.33/ocr-runtime-windows-312.zip",
+      "sha256": "9c3d4d975dd15e690d1f995b718df298facc99314295db35388afeed5c957f8b",
+      "size": 85474575
     },
     "macos": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.32/ocr-runtime-macos.zip",
-      "sha256": "d1706f09542ae9e6fd0d05df6fd40656f69d7b2da69994cbc2fdc8f4e2c974e5",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.33/ocr-runtime-macos.zip",
+      "sha256": "cbb16609f6085b3c68cbe053d7df36c85d501f70ea4418db42aef57d8ceb450b",
       "size": 105664901
     },
     "macos_3_11": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.32/ocr-runtime-macos.zip",
-      "sha256": "d1706f09542ae9e6fd0d05df6fd40656f69d7b2da69994cbc2fdc8f4e2c974e5",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.33/ocr-runtime-macos.zip",
+      "sha256": "cbb16609f6085b3c68cbe053d7df36c85d501f70ea4418db42aef57d8ceb450b",
       "size": 105664901
     },
     "macos_3_12": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.32/ocr-runtime-macos-312.zip",
-      "sha256": "8df9a197fe8d8c0edec1d7e286b2e1d5a959d0bee2c9f404b64bb7d325f5d353",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.33/ocr-runtime-macos-312.zip",
+      "sha256": "c84765d54e2a2555453b5163de46ef3f63d7200422fb3dc1d036e37ca3ab0d08",
       "size": 105671524
     }
   }

@@ -115,6 +115,7 @@ from toolbox_app.kit.screenkit import (
     gray_array, block_mean, best_vertical_offset, offset_score,
 )
 from toolbox_app.kit.barcodekit import render_code128
+from toolbox_app.kit import adbkit
 from toolbox_app.kit import cronkit
 from toolbox_app.kit.updatekit import (
     update_version_parts, validate_update_url, UpdateRedirectHandler,
@@ -4715,6 +4716,516 @@ class ScreenshotTool(QObject):
         for worker in list(self._ocr_workers):
             worker.wait()
         self._restore_windows.clear()
+
+
+class AdbTask(QThread):
+    """在后台跑一次 adb 操作（安装/卸载/刷新设备），结果回主线程。"""
+
+    done = pyqtSignal(object)
+
+    def __init__(self, func, parent=None):
+        super().__init__(parent)
+        self._func = func
+
+    def run(self):
+        try:
+            result = self._func()
+        except Exception as exc:  # adb 不在、超时、权限不足都统一提示
+            result = ("error", str(exc)[:400])
+        self.done.emit(result)
+
+
+class AdbDownloadWorker(QThread):
+    """下载 Google 官方 platform-tools 并解出 adb。"""
+
+    progress = pyqtSignal(int, int)
+    status = pyqtSignal(str)
+    ready = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.cancelled = threading.Event()
+
+    def cancel(self):
+        self.cancelled.set()
+
+    def run(self):
+        try:
+            self.status.emit("正在从 Google 下载 platform-tools…")
+            path = adbkit.download_adb(
+                progress=lambda done, total: self.progress.emit(done, total),
+                cancelled=self.cancelled)
+            self.ready.emit(path)
+        except InterruptedError:
+            pass
+        except Exception as exc:
+            if not self.cancelled.is_set():
+                self.failed.emit(str(exc)[:300])
+
+
+class AdbWindow(QMainWindow):
+    """安卓调试：检测设备、无线连接、安装/卸载 APK、触发调试授权弹窗。"""
+
+    POLL_INTERVAL = 3000
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("ADB 调试")
+        self.setGeometry(*tool_win_geometry())
+        self._workers = []
+        self._devices = []
+        self._refreshing = False
+        self._download_worker = None
+        self._init_ui()
+        self._poll = QTimer(self)
+        self._poll.setInterval(self.POLL_INTERVAL)
+        self._poll.timeout.connect(self._poll_devices)
+        self.refresh_state()
+        self.refresh_devices()
+
+    # ---------- 界面 ----------
+    def _init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(16, 14, 16, 12)
+        layout.setSpacing(10)
+        layout.addWidget(self._build_status_box())
+        layout.addWidget(self._build_device_box())
+        layout.addWidget(self._build_install_box())
+        layout.addWidget(self._build_uninstall_box())
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setFont(QFont("Menlo", 12))
+        self.log.setStyleSheet(_plain_style() + "QPlainTextEdit { background: #FAFBFC; color: #33435A; }")
+        self.log.setPlaceholderText("操作记录会显示在这里")
+        layout.addWidget(self.log, 1)
+
+    def _card(self, title):
+        frame = QFrame()
+        frame.setObjectName("adbCard")
+        frame.setStyleSheet(
+            "QFrame#adbCard { background: #FFFFFF; border: 1px solid #E4EAF2; border-radius: 10px; }")
+        box = QVBoxLayout(frame)
+        box.setContentsMargins(14, 10, 14, 12)
+        box.setSpacing(8)
+        label = QLabel(title)
+        label.setFont(ui_font(12, 13, bold=True))
+        label.setStyleSheet("color: #53657E; border: none;")
+        box.addWidget(label)
+        return frame, box
+
+    def _build_status_box(self):
+        frame, box = self._card("平台工具")
+        self.adb_label = QLabel()
+        self.adb_label.setWordWrap(True)
+        self.adb_label.setStyleSheet("color: #53657E; border: none;")
+        box.addWidget(self.adb_label)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.download_btn = QPushButton("下载 adb（约 8 MB）")
+        self.download_btn.setCursor(Qt.PointingHandCursor)
+        self.download_btn.setStyleSheet(_primary_btn())
+        self.download_btn.clicked.connect(self.start_download)
+        self.server_btn = QPushButton("重启 adb 服务")
+        self.server_btn.setCursor(Qt.PointingHandCursor)
+        self.server_btn.setStyleSheet(_secondary_btn())
+        self.server_btn.clicked.connect(self.restart_server)
+        row.addWidget(self.download_btn)
+        row.addWidget(self.server_btn)
+        row.addStretch()
+        box.addLayout(row)
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        self.progress.setFixedHeight(14)
+        self.progress.setTextVisible(False)
+        box.addWidget(self.progress)
+        return frame
+
+    def _build_device_box(self):
+        frame, box = self._card("设备")
+        self.device_list = QListWidget()
+        self.device_list.setFixedHeight(104)
+        self.device_list.setFont(QFont("Menlo", 12))
+        self.device_list.setStyleSheet(
+            "QListWidget { border: 1px solid #E4EAF2; border-radius: 6px; background: #FBFCFE; }")
+        box.addWidget(self.device_list)
+        self.device_hint = QLabel("")
+        self.device_hint.setWordWrap(True)
+        self.device_hint.setStyleSheet("color: #8290A5; border: none; font-size: 11px;")
+        box.addWidget(self.device_hint)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        for text, slot in (("刷新设备", self.refresh_devices),
+                           ("无线连接…", self.wireless_connect),
+                           ("断开无线", self.wireless_disconnect),
+                           ("触发调试授权弹窗", self.trigger_auth)):
+            button = QPushButton(text)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setStyleSheet(_secondary_btn() if text != "触发调试授权弹窗" else _primary_btn())
+            button.clicked.connect(slot)
+            row.addWidget(button)
+        row.addStretch()
+        box.addLayout(row)
+        hint = QLabel("手机需先打开「开发者选项 → USB 调试」，数据线连上后若手机没弹授权框，点「触发调试授权弹窗」。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #8290A5; border: none; font-size: 11px;")
+        box.addWidget(hint)
+        return frame
+
+    def _build_install_box(self):
+        frame, box = self._card("安装应用")
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.apk_edit = QLineEdit()
+        self.apk_edit.setReadOnly(True)
+        self.apk_edit.setPlaceholderText("选择 .apk 文件（可在下方勾选覆盖安装 / 授予权限）")
+        pick = QPushButton("选择 APK…")
+        pick.setCursor(Qt.PointingHandCursor)
+        pick.setStyleSheet(_secondary_btn())
+        pick.clicked.connect(self.pick_apk)
+        row.addWidget(self.apk_edit, 1)
+        row.addWidget(pick)
+        box.addLayout(row)
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self.reinstall_check = QCheckBox("覆盖安装 -r")
+        self.reinstall_check.setChecked(True)
+        self.grant_check = QCheckBox("授予全部运行时权限 -g")
+        self.grant_check.setChecked(True)
+        install_btn = QPushButton("安装到选中设备")
+        install_btn.setCursor(Qt.PointingHandCursor)
+        install_btn.setStyleSheet(_primary_btn())
+        install_btn.clicked.connect(self.install_apk)
+        row.addWidget(self.reinstall_check)
+        row.addWidget(self.grant_check)
+        row.addStretch()
+        row.addWidget(install_btn)
+        box.addLayout(row)
+        return frame
+
+    def _build_uninstall_box(self):
+        frame, box = self._card("卸载应用")
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.pkg_combo = QComboBox()
+        self.pkg_combo.setEditable(True)
+        self.pkg_combo.setPlaceholderText("包名，例如 com.example.app")
+        self.pkg_combo.setStyleSheet(_combo_style())
+        list_btn = QPushButton("列出第三方应用")
+        list_btn.setCursor(Qt.PointingHandCursor)
+        list_btn.setStyleSheet(_secondary_btn())
+        list_btn.clicked.connect(self.list_packages)
+        row.addWidget(self.pkg_combo, 1)
+        row.addWidget(list_btn)
+        box.addLayout(row)
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self.keep_data_check = QCheckBox("保留数据与缓存 -k")
+        uninstall_btn = QPushButton("卸载")
+        uninstall_btn.setCursor(Qt.PointingHandCursor)
+        uninstall_btn.setStyleSheet(_secondary_btn())
+        uninstall_btn.clicked.connect(self.uninstall_apk)
+        row.addWidget(self.keep_data_check)
+        row.addStretch()
+        row.addWidget(uninstall_btn)
+        box.addLayout(row)
+        return frame
+
+    # ---------- 通用 ----------
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._poll.start()
+        self.refresh_state()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._poll.stop()
+
+    def closeEvent(self, event):
+        self._poll.stop()
+        if self._download_worker is not None:
+            self._download_worker.cancel()
+        for worker in list(self._workers):
+            worker.wait(2000)
+        super().closeEvent(event)
+
+    def _log(self, text):
+        self.log.appendPlainText(text)
+
+    def _run(self, title, func, handler):
+        """后台跑一次操作；title 打印到日志，handler 处理返回值。"""
+        self._log("» %s" % title)
+        worker = AdbTask(func, self)
+        self._workers.append(worker)
+
+        def finish(result):
+            handler(result)
+            if worker in self._workers:
+                self._workers.remove(worker)
+
+        worker.done.connect(finish)
+        worker.start()
+
+    def _report(self, result):
+        if not isinstance(result, tuple) or len(result) != 2:
+            self._log(str(result)[:400])
+            return
+        status, text = result
+        if status == "ok":
+            self._log(text or "完成")
+        else:
+            self._log("失败：%s" % (text or "未知错误"))
+
+    def _current_serial(self):
+        item = self.device_list.currentItem()
+        if item is not None:
+            return item.data(Qt.UserRole)
+        if len(self._devices) == 1:
+            return self._devices[0]["serial"]
+        if not self._devices:
+            self._log("还没有已连接的设备，先点「刷新设备」。")
+            return None
+        self._log("检测到多台设备，请先在列表里选中一台。")
+        return None
+
+    # ---------- 状态与下载 ----------
+    def refresh_state(self):
+        path = adbkit.adb_path()
+        if path:
+            try:
+                version = adbkit.version_text(path)
+            except Exception:
+                version = ""
+            self.adb_label.setText("adb 已就绪：%s\n%s" % (version or "platform-tools", path))
+            self.adb_label.setStyleSheet("color: #1A7F37; border: none;")
+            self.download_btn.setText("重新下载 adb")
+            self.server_btn.setVisible(True)
+        else:
+            self.adb_label.setText("还没有 adb：首次使用点下面的按钮，从 Google 官方下载 platform-tools（约 8 MB），"
+                                   "下载完就一直用本地这份，不再联网。")
+            self.adb_label.setStyleSheet("color: #B25000; border: none;")
+            self.download_btn.setText("下载 adb（约 8 MB）")
+            self.server_btn.setVisible(False)
+
+    def start_download(self):
+        if self._download_worker is not None and self._download_worker.isRunning():
+            return
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)
+        self.progress.setFormat("正在下载 platform-tools…")
+        self._log("开始下载 %s" % adbkit.download_url())
+        worker = AdbDownloadWorker(self)
+        self._download_worker = worker
+        worker.status.connect(self._log)
+        worker.progress.connect(self._download_progress)
+        worker.ready.connect(self._download_ready)
+        worker.failed.connect(self._download_failed)
+        worker.start()
+
+    def _download_progress(self, done, total):
+        if total:
+            self.progress.setRange(0, total)
+            self.progress.setValue(min(done, total))
+        else:
+            self.progress.setRange(0, 0)
+
+    def _download_ready(self, path):
+        self.progress.setVisible(False)
+        self._log("adb 已就绪：%s" % path)
+        self._download_worker = None
+        self.refresh_state()
+        self.refresh_devices()
+
+    def _download_failed(self, message):
+        self.progress.setVisible(False)
+        self._log("下载失败：%s" % message)
+        self._download_worker = None
+        QMessageBox.warning(self, "下载 adb 失败",
+                            "%s\n\n可稍后重试；若网络受限，也可安装 Android SDK 的 platform-tools，"
+                            "Toolbox 会自动识别。" % message)
+
+    def restart_server(self):
+        self._run("adb kill-server / start-server",
+                  lambda: self._server_restart(),
+                  self._after_restart)
+
+    def _server_restart(self):
+        try:
+            adbkit.run_adb(["kill-server"], timeout=15)
+            _code, out, err = adbkit.run_adb(["start-server"], timeout=20)
+            text = (out + err).strip()
+            return ("ok", text or "adb 服务已重启")
+        except Exception as exc:
+            return ("fail", str(exc)[:300])
+
+    def _after_restart(self, result):
+        self._report(result)
+        self.refresh_devices()
+
+    # ---------- 设备 ----------
+    def refresh_devices(self):
+        if not adbkit.adb_path():
+            self.device_list.clear()
+            self._devices = []
+            self.device_hint.setText("还没有 adb：先在上面下载 platform-tools。")
+            return
+        if self._refreshing:
+            return
+        self._refreshing = True
+        self._run("检测设备", lambda: ("devices",) + self._devices_snapshot(), self._devices_done)
+
+    def _devices_snapshot(self):
+        devices, _raw = adbkit.list_devices()
+        return (devices, "；".join("%s %s" % (d["serial"], adbkit.state_label(d["state"]))
+                                   for d in devices) or "未发现设备")
+
+    def _devices_done(self, result):
+        self._refreshing = False
+        if not isinstance(result, tuple) or result[0] != "devices":
+            self._report(result if isinstance(result, tuple) and result[0] != "devices" else ("fail", str(result)))
+            return
+        devices = result[1]
+        summary = result[2]
+        self._devices = devices
+        self.device_hint.setText(summary)
+        selected = self.device_list.currentItem()
+        keep = selected.data(Qt.UserRole) if selected is not None else ""
+        self.device_list.clear()
+        for device in devices:
+            label = "%s · %s · %s" % (device["serial"],
+                                      device["model"] or device["product"] or "未知型号",
+                                      adbkit.state_label(device["state"]))
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, device["serial"])
+            if device["state"] != "device":
+                item.setForeground(QColor("#B25000"))
+            self.device_list.addItem(item)
+            if keep and device["serial"] == keep:
+                self.device_list.setCurrentItem(item)
+
+    def _poll_devices(self):
+        # 轮询只在窗口可见时跑，避免后台常驻占 CPU
+        if not adbkit.adb_path():
+            return
+        self.refresh_devices()
+
+    def wireless_connect(self):
+        address, ok = QInputDialog.getText(self, "无线连接",
+                                           "手机地址（先在「开发者选项 → 无线调试」里开启）：",
+                                           text="192.168.1.100:5555")
+        if not ok or not address.strip():
+            return
+        host = address.strip()
+        pair_address, ok = QInputDialog.getText(
+            self, "无线连接", "如果是第一次连 Android 11+ 设备，需要配对：填「无线调试」里的配对地址:端口；\n"
+                              "已配对过则直接留空继续。", text="")
+        if not ok:
+            return
+        target = pair_address.strip()
+        if target:
+            code, ok = QInputDialog.getText(self, "无线连接", "填手机屏幕上显示的 6 位配对码：")
+            if not ok or not code.strip():
+                return
+            self._run("adb pair %s" % target,
+                      lambda: adbkit.pair(adbkit.adb_path(), target, code.strip()),
+                      self._report)
+        self._run("adb connect %s" % host,
+                  lambda: adbkit.connect(adbkit.adb_path(), host),
+                  self._after_connect)
+
+    def _after_connect(self, result):
+        self._report(result)
+        self.refresh_devices()
+
+    def wireless_disconnect(self):
+        item = self.device_list.currentItem()
+        address = item.data(Qt.UserRole) if item is not None else ""
+        if address and ":" not in address:
+            address = ""
+        self._run("adb disconnect %s" % (address or "全部"),
+                  lambda: adbkit.disconnect(adbkit.adb_path(), address),
+                  self._after_connect)
+
+    def trigger_auth(self):
+        self._run("重启 adb 服务并请求调试授权",
+                  lambda: adbkit.trigger_auth_dialog(adbkit.adb_path()),
+                  self._after_auth)
+
+    def _after_auth(self, result):
+        self._report(result)
+        self.refresh_devices()
+
+    # ---------- 安装 / 卸载 ----------
+    def pick_apk(self):
+        path, _filter = QFileDialog.getOpenFileName(self, "选择 APK", "", "Android 安装包 (*.apk)")
+        if path:
+            self.apk_edit.setText(path)
+
+    def install_apk(self):
+        apk = self.apk_edit.text().strip()
+        if not apk:
+            QMessageBox.information(self, "安装应用", "先点「选择 APK…」挑一个安装包。")
+            return
+        if not adbkit.adb_path():
+            QMessageBox.information(self, "安装应用", "还没有 adb，先在上面下载 platform-tools。")
+            return
+        serial = self._current_serial()
+        if serial is None:
+            return
+        self._run("adb install %s" % apk,
+                  lambda: adbkit.install(adbkit.adb_path(), apk, serial=serial or None,
+                                         reinstall=self.reinstall_check.isChecked(),
+                                         grant=self.grant_check.isChecked()),
+                  self._after_install)
+
+    def _after_install(self, result):
+        self._report(result)
+        self.refresh_devices()
+
+    def list_packages(self):
+        if not adbkit.adb_path():
+            QMessageBox.information(self, "列出应用", "还没有 adb，先在上面下载 platform-tools。")
+            return
+        serial = self._current_serial()
+        if serial is None:
+            return
+        self._run("列出第三方应用",
+                  lambda: ("packages", adbkit.packages(adbkit.adb_path(), serial=serial or None)),
+                  self._packages_done)
+
+    def _packages_done(self, result):
+        if not isinstance(result, tuple) or result[0] != "packages":
+            self._report(result)
+            return
+        names = result[1]
+        current = self.pkg_combo.currentText()
+        self.pkg_combo.clear()
+        self.pkg_combo.addItems(names)
+        if current:
+            self.pkg_combo.setEditText(current)
+        self._log("共 %d 个第三方应用，已填进下拉框，可直接选中后卸载。" % len(names))
+
+    def uninstall_apk(self):
+        package = self.pkg_combo.currentText().strip()
+        if not package:
+            QMessageBox.information(self, "卸载应用", "先填或从下拉框里选一个包名。")
+            return
+        if not adbkit.adb_path():
+            QMessageBox.information(self, "卸载应用", "还没有 adb，先在上面下载 platform-tools。")
+            return
+        serial = self._current_serial()
+        if serial is None:
+            return
+        self._run("adb uninstall %s" % package,
+                  lambda: adbkit.uninstall(adbkit.adb_path(), package, serial=serial or None,
+                                           keep_data=self.keep_data_check.isChecked()),
+                  self._after_uninstall)
+
+    def _after_uninstall(self, result):
+        self._report(result)
+        self.refresh_devices()
 
 
 class ColorWindow(QMainWindow):
@@ -10165,6 +10676,7 @@ TOOL_TIPS = {
     "Cron 表达式": "页签：执行计划 / 书写规范",
     "哈希计算": "页签：文本哈希 / 文件哈希（MD5 / SHA1 / SHA256 / SHA512）",
     "开发速查": "分类：Docker / Linux / SSH / Vim / Windows / Git / ADB（安卓调试）命令速查 / HTTP 状态码 · 统一搜索 · 点击复制",
+    "ADB 调试": "功能：检测手机连接 · 无线连接 / 配对 · 安装 APK · 卸载应用 · 触发手机调试授权弹窗 · 日志输出 · 首次使用自动下载 Google 官方 platform-tools",
     "chmod 权限": "功能：八进制 ↔ 符号表示互转，可视化 9 个权限位",
     "日期时间": "页签：时间戳转换（秒/毫秒/微秒/纳秒自动识别 · ISO 8601 / RFC 2822 / 自定义格式）/ 日期计算（间隔 · 工作日 · 加减）/ 时区转换（夏令时）",
     "提醒事项": "功能：定时弹框提醒（如上下班打卡）· 每天/工作日/仅一次 · 稍后再提醒 · 提示音",
@@ -10250,10 +10762,11 @@ PINYIN_MAP = {
     "windows": ["开发速查"],
     "git": ["开发速查", "配置"],
     "http": ["开发速查"],
-    "adb": ["开发速查"],
-    "android": ["开发速查"],
-    "anzhuo": ["开发速查"],
-    "shouji": ["开发速查"],
+    "adb": ["ADB 调试", "开发速查"],
+    "android": ["ADB 调试", "开发速查"],
+    "anzhuo": ["ADB 调试", "开发速查"],
+    "shouji": ["ADB 调试", "开发速查"],
+    "tiaoshi": ["ADB 调试"],
     "zhuangtai": ["开发速查"],
     "chmod": ["chmod 权限"],
     "quanxian": ["chmod 权限"],
@@ -11887,6 +12400,7 @@ class ToolboxWindow(QMainWindow):
         self.image_window = None
         self.network_window = None
         self.dev_reference_window = None
+        self.adb_window = None
         self.mortgage_window = None
         self.chmod_window = None
         self.datetime_window = None
@@ -12040,8 +12554,9 @@ class ToolboxWindow(QMainWindow):
             "房贷计算器": self.show_mortgage
         })
 
-        self.create_section("开发辅助", ["开发速查", "chmod 权限", "颜色", "生成器"], {
+        self.create_section("开发辅助", ["开发速查", "ADB 调试", "chmod 权限", "颜色", "生成器"], {
             "开发速查": self.show_dev_reference,
+            "ADB 调试": self.show_adb,
             "chmod 权限": self.show_chmod,
             "颜色": self.show_color,
             "生成器": self.show_generator
@@ -12629,6 +13144,12 @@ class ToolboxWindow(QMainWindow):
             self.dev_reference_window = DeveloperReferenceWindow()
         self.dev_reference_window.show()
         self.dev_reference_window.activateWindow()
+
+    def show_adb(self):
+        if self.adb_window is None:
+            self.adb_window = AdbWindow()
+        self.adb_window.show()
+        self.adb_window.activateWindow()
 
     def show_mortgage(self):
         if self.mortgage_window is None:

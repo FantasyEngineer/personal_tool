@@ -14,7 +14,7 @@ import zoneinfo
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import toolbox
-from toolbox_app.kit import (barcodekit, convertkit, cronkit, cryptokit, datetimekit,
+from toolbox_app.kit import (adbkit, barcodekit, convertkit, cronkit, cryptokit, datetimekit,
                              diffkit, netkit, ocrkit, reminderkit, screenkit, updatekit)
 
 try:
@@ -357,6 +357,56 @@ class ScreenKitTest(unittest.TestCase):
 
     def test_long_shot_missing_deps(self):
         self.assertEqual(screenkit.long_shot_missing_deps(), [])
+
+
+class AdbKitTest(unittest.TestCase):
+    """adbkit 的纯解析逻辑：设备列表、包名列表、状态文案与下载地址。"""
+
+    DEVICES = "List of devices attached\n" \
+              "emulator-5554\tdevice product:sdk_gphone64_arm64 model:Pixel_7 device:emu64a\n" \
+              "192.168.1.7:5555\tdevice product:panther model:Pixel_7 transport_id:3\n" \
+              "RF8M1234ABC\tunauthorized usb:1-1 transport_id:2\n" \
+              "RF8M5678DEF\toffline transport_id:4\n" \
+              "\n"
+
+    def test_parse_devices(self):
+        devices = adbkit.parse_devices(self.DEVICES)
+        self.assertEqual([d["serial"] for d in devices],
+                         ["emulator-5554", "192.168.1.7:5555", "RF8M1234ABC", "RF8M5678DEF"])
+        self.assertEqual(devices[0]["model"], "Pixel_7")
+        self.assertEqual(devices[0]["state"], "device")
+        self.assertEqual(devices[1]["transport"], "network")
+        self.assertEqual(devices[2]["transport"], "usb")
+        self.assertEqual(devices[2]["state"], "unauthorized")
+
+    def test_parse_devices_empty_and_header_only(self):
+        self.assertEqual(adbkit.parse_devices(""), [])
+        self.assertEqual(adbkit.parse_devices("List of devices attached\n\n"), [])
+
+    def test_state_label(self):
+        self.assertEqual(adbkit.state_label("device"), "已连接")
+        self.assertIn("未授权", adbkit.state_label("unauthorized"))
+        self.assertIn("离线", adbkit.state_label("offline"))
+        self.assertEqual(adbkit.state_label("weird-state"), "weird-state")
+
+    def test_parse_packages(self):
+        text = "package:com.example.app\npackage:com.android.chrome\n" \
+               "package:com.example.app\nWarning: something\n"
+        self.assertEqual(adbkit.parse_packages(text),
+                         ["com.android.chrome", "com.example.app"])
+
+    def test_download_url(self):
+        url = adbkit.download_url()
+        self.assertTrue(url.startswith("https://dl.google.com/android/repository/platform-tools-latest-"))
+        self.assertTrue(url.endswith(".zip"))
+        self.assertEqual(adbkit.adb_binary_name(),
+                         "adb.exe" if adbkit.platform_key() == "Windows" else "adb")
+
+    def test_is_network_address(self):
+        self.assertTrue(adbkit.is_network_address("192.168.1.7:5555"))
+        self.assertTrue(adbkit.is_network_address("10.0.0.2"))
+        self.assertFalse(adbkit.is_network_address("RF8M1234ABC"))
+        self.assertFalse(adbkit.is_network_address(""))
 
 
 if __name__ == "__main__":

@@ -3135,7 +3135,7 @@ class CaptureOverlay(QWidget):
         for name, tip in (("select", "移动 / 调整选区"), ("rectangle", "矩形"), ("arrow", "箭头"),
                           ("pen", "画笔"), ("text", "文字 · 点击选区直接输入，按住已有文字可拖动"), ("undo", "撤销 · Ctrl+Z"),
                           ("redo", "重做 · Ctrl+Shift+Z"), ("ocr", "识别文字 · Ctrl+O · 识别后框内拖选即可复制"),
-                          ("save", "保存 PNG · Ctrl+S"), ("pin", "贴到桌面 · Ctrl+T"),
+                          ("save", "保存 PNG · Ctrl+S"), ("pin", "贴到桌面 · Ctrl+T · 不改剪贴板"),
                           ("copy", "复制并完成 · Enter / Ctrl+C"), ("cancel", "取消 · Esc")):
             button = QPushButton()
             button.setFixedSize(30, 30)
@@ -4668,7 +4668,8 @@ class ScreenshotTool(QObject):
     def _finish_capture(self, image, action, rectangle):
         self.overlay = None
         self._restore()
-        if action in ("copy", "pin"):
+        # 只有"复制并完成"才写剪贴板；贴图不写，否则会把刚识别并复制的文字覆盖成图片
+        if action == "copy":
             QApplication.clipboard().setImage(image.toImage())
         if action == "pin":
             self.pin(image, rectangle.topLeft())
@@ -11675,7 +11676,7 @@ class SettingsWindow(QMainWindow):
         local.setWordWrap(True)
         local.setStyleSheet("color: #57606A; background: #F8FAFC; border-radius: 6px; padding: 10px; font-size: 12px;")
         body_layout.addWidget(local)
-        capture_hint = QLabel("截屏取色：像素放大镜 · C 复制颜色并退出 · X 切换 HEX / RGB\n截屏：框选后调整 / 标注 · Enter / Ctrl+C 复制截图 · Ctrl+T 贴图 · Esc 退出 · 右键重选\n文字识别：框选后点击识别按钮 / Ctrl+O，识别后在旁窗查看 / 编辑 / 选中复制，不自动复制或退出；无文字或失败可调整选区重试\n贴图：拖动移动 · 滚轮缩放 · Ctrl+滚轮调透明度 · 双击 / Esc 隐藏 · 全局显隐快捷键恢复")
+        capture_hint = QLabel("截屏取色：像素放大镜 · C 复制颜色并退出 · X 切换 HEX / RGB\n截屏：框选后调整 / 标注 · Enter / Ctrl+C 复制截图 · Ctrl+T 贴图（不改剪贴板）· Esc 退出 · 右键重选\n文字识别：框选后点击识别按钮 / Ctrl+O，识别后在旁窗查看 / 编辑 / 选中复制，不自动复制或退出；无文字或失败可调整选区重试\n贴图：拖动移动 · 滚轮缩放 · Ctrl+滚轮调透明度 · 双击 / Esc 隐藏 · 全局显隐快捷键恢复")
         capture_hint.setWordWrap(True)
         capture_hint.setStyleSheet("color: #697386; font-size: 11px;")
         body_layout.addWidget(capture_hint)

@@ -11841,23 +11841,6 @@ class ToolboxWindow(QMainWindow):
         main_layout.setContentsMargins(18, 14, 18, 10)
         main_layout.setSpacing(10)
 
-        header = QHBoxLayout()
-        header.setSpacing(12)
-        title = QLabel("工具箱")
-        title.setFont(ui_font(18, 21, bold=True))
-        title.setStyleSheet("color: #202B3D;")
-        header.addWidget(title)
-        subtitle = QLabel("系统 · 开发 · 日常")
-        subtitle.setFont(ui_font(10, 12))
-        subtitle.setStyleSheet("color: #8290A5;")
-        header.addWidget(subtitle)
-        header.addStretch()
-        self.tool_count_label = QLabel()
-        self.tool_count_label.setFont(ui_font(10, 12))
-        self.tool_count_label.setStyleSheet("color: #69788F;")
-        header.addWidget(self.tool_count_label)
-        main_layout.addLayout(header)
-
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("搜索工具、功能或拼音 · 唯一结果按 Enter 打开")
         self.search_input.setClearButtonEnabled(True)
@@ -12051,7 +12034,6 @@ class ToolboxWindow(QMainWindow):
         scroll.viewport().setStyleSheet("QWidget#launcherViewport { background: #F6F8FC; }")
         scroll.setWidget(content_area)
         content_area.setAutoFillBackground(False)
-        self.tool_count_label.setText("%s 个工具" % len(self.all_buttons))
         # 顶部渐隐：仅当内容真正向上滚动时才淡出顶端，静止时标题完全可见
         self._top_fade = QGraphicsOpacityEffect(scroll.viewport())
         self._top_fade.setOpacity(1.0)
@@ -12644,7 +12626,6 @@ class ToolboxWindow(QMainWindow):
             for section, title_label, _, _ in self.sections:
                 section.setVisible(True)
                 section.updateGeometry()
-            self.tool_count_label.setText("%s 个工具" % len(self.all_buttons))
             self.empty_search_label.hide()
             return
         # 模糊匹配：工具名称、提示内容或拼音包含关键词
@@ -12666,7 +12647,6 @@ class ToolboxWindow(QMainWindow):
             section.setVisible(has_visible)
             section.updateGeometry()  # 过滤后重新换行，别留下空位
         count = sum(btn._filter_match for btn in self.all_buttons.values())
-        self.tool_count_label.setText("找到 %s 个工具" % count)
         self.empty_search_label.setVisible(count == 0)
 
     def open_single_match(self):

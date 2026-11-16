@@ -12619,7 +12619,8 @@ class ToolboxWindow(QMainWindow):
         self.history_mode = "recent"
         self.usage_history = []
         self.search_history = []
-        self.max_history = 12
+        # 一行能塞几个就塞几个，宽窗口最多摆到 24 个，再多就走「全部」菜单
+        self.max_history = 24
         self.history_widget = QWidget()
         self.history_widget.setObjectName("historyPanel")
         self.history_widget.setAttribute(Qt.WA_StyledBackground, True)
@@ -12680,6 +12681,10 @@ class ToolboxWindow(QMainWindow):
         history_layout.addLayout(self.history_row)
         history_layout.addStretch()
         self.history_widget.installEventFilter(self)
+        self._history_layout_timer = QTimer(self)
+        self._history_layout_timer.setSingleShot(True)
+        self._history_layout_timer.setInterval(80)
+        self._history_layout_timer.timeout.connect(self._refresh_history_display)
         main_layout.addWidget(self.history_widget)
 
         content_area = QWidget()
@@ -13558,6 +13563,12 @@ class ToolboxWindow(QMainWindow):
             self.search_input.setFocus()
             self.search_input.selectAll()
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # 宽度变了就把胶囊重新铺一遍：宽了多放几个，窄了少放几个
+        if getattr(self, "_history_layout_timer", None) is not None:
+            self._history_layout_timer.start()
+
     def _refresh_history_display(self):
         while self.history_row.count():
             widget = self.history_row.takeAt(0).widget()
@@ -13578,14 +13589,18 @@ class ToolboxWindow(QMainWindow):
         margins = self.history_widget.layout().contentsMargins()
         available = max(0, self.history_widget.contentsRect().width()
                         - margins.left() - margins.right())
-        for value in items[:5]:
+        gap = self.history_row.spacing()
+        placed = 0
+        for value in items:
             btn = QPushButton()
             btn.setFont(ui_font(10, 12))
-            width = min(168, btn.fontMetrics().horizontalAdvance(value) + 26)
-            if width > available and self.history_row.count():
+            natural = min(168, btn.fontMetrics().horizontalAdvance(value) + 26)
+            budget = available if placed == 0 else available - gap
+            # 一行铺满：放不下就不放了，绝不换行，剩下的交给「全部 (N)」菜单
+            if budget < 40:
                 btn.deleteLater()
                 break
-            width = min(width, max(40, available))
+            width = min(natural, budget)
             btn.setText(btn.fontMetrics().elidedText(value, Qt.ElideRight, width - 22).replace("&", "&&"))
             btn.setFixedSize(width, 28)
             btn.setProperty("historyValue", value)
@@ -13601,7 +13616,8 @@ class ToolboxWindow(QMainWindow):
             btn.customContextMenuRequested.connect(
                 lambda pos, b=btn, m=mode, v=value: self._show_history_context(m, v, b.mapToGlobal(pos)))
             self.history_row.addWidget(btn)
-            available -= width + self.history_row.spacing()
+            placed += 1
+            available -= width + gap
         self.history_row.addStretch()
 
     def _populate_history_menu(self):

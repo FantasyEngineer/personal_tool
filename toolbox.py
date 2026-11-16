@@ -8533,6 +8533,64 @@ COMMAND_ITEMS = [
     ("git shortlog -sn", "统计各作者提交数", "Git"),
     ("git stash list", "查看暂存记录列表", "Git"),
     ("git push origin --delete 分支", "删除远程分支", "Git"),
+    # ---------- ADB ----------
+    ("adb devices", "列出已连接设备（序列号与状态）", "ADB"),
+    ("adb devices -l", "列出设备型号、传输方式等详细信息", "ADB"),
+    ("adb -s 序列号 shell", "多设备时指定某台设备执行命令", "ADB"),
+    ("adb connect 192.168.1.100:5555", "无线连接已开启 tcpip 调试的设备", "ADB"),
+    ("adb disconnect 192.168.1.100:5555", "断开无线调试连接", "ADB"),
+    ("adb tcpip 5555", "把 USB 连接切到无线调试端口 5555", "ADB"),
+    ("adb pair 192.168.1.100:37000", "Android 11+ 无线调试配对（随后输入配对码）", "ADB"),
+    ("adb kill-server", "结束 adb 服务进程（设备掉线时先试它）", "ADB"),
+    ("adb start-server", "启动 adb 服务进程", "ADB"),
+    ("adb root", "以 root 身份重启 adbd（需可调试系统镜像）", "ADB"),
+    ("adb remount", "重新挂载 /system 为可写", "ADB"),
+    ("adb reboot", "重启设备", "ADB"),
+    ("adb reboot bootloader", "重启到 bootloader / fastboot 模式", "ADB"),
+    ("adb reboot recovery", "重启到 recovery 模式", "ADB"),
+    ("adb install app.apk", "安装 APK", "ADB"),
+    ("adb install -r app.apk", "覆盖安装（保留原有数据）", "ADB"),
+    ("adb install -d app.apk", "允许降级安装", "ADB"),
+    ("adb install -g app.apk", "安装并授予全部运行时权限", "ADB"),
+    ("adb uninstall com.example.app", "卸载应用", "ADB"),
+    ("adb uninstall -k com.example.app", "卸载但保留数据与缓存", "ADB"),
+    ("adb shell pm list packages", "列出所有已安装应用的包名", "ADB"),
+    ('adb shell pm list packages -3', "只列第三方应用", "ADB"),
+    ('adb shell pm list packages -s', "只列系统应用", "ADB"),
+    ('adb shell pm list packages | grep 关键字', "按关键字过滤包名", "ADB"),
+    ("adb shell pm path com.example.app", "查看应用 APK 的实际路径", "ADB"),
+    ("adb shell dumpsys package com.example.app", "查看版本号、权限、Activity 等详情", "ADB"),
+    ("adb shell pm clear com.example.app", "清除应用数据（相当于恢复出厂设置该应用）", "ADB"),
+    ("adb shell am force-stop com.example.app", "强制停止应用", "ADB"),
+    ("adb shell am start -n com.example.app/.MainActivity", "启动指定 Activity", "ADB"),
+    ('adb shell am start -a android.intent.action.VIEW -d "https://example.com"', "用默认浏览器打开链接", "ADB"),
+    ("adb shell monkey -p com.example.app -v 500", "对该应用做 500 次随机操作压测", "ADB"),
+    ("adb logcat", "实时输出全部日志", "ADB"),
+    ("adb logcat -c", "清空日志缓冲区", "ADB"),
+    ("adb logcat -s TAG", "只看指定 TAG 的日志", "ADB"),
+    ("adb logcat -v time > log.txt", "带时间戳把日志写到电脑文件", "ADB"),
+    ("adb logcat | grep 关键字", "按关键字过滤日志", "ADB"),
+    ('adb shell dumpsys window | grep mCurrentFocus', "查看当前前台 Activity / 窗口", "ADB"),
+    ("adb bugreport", "生成完整诊断报告 zip（体积较大）", "ADB"),
+    ('adb exec-out screencap -p > screen.png', "直接截图存到电脑（推荐，不会损坏 PNG）", "ADB"),
+    ("adb shell screencap -p /sdcard/s.png", "在设备上截图", "ADB"),
+    ("adb pull /sdcard/s.png ~/Desktop", "把设备上的文件拉到电脑", "ADB"),
+    ("adb push local.txt /sdcard/", "把电脑文件推送到设备", "ADB"),
+    ("adb shell screenrecord /sdcard/r.mp4", "录屏（默认最长 180 秒）", "ADB"),
+    ("adb shell screenrecord --time-limit 30 /sdcard/r.mp4", "录制 30 秒屏幕", "ADB"),
+    ('adb shell input text "hello"', "向当前焦点输入框输入文本", "ADB"),
+    ("adb shell input keyevent 3", "按键事件：3=Home，4=返回，26=电源", "ADB"),
+    ("adb shell input tap 500 1000", "在屏幕坐标处点击", "ADB"),
+    ("adb shell input swipe 500 1500 500 500 300", "滑动：起点、终点、时长（毫秒）", "ADB"),
+    ("adb shell getprop ro.product.model", "查看设备型号", "ADB"),
+    ("adb shell getprop ro.build.version.release", "查看 Android 版本", "ADB"),
+    ("adb shell wm size", "查看屏幕分辨率", "ADB"),
+    ("adb shell wm density", "查看屏幕密度", "ADB"),
+    ("adb shell dumpsys battery", "查看电量与充电状态", "ADB"),
+    ("adb shell dumpsys meminfo com.example.app", "查看应用内存占用", "ADB"),
+    ("adb shell df -h", "查看设备存储空间", "ADB"),
+    ("adb forward tcp:8080 tcp:8080", "端口转发：电脑 8080 → 设备 8080", "ADB"),
+    ("adb reverse tcp:8080 tcp:8080", "反向转发：设备 8080 → 电脑 8080（真机调本地接口）", "ADB"),
 ]
 
 COMMAND_CAT_COLORS = {
@@ -8540,6 +8598,9 @@ COMMAND_CAT_COLORS = {
     "Linux": "#E8590C",
     "Windows": "#1A7F37",
     "Git": "#D81E06",
+    "ADB": "#0C9A55",
+    "SSH": "#6950C8",
+    "Vim": "#00838F",
 }
 
 
@@ -8584,7 +8645,7 @@ class CommandRow(QWidget):
 
 
 class DeveloperReferenceWindow(QMainWindow):
-    CATEGORIES = ["全部", "Docker", "Linux", "SSH", "Vim", "Windows", "Git", "HTTP"]
+    CATEGORIES = ["全部", "Docker", "Linux", "SSH", "Vim", "Windows", "Git", "ADB", "HTTP"]
 
     def __init__(self):
         super().__init__()
@@ -10103,7 +10164,7 @@ TOOL_TIPS = {
     "文本工具": "页签：处理与统计（排序 · 去重 · uniq -c · 命名风格 · 合并拆分 · SQL IN · 选区实时统计 · 编码字节 · 不可见字符）/ 文本对比（行内高亮 · 忽略空白/大小写 · 差异跳转 · unified diff）",
     "Cron 表达式": "页签：执行计划 / 书写规范",
     "哈希计算": "页签：文本哈希 / 文件哈希（MD5 / SHA1 / SHA256 / SHA512）",
-    "开发速查": "分类：Docker / Linux / SSH / Vim / Windows / Git 命令速查 / HTTP 状态码 · 统一搜索 · 点击复制",
+    "开发速查": "分类：Docker / Linux / SSH / Vim / Windows / Git / ADB（安卓调试）命令速查 / HTTP 状态码 · 统一搜索 · 点击复制",
     "chmod 权限": "功能：八进制 ↔ 符号表示互转，可视化 9 个权限位",
     "日期时间": "页签：时间戳转换（秒/毫秒/微秒/纳秒自动识别 · ISO 8601 / RFC 2822 / 自定义格式）/ 日期计算（间隔 · 工作日 · 加减）/ 时区转换（夏令时）",
     "提醒事项": "功能：定时弹框提醒（如上下班打卡）· 每天/工作日/仅一次 · 稍后再提醒 · 提示音",
@@ -10189,6 +10250,10 @@ PINYIN_MAP = {
     "windows": ["开发速查"],
     "git": ["开发速查", "配置"],
     "http": ["开发速查"],
+    "adb": ["开发速查"],
+    "android": ["开发速查"],
+    "anzhuo": ["开发速查"],
+    "shouji": ["开发速查"],
     "zhuangtai": ["开发速查"],
     "chmod": ["chmod 权限"],
     "quanxian": ["chmod 权限"],

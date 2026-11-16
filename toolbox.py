@@ -121,6 +121,10 @@ from toolbox_app.kit.datetimekit import (
     dt_zone, dt_localize, dt_in_zone, dt_from_ns, dt_parse, dt_format,
     dt_relative, dt_workdays, dt_calendar_diff,
 )
+from toolbox_app.kit.convertkit import (
+    UNIT_CATEGORIES, TEMP_UNITS, BASES, ratio_converters, temp_converters,
+    unit_format, base_convert,
+)
 
 
 class ProcessListWorker(QThread):
@@ -8050,13 +8054,6 @@ class SpeedTestWindow(QMainWindow):
 
 
 class BaseConvertWindow(QMainWindow):
-    BASES = [
-        ("十进制", 10),
-        ("二进制", 2),
-        ("八进制", 8),
-        ("十六进制", 16),
-    ]
-
     def __init__(self):
         super().__init__()
         self.setWindowTitle("进制转换")
@@ -8074,7 +8071,7 @@ class BaseConvertWindow(QMainWindow):
         combo_layout = QHBoxLayout()
         combo_layout.addWidget(QLabel("源格式:"))
         self.src_combo = QComboBox()
-        for label, _ in self.BASES:
+        for label, _ in BASES:
             self.src_combo.addItem(label)
         self.src_combo.currentIndexChanged.connect(self.do_convert)
         self.src_combo.setStyleSheet(_combo_style())
@@ -8089,7 +8086,7 @@ class BaseConvertWindow(QMainWindow):
 
         combo_layout.addWidget(QLabel("目标格式:"))
         self.dst_combo = QComboBox()
-        for label, _ in self.BASES:
+        for label, _ in BASES:
             self.dst_combo.addItem(label)
         self.dst_combo.setCurrentText("二进制")
         self.dst_combo.currentIndexChanged.connect(self.do_convert)
@@ -8142,24 +8139,13 @@ class BaseConvertWindow(QMainWindow):
         if not raw:
             self.output_text.setText("")
             return
-        src_base = self.BASES[self.src_combo.currentIndex()][1]
-        dst_base = self.BASES[self.dst_combo.currentIndex()][1]
-        cleaned = raw.replace("0x", "").replace("0X", "").replace(" ", "")
+        src_base = BASES[self.src_combo.currentIndex()][1]
+        dst_base = BASES[self.dst_combo.currentIndex()][1]
         try:
-            value = int(cleaned, src_base)
+            result = base_convert(raw, src_base, dst_base)
         except ValueError:
-            self.output_text.setText(f"输入不是合法的{self.BASES[self.src_combo.currentIndex()][0]}数值")
+            self.output_text.setText(f"输入不是合法的{BASES[self.src_combo.currentIndex()][0]}数值")
             return
-        if dst_base == 10:
-            result = str(value)
-        elif dst_base == 2:
-            result = bin(value).replace("0b", "")
-        elif dst_base == 8:
-            result = oct(value).replace("0o", "")
-        elif dst_base == 16:
-            result = hex(value).replace("0x", "").upper()
-        else:
-            result = str(value)
         self.output_text.setText(result)
 
     def do_swap(self):
@@ -9031,43 +9017,6 @@ class _GitConfigPage(QWidget):
         QMessageBox.warning(self, title, str(error), QMessageBox.Ok)
 
 
-# 每类：标签、单位列表、折算到基准单位的因子、默认选中的单位
-UNIT_CATEGORIES = (
-    ("字节", ("B", "KB", "MB", "GB", "TB", "PB"),
-     tuple(1024 ** i for i in range(6)), "B"),
-    ("时间", ("纳秒", "微秒", "毫秒", "秒", "分钟", "小时", "天"),
-     (1, 1000, 1000000, 1000000000, 60000000000, 3600000000000, 86400000000000), "秒"),
-    ("长度", ("微米", "毫米", "厘米", "米", "千米", "英寸", "英尺", "码", "英里"),
-     (1e-6, 0.001, 0.01, 1, 1000, 0.0254, 0.3048, 0.9144, 1609.344), "米"),
-    ("重量", ("毫克", "克", "千克", "吨", "斤", "盎司", "磅"),
-     (1e-6, 0.001, 1, 1000, 0.5, 0.028349523125, 0.45359237), "克"),
-    ("面积", ("平方厘米", "平方米", "平方千米", "亩", "公顷", "平方英寸", "平方英尺", "英亩"),
-     (0.0001, 1, 1000000, 2000.0 / 3.0, 10000, 0.00064516, 0.09290304, 4046.8564224), "平方米"),
-    ("体积", ("毫升", "升", "立方米", "立方英寸", "立方英尺", "加仑(美)", "液量盎司(美)"),
-     (0.001, 1, 1000, 0.016387064, 28.316846592, 3.785411784, 0.0295735295625), "升"),
-    ("速度", ("米/秒", "千米/时", "英里/时", "节", "英尺/秒"),
-     (1, 1000.0 / 3600.0, 0.44704, 1852.0 / 3600.0, 0.3048), "千米/时"),
-)
-
-TEMP_UNITS = ("℃", "℉", "K")
-
-
-def _ratio_converters(factors):
-    """乘数类单位：先折算到该类的基准单位，再从基准单位摊回每个目标单位。"""
-    return ([lambda v, f=f: v * f for f in factors],
-            [lambda t, f=f: t / f for f in factors])
-
-
-def _temp_converters():
-    """温度有偏移量，套不进乘数：℉ 和 K 都先折回 ℃（℃ 就是这类的基准）。"""
-    return ([lambda v: v,
-             lambda v: (v - 32) * 5.0 / 9.0,
-             lambda v: v - 273.15],
-            [lambda c: c,
-             lambda c: c * 9.0 / 5.0 + 32,
-             lambda c: c + 273.15])
-
-
 class _UnitConvertPage(QWidget):
     """一个换算类别：输入数值和源单位，一次列出该类别下所有单位的结果。"""
 
@@ -9125,19 +9074,13 @@ class _UnitConvertPage(QWidget):
             self.result_text.setPlainText("请输入有效数字")
             return
         total = self._to_base[self.src_combo.currentIndex()](val)
-        lines = ["%s %s" % (self._fmt(self._from_base[i](total)), unit)
+        lines = ["%s %s" % (unit_format(self._from_base[i](total)), unit)
                  for i, unit in enumerate(self._units)]
         self.result_text.setPlainText("\n".join(lines))
 
     def do_clear(self):
         self.value_input.clear()
         self.result_text.setPlainText("")
-
-    @staticmethod
-    def _fmt(v):
-        if abs(v) < 1e15 and v == int(v):
-            return str(int(v))
-        return "%.6g" % v
 
 
 class UnitConvertWindow(QMainWindow):
@@ -9152,8 +9095,8 @@ class UnitConvertWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.setStyleSheet(_tab_style())
         for name, units, factors, default_unit in UNIT_CATEGORIES:
-            tabs.addTab(_UnitConvertPage(units, *_ratio_converters(factors), default_unit), name)
-        tabs.addTab(_UnitConvertPage(TEMP_UNITS, *_temp_converters()), "温度")
+            tabs.addTab(_UnitConvertPage(units, *ratio_converters(factors), default_unit), name)
+        tabs.addTab(_UnitConvertPage(TEMP_UNITS, *temp_converters()), "温度")
         self.setCentralWidget(tabs)
 
     def keyPressEvent(self, event):

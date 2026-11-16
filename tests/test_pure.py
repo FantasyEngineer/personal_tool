@@ -12,7 +12,7 @@ import zoneinfo
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import toolbox
-from toolbox_app.kit import cryptokit, datetimekit, diffkit
+from toolbox_app.kit import convertkit, cryptokit, datetimekit, diffkit
 
 UTC = zoneinfo.ZoneInfo("UTC")
 
@@ -138,6 +138,35 @@ class DateTimeParseTest(unittest.TestCase):
     def test_unrecognized_text(self):
         with self.assertRaises(ValueError):
             datetimekit.dt_parse("不是时间", UTC)
+
+
+class ConvertKitTest(unittest.TestCase):
+    """进制换算与单位换算：非法输入要抛错，温度走偏移量而非乘数。"""
+
+    def test_base_convert(self):
+        self.assertEqual(convertkit.base_convert("255", 10, 16), "FF")
+        self.assertEqual(convertkit.base_convert("0xFF", 16, 10), "255")
+        self.assertEqual(convertkit.base_convert("255", 10, 2), "11111111")
+        self.assertEqual(convertkit.base_convert("777", 8, 10), "511")
+        self.assertEqual(convertkit.base_convert("-1010", 2, 10), "-10")
+
+    def test_base_convert_invalid(self):
+        for text in ("", "zz", "12a"):
+            with self.assertRaises(ValueError, msg="应拒绝 %r" % text):
+                convertkit.base_convert(text, 10, 10)
+
+    def test_unit_format(self):
+        self.assertEqual(convertkit.unit_format(1024.0), "1024")
+        self.assertEqual(convertkit.unit_format(0.000976562), "0.000976562")
+
+    def test_ratio_and_temp_converters(self):
+        to_base, from_base = convertkit.ratio_converters((1, 1024))
+        self.assertEqual(to_base[1](2), 2048)
+        self.assertEqual(from_base[1](2048), 2)
+
+        to_base, from_base = convertkit.temp_converters()
+        self.assertAlmostEqual(to_base[1](212), 100)          # ℉ -> ℃
+        self.assertAlmostEqual(from_base[2](100), 373.15)     # ℃ -> K
 
 
 if __name__ == "__main__":

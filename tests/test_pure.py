@@ -12,7 +12,8 @@ import zoneinfo
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import toolbox
-from toolbox_app.kit import convertkit, cryptokit, datetimekit, diffkit, screenkit
+from toolbox_app.kit import (barcodekit, convertkit, cronkit, cryptokit, datetimekit,
+                             diffkit, reminderkit, screenkit, updatekit)
 
 try:
     import numpy as np
@@ -53,7 +54,7 @@ class DiffRowsTest(unittest.TestCase):
 class CronParseFieldTest(unittest.TestCase):
     """cron 字段解析：取值范围、步长、周日的 7 折算成 0。"""
 
-    parse = staticmethod(toolbox.CronWindow._parse_field)
+    parse = staticmethod(cronkit.parse_field)
 
     def test_star_and_step(self):
         self.assertEqual(self.parse("*", 0, 59), set(range(60)))
@@ -74,6 +75,93 @@ class CronParseFieldTest(unittest.TestCase):
         for token in ("", "60", "0-99", "5-3", "*/0", "1-2-3"):
             with self.assertRaises(ValueError, msg="应拒绝 %r" % token):
                 self.parse(token, 0, 59)
+
+    def test_plan_every_minute(self):
+        start = datetime.datetime(2026, 11, 16, 9, 30, 15)
+        plan = cronkit.plan("* * * * *", 3, now=start)
+        self.assertEqual(plan[0], datetime.datetime(2026, 11, 16, 9, 31))
+        self.assertEqual([t.minute for t in plan], [31, 32, 33])
+
+    def test_plan_six_fields_with_seconds(self):
+        start = datetime.datetime(2026, 11, 16, 9, 30, 15)
+        plan = cronkit.plan("*/30 * * * * *", 2, now=start)
+        self.assertEqual(plan, [datetime.datetime(2026, 11, 16, 9, 30, 30),
+                                datetime.datetime(2026, 11, 16, 9, 31, 0)])
+
+    def test_plan_weekday_and_dow_or_dom(self):
+        # 2026-11-16 是周一
+        start = datetime.datetime(2026, 11, 16, 8, 0)
+        plan = cronkit.plan("0 9 * * 1-5", 1, now=start)
+        self.assertEqual(plan[0], datetime.datetime(2026, 11, 16, 9, 0))
+        # 日与周同时限定时取“或”：11 号在 2026-11 里是周三，也该命中
+        plan = cronkit.plan("0 9 11,22 * 1", 2, now=start)
+        self.assertIn(datetime.datetime(2026, 11, 16, 9, 0), plan)
+
+    def test_plan_insufficient(self):
+        with self.assertRaises(ValueError):
+            cronkit.plan("0 0 30 2 *", 5, now=datetime.datetime(2026, 1, 1))
+
+
+class BarcodeKitTest(unittest.TestCase):
+    """Code 128 编码：值序列、校验位与条/空宽度。"""
+
+    def test_values_and_checksum(self):
+        values = barcodekit.code128_values("A")
+        # 起始符 104 + (65 - 32)，校验位 = (104 + 1 * 33) % 103
+        self.assertEqual(values, [104, 33, (104 + 33) % 103])
+
+    def test_widths_alternate(self):
+        widths = barcodekit.code128_widths("HI")
+        # 起始符 + 2 个数据 + 校验位共 4 个 symbol（各 11 模块），加 13 模块的结束符
+        self.assertEqual(sum(widths), 11 * 4 + 13)
+
+    def test_non_ascii_rejected(self):
+        with self.assertRaises(ValueError):
+            barcodekit.code128_values("中文")
+
+
+class UpdateKitTest(unittest.TestCase):
+    """版本号解析与下载地址校验。"""
+
+    def test_version_parts(self):
+        self.assertEqual(updatekit.update_version_parts("1.2"), (1, 2, 0, 0))
+        self.assertEqual(updatekit.update_version_parts("1.2.3.4"), (1, 2, 3, 4))
+        for bad in ("", "v1.2", "1.2.3.4.5", "1..2"):
+            with self.assertRaises(ValueError):
+                updatekit.update_version_parts(bad)
+
+    def test_validate_url(self):
+        updatekit.validate_update_url("https://example.com/toolbox.zip")
+        for bad in ("http://example.com/a.zip", "https://user@example.com/a.zip",
+                    "https://example.com/a.zip#frag", "https://exa mple.com/a.zip", 123):
+            with self.assertRaises(ValueError):
+                updatekit.validate_update_url(bad)
+
+
+class ReminderKitTest(unittest.TestCase):
+    """提醒规则的触发时刻计算（QDate/QDateTime 值类型）。"""
+
+    def test_daily_occurrence_and_upcoming(self):
+        from PyQt5.QtCore import QDateTime
+        now = QDateTime(2026, 11, 16, 9, 0, 0)
+        rule = {"time": "08:30", "repeat": reminderkit.REPEAT_DAILY}
+        self.assertEqual(reminderkit.reminder_occurrence(rule, now),
+                         QDateTime(2026, 11, 16, 8, 30, 0))
+        self.assertEqual(reminderkit.reminder_upcoming(rule, now),
+                         QDateTime(2026, 11, 17, 8, 30, 0))
+
+    def test_weekday_skips_weekend(self):
+        from PyQt5.QtCore import QDateTime
+        saturday = QDateTime(2026, 11, 21, 10, 0, 0)  # 周六
+        rule = {"time": "09:00", "repeat": reminderkit.REPEAT_WEEKDAY}
+        self.assertEqual(reminderkit.reminder_upcoming(rule, saturday),
+                         QDateTime(2026, 11, 23, 9, 0, 0))  # 周一
+
+    def test_invalid_rule_ignored(self):
+        from PyQt5.QtCore import QDateTime
+        now = QDateTime.currentDateTime()
+        self.assertIsNone(reminderkit.reminder_occurrence({"time": "25:00"}, now))
+        self.assertIsNone(reminderkit.reminder_upcoming({"time": "abc"}, now))
 
 
 class PassHashTest(unittest.TestCase):

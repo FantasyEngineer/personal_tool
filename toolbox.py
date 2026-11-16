@@ -7,7 +7,6 @@ import faulthandler
 import re
 import socket
 import json
-import ast
 import base64
 import urllib.parse
 import hashlib
@@ -32,21 +31,12 @@ import string
 import threading
 import ctypes
 import tempfile
-import zipfile
-import posixpath
-import ntpath
-import stat
 import plistlib
 import yaml
 from PIL import Image
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives import padding as sym_padding
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.primitives.asymmetric import rsa, utils as der_utils
+from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
-from cryptography.hazmat.primitives.asymmetric.ec import ECDSA
 from cryptography.exceptions import InvalidSignature, InvalidTag
 
 from toolbox_app.bootstrap import preload_windows_runtime
@@ -67,10 +57,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QTreeWidget, QTreeWidgetItem, QHeaderView,
                               QStyledItemDelegate, QStyle, QGraphicsOpacityEffect,
                               QDialog, QFormLayout, QDialogButtonBox,
-                              QDateEdit, QDateTimeEdit, QGroupBox, QTimeEdit,
-                              QAbstractItemView, QKeySequenceEdit, QProgressBar, QSizePolicy,
-                              QLayout,
-                              QStyleOptionComboBox)
+                              QDateEdit, QDateTimeEdit, QTimeEdit,
+                              QAbstractItemView, QKeySequenceEdit, QProgressBar, QSizePolicy)
 from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QThread, QObject, pyqtSignal, QTimer, QUrl, QLockFile, QDate, QDateTime, QTime, QAbstractNativeEventFilter, QEvent, QSize, QStandardPaths, QPropertyAnimation, QEasingCurve
 from PyQt5.QtGui import (QFont, QCursor, QTextCursor, QColor, QPen, QPixmap, QPainter, QIcon,
                          QImage, QLinearGradient, QBrush, QDesktopServices, QPalette, QKeySequence,
@@ -79,34 +67,31 @@ from PyQt5.QtGui import (QFont, QCursor, QTextCursor, QColor, QPen, QPixmap, QPa
 
 from toolbox_app.constants import (
     APP_VERSION, UPDATE_CHECK_URL,
-    TOOL_WIN_W, TOOL_WIN_H, LAUNCHER_BTN_W, LAUNCHER_BTN_H, LAUNCHER_GRID_SPACING,
-    HISTORY_LIMIT, JSON_HISTORY_PATH, TOOL_USAGE_HISTORY_PATH, SEARCH_HISTORY_PATH,
-    SECTION_ORDER_PATH, TOOL_ORDER_PATH, SHORTCUTS_PATH, OCR_SETTINGS_PATH,
-    UPDATE_TARGET_PATH, TOOL_RENAMES, SECTION_RENAMES,
+    LAUNCHER_BTN_W, LAUNCHER_BTN_H, LAUNCHER_GRID_SPACING,
+    JSON_HISTORY_PATH, TOOL_USAGE_HISTORY_PATH, SEARCH_HISTORY_PATH,
+    SHORTCUTS_PATH, TOOL_RENAMES,
 )
-from toolbox_app.assets import app_asset_path, app_icon, asset_root
+from toolbox_app.assets import app_asset_path, app_icon
 from toolbox_app.theme import (
     ui_font, FlowLayout, tool_win_geometry, _lineedit_style, _combo_style, _ComboClickFilter,
     _primary_btn, _secondary_btn, _plain_style, _output_style, _tab_style,
 )
 from toolbox_app.storage import (
-    cache_root, user_path, load_history, append_history, _read_text, _write_text, _read_lines,
-    load_section_order, save_section_order, load_tool_order, save_tool_order, _ini_get, _ini_set,
-    _app_config_dir,
+    user_path, load_history, append_history, _read_text, _write_text,
+    load_section_order, save_section_order, load_tool_order, save_tool_order,
 )
 from toolbox_app.natives import (
     WIN_ADVANCED_SUBKEY, win_no_console, visibility_read, visibility_write,
-    _mac_cover_menu_bar, _mac_picker_nonactivating, _mac_objc_runtime, _mac_is_cocoa,
-    _mac_frontmost_pid, _mac_reactivate, _win_dword_get, _win_dword_set, _win_broadcast_setting,
-    _macos_default_read, _macos_default_write, _macos_restart_finder,
+    _mac_cover_menu_bar, _mac_picker_nonactivating, _mac_is_cocoa,
+    _mac_frontmost_pid, _mac_reactivate,
 )
 from toolbox_app.kit.sysinfo import (
     get_effective_ip, get_system_stats, human_mem, kill_process,
-    list_processes, process_port_map, short_process_name,
+    list_processes, process_port_map,
 )
 from toolbox_app.kit.textkit import TEXT_OPS, text_stats, _text_escape_param
 from toolbox_app.kit.diffkit import (
-    DIFF_AUTO_LIMIT, DIFF_ROW_LIMIT, DIFF_CHAR_LIMIT, DIFF_COLORS, DIFF_LABELS,
+    DIFF_AUTO_LIMIT, DIFF_ROW_LIMIT, DIFF_COLORS, DIFF_LABELS,
     DIFF_DELTA_BG, DIFF_DELTA_FG, load_text_file, diff_rows, diff_segments, _text_pieces,
 )
 from toolbox_app.kit.cryptokit import (
@@ -127,7 +112,40 @@ from toolbox_app.kit.convertkit import (
 )
 from toolbox_app.kit.screenkit import (
     LONG_SHOT_MAX_HEIGHT, crop_desktop, qimage_rgb_array, long_shot_missing_deps,
-    gray_array, block_mean, match_score, best_vertical_offset, offset_score,
+    gray_array, block_mean, best_vertical_offset, offset_score,
+)
+from toolbox_app.kit.barcodekit import render_code128
+from toolbox_app.kit import cronkit
+from toolbox_app.kit.updatekit import (
+    update_version_parts, validate_update_url, UpdateRedirectHandler,
+    mac_app_bundle, mac_app_translocated, mac_downloads_dir, mac_applications_dir,
+    save_update_target, update_install_target,
+    extract_update_package,
+)
+from toolbox_app.kit.ocrkit import (
+    OCR_ENGINE_LABELS, rapidocr_available, rapidocr_version, ocr_runtime_root,
+    ocr_runtime_abi_issue, reset_ocr_runtime_cache, fetch_ocr_runtime_info,
+    extract_runtime_zip, file_sha256, join_ocr_spans, run_ocr, ocr_mode_hint,
+    ocr_llm_ready, load_ocr_settings, save_ocr_settings,
+)
+from toolbox_app.kit.reminderkit import (
+    REPEAT_CHOICES, REPEAT_DAILY, REPEAT_ONCE, REPEAT_WEEKDAY, SNOOZE_MINUTES,
+    MISSED_QUIET_SECONDS, load_reminders, save_reminders,
+    reminder_occurrence, reminder_upcoming, next_reminder, reminder_when_text,
+)
+from toolbox_app.kit.envkit import (
+    POSIX_ENV_FILE, ENV_NAME_RE, user_env_location, load_user_env, save_user_env,
+    remove_user_env,
+)
+from toolbox_app.kit.gitkit import (
+    GIT_KEY_RE, git_global_path, git_global_list, git_global_set, git_global_unset,
+)
+from toolbox_app.kit.mirrorkit import (
+    CUSTOM_MIRROR, mirror_targets,
+)
+from toolbox_app.kit.sshkit import (
+    SSH_CONFIG_KEYS, SSH_ALIAS_RE, ssh_config_path, _ssh_canonical, ssh_parse_config,
+    ssh_dump, ssh_summary, _ssh_merge_opts,
 )
 
 
@@ -2821,442 +2839,6 @@ def save_screenshot(parent, image):
     return True
 
 
-def screenshot_ocr_layout_command(image_path):
-    """返回带坐标的系统 OCR 命令：输出 {width, height, lines:[{text, words:[...]}]}。
-
-    坐标基于识别图片的像素尺寸，调用方按 width/height 归一化后映射到窗口。
-    """
-    env = os.environ.copy()
-    if platform.system() == "Windows":
-        script = r'''
-$ErrorActionPreference = "Stop"
-$ProgressPreference = "SilentlyContinue"
-[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$stream = $null
-$bitmap = $null
-try {
-    Add-Type -AssemblyName System.Runtime.WindowsRuntime
-    $awaitMethod = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
-        $_.Name -eq "AsTask" -and $_.IsGenericMethod -and
-        $_.GetGenericArguments().Count -eq 1 -and $_.GetParameters().Count -eq 1
-    } | Select-Object -First 1
-    function Await($operation, [Type]$resultType) {
-        $task = $awaitMethod.MakeGenericMethod($resultType).Invoke($null, @($operation))
-        $task.GetAwaiter().GetResult()
-    }
-    $ocr = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
-    $language = $ocr::AvailableRecognizerLanguages | Where-Object {
-        $_.LanguageTag -like "zh-Hans*"
-    } | Select-Object -First 1
-    if ($null -ne $language) {
-        $engine = $ocr::TryCreateFromLanguage($language)
-    } else {
-        $engine = $ocr::TryCreateFromUserProfileLanguages()
-    }
-    if ($null -eq $engine) {
-        throw "系统没有可用的 OCR 语言包，请在 Windows 设置的语言选项中安装中文或英文语言包。"
-    }
-    $file = Await ([Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]::GetFileFromPathAsync($env:PERSONAL_TOOLBOX_OCR_IMAGE)) ([Windows.Storage.StorageFile])
-    $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
-    $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation, ContentType = WindowsRuntime]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
-    $transform = [Windows.Graphics.Imaging.BitmapTransform, Windows.Foundation, ContentType = WindowsRuntime]::new()
-    $ratio = [Math]::Min(1.0, [double]$ocr::MaxImageDimension / [Math]::Max($decoder.PixelWidth, $decoder.PixelHeight))
-    $transform.ScaledWidth = [uint32][Math]::Max(1, [Math]::Floor($decoder.PixelWidth * $ratio))
-    $transform.ScaledHeight = [uint32][Math]::Max(1, [Math]::Floor($decoder.PixelHeight * $ratio))
-    $bitmap = Await ($decoder.GetSoftwareBitmapAsync(
-        [Windows.Graphics.Imaging.BitmapPixelFormat]::Bgra8,
-        [Windows.Graphics.Imaging.BitmapAlphaMode]::Ignore,
-        $transform,
-        [Windows.Graphics.Imaging.ExifOrientationMode]::IgnoreExifOrientation,
-        [Windows.Graphics.Imaging.ColorManagementMode]::DoNotColorManage
-    )) ([Windows.Graphics.Imaging.SoftwareBitmap])
-    $result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
-    $lines = @()
-    foreach ($line in $result.Lines) {
-        $words = @()
-        foreach ($word in $line.Words) {
-            $rect = $word.BoundingRect
-            $words += [pscustomobject]@{
-                t = $word.Text
-                x = [double]$rect.X
-                y = [double]$rect.Y
-                w = [double]$rect.Width
-                h = [double]$rect.Height
-            }
-        }
-        $lines += [pscustomobject]@{ text = $line.Text; words = @($words) }
-    }
-    ConvertTo-Json -InputObject ([pscustomobject]@{
-        width = [double]$transform.ScaledWidth
-        height = [double]$transform.ScaledHeight
-        lines = @($lines)
-    }) -Compress -Depth 6
-} catch {
-    [Console]::Error.WriteLine($_.Exception.Message)
-    exit 1
-} finally {
-    if ($null -ne $bitmap) { $bitmap.Dispose() }
-    if ($null -ne $stream) { $stream.Dispose() }
-}
-'''
-        env["PERSONAL_TOOLBOX_OCR_IMAGE"] = image_path
-        powershell = os.path.join(os.environ["SystemRoot"], "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
-        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
-        return [powershell, "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], env
-    if platform.system() == "Darwin":
-        script = r'''
-ObjC.import('Vision');
-ObjC.import('Foundation');
-function run(argv) {
-    var request = $.VNRecognizeTextRequest.alloc.init;
-    request.recognitionLevel = $.VNRequestTextRecognitionLevelAccurate;
-    request.usesLanguageCorrection = true;
-    var error = Ref();
-    var supported = ObjC.deepUnwrap($.VNRecognizeTextRequest.supportedRecognitionLanguagesForRecognitionLevelRevisionError(
-        request.recognitionLevel, request.revision, error));
-    request.recognitionLanguages = supported.filter(function(language) {
-        return language === 'zh-Hans' || language === 'en-US';
-    });
-    var handler = $.VNImageRequestHandler.alloc.initWithURLOptions(
-        $.NSURL.fileURLWithPath(argv[0]), $.NSDictionary.dictionary);
-    if (!handler.performRequestsError([request], error)) {
-        throw new Error(ObjC.unwrap(error[0].localizedDescription));
-    }
-    var lines = [];
-    var results = request.results;
-    for (var index = 0; index < results.count; index++) {
-        var observation = results.objectAtIndex(index);
-        var candidate = observation.topCandidates(1).firstObject;
-        var box = observation.boundingBox;
-        var x = box.origin.x;
-        var y = box.origin.y;
-        var w = box.size.width;
-        var h = box.size.height;
-        lines.push({
-            text: ObjC.unwrap(candidate.string),
-            words: [{ t: ObjC.unwrap(candidate.string), x: x, y: 1 - y - h, w: w, h: h }]
-        });
-    }
-    return JSON.stringify({ width: 1, height: 1, lines: lines });
-}
-'''
-        return ["/usr/bin/osascript", "-l", "JavaScript", "-e", script, image_path], env
-    raise RuntimeError("文字识别需要 Windows 10 及以上或 macOS 10.15 及以上的系统 OCR 引擎。")
-
-
-def join_ocr_spans(spans, line_text=None):
-    """拼接同一行的文字片段。
-
-    有整行原文时按词框在原文中的位置切片，能保留英文词间空格；否则按字框间距估算。
-    """
-    if not spans:
-        return ""
-    if line_text and all("start" in span and "end" in span for span in spans):
-        return line_text[spans[0]["start"]:spans[-1]["end"]].strip()
-    text = ""
-    previous = None
-    for span in spans:
-        value = span["t"]
-        if not text:
-            text = value
-        elif previous is not None and span["x"] - (previous["x"] + previous["w"]) > max(
-                2.0, 0.3 * min(previous["h"], span["h"])):
-            text += " " + value
-        else:
-            text += value
-        previous = span
-    return text
-
-
-def normalize_ocr_layout(layout):
-    """把系统 OCR 的 JSON 整理成统一结构：{width, height, lines:[[{t,x,y,w,h}]]}。"""
-    if not isinstance(layout, dict):
-        raise ValueError("系统 OCR 返回的内容不完整。")
-    try:
-        width = float(layout.get("width") or 0)
-        height = float(layout.get("height") or 0)
-    except (TypeError, ValueError):
-        raise ValueError("系统 OCR 返回的图片尺寸无效。")
-    if width <= 0 or height <= 0:
-        raise ValueError("系统 OCR 返回的图片尺寸无效。")
-    lines = []
-    for line in layout.get("lines") or []:
-        if not isinstance(line, dict):
-            continue
-        words = line.get("words")
-        if isinstance(words, dict):
-            words = [words]
-        spans = []
-        for word in words or []:
-            if not isinstance(word, dict):
-                continue
-            text = str(word.get("t") or "")
-            try:
-                x, y = float(word.get("x")), float(word.get("y"))
-                w, h = float(word.get("w")), float(word.get("h"))
-            except (TypeError, ValueError):
-                continue
-            if text and w > 0 and h > 0:
-                spans.append({"t": text, "x": x, "y": y, "w": w, "h": h})
-        if spans:
-            lines.append(spans)
-    return {"width": width, "height": height, "lines": lines}
-
-
-def execute_ocr_layout(image, cancelled, register_process):
-    """调用系统 OCR，返回 (layout, error)；失败时 layout 为 None。"""
-    try:
-        with tempfile.TemporaryDirectory(prefix="toolbox_ocr_") as directory:
-            image_path = os.path.join(directory, "selection.png")
-            if not image.save(image_path, "PNG"):
-                raise RuntimeError("无法写入识别图片，请检查系统临时目录的写入权限。")
-            if cancelled.is_set():
-                return None, ""
-            command, env = screenshot_ocr_layout_command(image_path)
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       env=env, **win_no_console())
-            register_process(process)
-            if cancelled.is_set():
-                process.kill()
-            try:
-                stdout, stderr = process.communicate(timeout=45)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.communicate()
-                raise RuntimeError("识别超过 45 秒，请缩小识别范围后重试。")
-            if cancelled.is_set():
-                return None, ""
-            if process.returncode:
-                raise RuntimeError(stderr.decode("utf-8", errors="replace").strip()[:200] or "系统 OCR 识别失败。")
-            return normalize_ocr_layout(json.loads(stdout.decode("utf-8-sig"))), ""
-    except (OSError, RuntimeError, ValueError) as exc:
-        return None, str(exc)
-    finally:
-        register_process(None)
-
-
-RAPID_OCR_MAX_SIDE = 2560  # 整屏识别时保留足够分辨率，兼顾小字准确率与耗时
-_rapidocr_engine = None
-_rapidocr_engine_lock = threading.Lock()
-_rapidocr_run_lock = threading.Lock()
-
-
-def rapidocr_available():
-    """本地 RapidOCR 是否可用（安装包内置或已按需下载运行时）。"""
-    try:
-        import importlib.util
-        ocr_runtime_site()
-        return (importlib.util.find_spec("rapidocr") is not None
-                and importlib.util.find_spec("onnxruntime") is not None)
-    except (ImportError, ValueError):
-        return False
-
-
-def rapidocr_version():
-    try:
-        import importlib.metadata
-        return importlib.metadata.version("rapidocr")
-    except Exception:
-        return ""
-
-
-# 本地 OCR 运行时不随安装包分发（约 100 MB），首次使用时下载到用户目录，
-# 这样基础安装包可以保持在几十 MB，且不用的用户完全不用承担体积。
-OCR_RUNTIME_FOLDER = "ocr-runtime"
-_ocr_runtime_site_cache = None
-_ocr_runtime_site_checked = False
-_ocr_runtime_prompted = False
-_ocr_runtime_migrated = False
-
-
-def _legacy_ocr_runtime_root():
-    """旧版存放位置（Windows: LOCALAPPDATA，macOS: Application Support），仅用于迁移。"""
-    if platform.system() == "Darwin":
-        base = os.path.expanduser("~/Library/Application Support")
-    elif os.name == "nt":
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    else:
-        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
-    return os.path.join(base, "PersonalToolbox", OCR_RUNTIME_FOLDER)
-
-
-def _migrate_legacy_ocr_runtime(root):
-    """把旧位置的运行时整目录搬到 ~/.personal_toolbox/ocr-runtime，省掉重新下载。"""
-    global _ocr_runtime_migrated
-    if _ocr_runtime_migrated:
-        return
-    _ocr_runtime_migrated = True
-    legacy = _legacy_ocr_runtime_root()
-    if os.path.normcase(legacy) == os.path.normcase(root):
-        return
-    try:
-        if not os.path.isdir(legacy):
-            return
-        if os.path.isdir(root) and os.listdir(root):
-            return                            # 新位置已经有内容，不覆盖
-        os.makedirs(os.path.dirname(root), exist_ok=True)
-        if os.path.isdir(root):
-            try:
-                os.rmdir(root)                # 空目录先删掉，避免 rename 目标已存在
-            except OSError:
-                return
-        try:
-            os.replace(legacy, root)          # 同一分区时是秒级的目录改名
-        except OSError:
-            shutil.move(legacy, root)         # 跨分区退化为复制后删除
-        # 旧目录空了就顺手清掉，避免 LOCALAPPDATA 下留下空壳
-        parent = os.path.dirname(legacy)
-        try:
-            if os.path.isdir(parent) and not os.listdir(parent):
-                os.rmdir(parent)
-        except OSError:
-            pass
-    except OSError:
-        pass
-
-
-def ocr_runtime_root():
-    """离线 OCR 运行时的本地目录，与配置缓存同放 ~/.personal_toolbox。"""
-    root = os.path.join(cache_root(), OCR_RUNTIME_FOLDER)
-    _migrate_legacy_ocr_runtime(root)
-    return root
-
-
-def _ocr_runtime_abi_mismatch(path):
-    """运行时目录里编译扩展的 ABI 标签，与当前解释器不一致的返回列表（一致则空）。
-
-    压缩包在发布端按某个 Python 版本编译，扩展模块（.pyd/.so）与解释器强绑定；
-    runtime.json 里的 python 字段是本地解压时写的，不能用来判断兼容性。
-    """
-    current = "cp%d%d" % sys.version_info[:2]
-    found = set()
-    for base, _dirs, files in os.walk(path):
-        for name in files:
-            if not name.endswith((".pyd", ".so")):
-                continue
-            for tag in re.findall(r"cp3\d\d", name):
-                found.add(tag)
-    return sorted(tag for tag in found if tag != current)
-
-
-_ocr_runtime_broken = None  # (目录, 不匹配的标签) —— 已下载但与当前解释器不符
-
-
-def ocr_runtime_abi_issue():
-    """已下载的运行库与当前解释器 ABI 不符时返回给用户看的说明，否则空串。"""
-    ocr_runtime_site()
-    if not _ocr_runtime_broken:
-        return ""
-    tags = " / ".join(_ocr_runtime_broken[1])
-    return ("已下载的离线引擎与当前 Python %d.%d 不匹配（压缩包里是 %s 构建的），"
-            "无法加载。请在设置里重新下载（发布端已下载版本若仍不匹配，请改用系统 OCR）。"
-            % (sys.version_info[0], sys.version_info[1], tags))
-
-
-def ocr_runtime_site():
-    """已下载且完整的运行时目录；命中时挂到 sys.path 前部，返回目录路径。"""
-    global _ocr_runtime_site_cache, _ocr_runtime_site_checked, _ocr_runtime_broken
-    if _ocr_runtime_site_checked:
-        return _ocr_runtime_site_cache
-    _ocr_runtime_site_checked = True
-    root = ocr_runtime_root()
-    try:
-        names = sorted(os.listdir(root), reverse=True)
-    except OSError:
-        return None
-    current = "%d.%d" % sys.version_info[:2]
-    for name in names:
-        path = os.path.join(root, name)
-        try:
-            with open(os.path.join(path, "runtime.json"), encoding="utf-8") as file:
-                info = json.load(file)
-        except (OSError, ValueError):
-            continue
-        # 扩展模块与解释器版本强绑定，版本不符时宁可不加载
-        if not isinstance(info, dict) or info.get("python") != current:
-            continue
-        if not all(os.path.isdir(os.path.join(path, package))
-                   for package in ("rapidocr", "onnxruntime")):
-            continue
-        mismatch = _ocr_runtime_abi_mismatch(path)
-        if mismatch:
-            # 标记（本地写的）与实际扩展 ABI 对不上，别挂到 sys.path 上
-            _ocr_runtime_broken = (path, mismatch)
-            continue
-        if path not in sys.path:
-            sys.path.insert(0, path)
-        _ocr_runtime_site_cache = path
-        return path
-    return None
-
-
-def reset_ocr_runtime_cache():
-    global _ocr_runtime_site_cache, _ocr_runtime_site_checked, _ocr_runtime_broken
-    _ocr_runtime_site_cache = None
-    _ocr_runtime_site_checked = False
-    _ocr_runtime_broken = None
-
-
-def fetch_ocr_runtime_info():
-    """从 version.json 取当前平台的离线 OCR 运行时下载信息。"""
-    validate_update_url(UPDATE_CHECK_URL)
-    request = urllib.request.Request(UPDATE_CHECK_URL,
-                                     headers={"User-Agent": "Toolbox/" + APP_VERSION})
-    opener = urllib.request.build_opener(UpdateRedirectHandler())
-    with opener.open(request, timeout=10) as response:
-        content = response.read(1024 * 1024 + 1)
-    if len(content) > 1024 * 1024:
-        raise ValueError("更新信息超出大小限制。")
-    envelope = json.loads(content.decode("utf-8"))
-    if (not isinstance(envelope, dict) or envelope.get("encoding") != "base64"
-            or not isinstance(envelope.get("content"), str)):
-        raise ValueError("更新服务器返回的文件信息无效。")
-    data = json.loads(base64.b64decode(envelope["content"], validate=True).decode("utf-8"))
-    runtime = data.get("ocr_runtime") if isinstance(data, dict) else None
-    if not isinstance(runtime, dict):
-        raise ValueError("当前版本还没有提供离线识别引擎。")
-    base_key = "macos" if platform.system() == "Darwin" else "windows"
-    # 发布端按 Python 版本各产一份运行库（扩展模块与解释器 ABI 强绑定），
-    # 先找「平台_主_次」这一份，没有再用平台默认那份。
-    keys = ["%s_%d_%d" % (base_key, sys.version_info[0], sys.version_info[1]), base_key]
-    item = None
-    for key in keys:
-        candidate = runtime.get(key)
-        if isinstance(candidate, dict) and isinstance(candidate.get("url"), str):
-            item = candidate
-            break
-    if item is None:
-        raise ValueError("没有找到当前平台的下载地址。")
-    if not getattr(sys, "frozen", False) and keys[0] not in runtime:
-        # 源码/pip 运行时的解释器版本常常不是打包机那一版，默认条目对不上 ABI；
-        # 与其下 100 MB 再报错，不如直接告诉用户装到自己的环境里。
-        raise ValueError(
-            "发布端还没有提供 Python %d.%d 版本的离线运行库。\n"
-            "源码运行可以直接在当前环境执行 pip install rapidocr onnxruntime，"
-            "或在设置里改用系统 OCR。" % (sys.version_info[0], sys.version_info[1]))
-    validate_update_url(item["url"])
-    try:
-        size = int(item.get("size") or 0)
-    except (TypeError, ValueError):
-        size = 0
-    return {"url": item["url"], "sha256": str(item.get("sha256") or "").lower(),
-            "size": size, "version": str(runtime.get("version") or data.get("version") or "")}
-
-
-def extract_runtime_zip(archive, target):
-    """把运行时压缩包解到 target；跳过越界路径与 macOS 的资源分支目录。"""
-    with zipfile.ZipFile(archive) as bundle:
-        root = os.path.realpath(target)
-        for info in bundle.infolist():
-            name = info.filename.replace("\\", "/").lstrip("/")
-            if not name or name.startswith("__MACOSX/"):
-                continue
-            destination = os.path.realpath(os.path.join(root, name))
-            if destination != root and not destination.startswith(root + os.sep):
-                continue
-            bundle.extract(info, target)
-
-
 class OcrRuntimeDownloadWorker(QThread):
     """下载并解压离线 OCR 运行时（在后台线程里做，界面走进度条）。"""
 
@@ -3358,12 +2940,7 @@ class OcrRuntimeDownloadWorker(QThread):
                 raise ValueError("下载不完整，请重试。")
 
 
-def file_sha256(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 256), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+_ocr_runtime_prompted = False  # 本次运行里是否已向用户弹过下载询问
 
 
 def ensure_ocr_runtime(parent=None, force=False):
@@ -3456,21 +3033,6 @@ def ensure_ocr_runtime(parent=None, force=False):
     return True
 
 
-def _get_rapidocr_engine():
-    """懒加载本地引擎：首次初始化约 1～2 秒，之后复用。"""
-    global _rapidocr_engine
-    if _rapidocr_engine is not None:
-        return _rapidocr_engine
-    with _rapidocr_engine_lock:
-        if _rapidocr_engine is None:
-            from rapidocr import RapidOCR
-            _rapidocr_engine = RapidOCR(params={
-                "Global.log_level": "warning",
-                "Global.max_side_len": RAPID_OCR_MAX_SIDE,
-            })
-    return _rapidocr_engine
-
-
 def warm_rapidocr():
     """后台预热引擎，避免第一次识别多等初始化时间。"""
     write_startup_log("warm_rapidocr 线程开始")
@@ -3480,189 +3042,6 @@ def warm_rapidocr():
     except Exception as exc:
         # 预热失败不影响使用（识别时会重新尝试并回退系统 OCR），但写进日志便于排查
         write_startup_log("本地 OCR 预热失败：%s: %s" % (type(exc).__name__, exc))
-
-
-def rapidocr_layout(image_path, cancelled=None):
-    """用本地 RapidOCR 识别图片，返回与系统 OCR 相同的版面结构。
-
-    坐标基于原图像素尺寸；优先使用逐词/逐字框，便于在截图预览上精确拖选。
-    """
-    engine = _get_rapidocr_engine()
-    if cancelled is not None and cancelled.is_set():
-        raise RuntimeError("已取消")
-    with _rapidocr_run_lock:
-        result = engine(image_path, return_word_box=True)
-    if cancelled is not None and cancelled.is_set():
-        raise RuntimeError("已取消")
-    with Image.open(image_path) as loaded:
-        width, height = loaded.size
-    texts = list(result.txts or ())
-    word_lines = list(result.word_results or ())
-    line_boxes = list(result.boxes) if result.boxes is not None else []
-    lines = []
-    texts_out = []
-    for index, text in enumerate(texts):
-        spans = []
-        cursor = 0
-        for word in word_lines[index] if index < len(word_lines) else ():
-            value, box = str(word[0]), word[2]
-            xs = [float(point[0]) for point in box]
-            ys = [float(point[1]) for point in box]
-            if not value.strip() or max(xs) <= min(xs) or max(ys) <= min(ys):
-                continue
-            # 记录词框在整行原文中的位置，复制时可保留英文词间空格
-            found = text.find(value, cursor)
-            if found < 0:
-                found = cursor
-            spans.append({"t": value, "x": min(xs), "y": min(ys),
-                          "w": max(xs) - min(xs), "h": max(ys) - min(ys),
-                          "start": found, "end": found + len(value)})
-            cursor = found + len(value)
-        if not spans and text and index < len(line_boxes):
-            box = line_boxes[index]
-            xs = [float(point[0]) for point in box]
-            ys = [float(point[1]) for point in box]
-            spans.append({"t": text, "x": min(xs), "y": min(ys),
-                          "w": max(xs) - min(xs), "h": max(ys) - min(ys),
-                          "start": 0, "end": len(text)})
-        if spans:
-            lines.append(spans)
-            texts_out.append(text)
-    return {"width": float(width), "height": float(height), "lines": lines, "texts": texts_out}
-
-
-def execute_rapidocr_layout(image, cancelled):
-    """把 QImage 交给本地 RapidOCR，返回 (layout, error)。"""
-    try:
-        with tempfile.TemporaryDirectory(prefix="toolbox_rapidocr_") as directory:
-            image_path = os.path.join(directory, "screen.png")
-            if not image.save(image_path, "PNG"):
-                raise RuntimeError("无法写入识别图片，请检查系统临时目录的写入权限。")
-            if cancelled.is_set():
-                return None, ""
-            return rapidocr_layout(image_path, cancelled), ""
-    except Exception as exc:  # 模型/运行库异常统一回退系统 OCR
-        return None, "本地 RapidOCR 识别失败：%s" % str(exc)[:200]
-
-
-LLM_OCR_PROMPT = """请识别这张图片中的所有可见文字，按阅读顺序逐行输出。
-只返回 JSON，不要解释，不要 Markdown 代码块，格式如下：
-{"lines": [{"text": "这一行的完整文字", "box": [x1, y1, x2, y2]}]}
-其中 box 是这行文字的外接矩形，使用相对整张图片宽高的 0 到 1000 的归一化坐标。
-尽量保留原文的标点与大小写；没有文字时返回 {"lines": []}。"""
-
-
-def ocr_llm_ready(settings):
-    return bool(settings.get("base_url") and settings.get("api_key")
-                and settings.get("model"))
-
-
-def llm_ocr_layout(image, settings, timeout=90):
-    """调用 OpenAI 兼容的多模态接口识别文字，返回与系统 OCR 相同的版面结构。"""
-    if image.width() > 2048 or image.height() > 2048:
-        image = image.scaled(2048, 2048, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-    with tempfile.TemporaryDirectory(prefix="toolbox_llm_ocr_") as directory:
-        png_path = os.path.join(directory, "screen.png")
-        if not image.save(png_path, "PNG"):
-            raise RuntimeError("无法写入识别图片。")
-        with open(png_path, "rb") as f:
-            encoded = base64.b64encode(f.read()).decode("ascii")
-    url = settings["base_url"].strip().rstrip("/")
-    if not url.endswith("/chat/completions"):
-        url += "/chat/completions"
-    payload = {
-        "model": settings["model"],
-        "temperature": 0,
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": LLM_OCR_PROMPT},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + encoded}},
-        ]}],
-    }
-    request = urllib.request.Request(
-        url, data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json",
-                 "Authorization": "Bearer " + settings["api_key"]},
-        method="POST")
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        data = json.loads(response.read().decode("utf-8"))
-    content = data["choices"][0]["message"]["content"]
-    if isinstance(content, list):
-        content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
-    text = str(content or "").strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end <= start:
-        raise ValueError("模型没有按约定返回 JSON。")
-    try:
-        result = json.loads(text[start:end + 1])
-    except ValueError:
-        raise ValueError("模型返回的 JSON 无法解析。")
-    lines = []
-    for line in (result.get("lines") if isinstance(result, dict) else None) or []:
-        if not isinstance(line, dict):
-            continue
-        value = str(line.get("text") or "").strip()
-        box = line.get("box")
-        if not value or not isinstance(box, (list, tuple)) or len(box) != 4:
-            continue
-        try:
-            x1, y1, x2, y2 = [float(item) for item in box]
-        except (TypeError, ValueError):
-            continue
-        left, right = sorted((x1, x2))
-        top, bottom = sorted((y1, y2))
-        if right - left <= 0 or bottom - top <= 0:
-            continue
-        lines.append([{"t": value, "x": left, "y": top, "w": right - left, "h": bottom - top}])
-    if not lines:
-        raise ValueError("模型没有返回可用的文字坐标。")
-    return {"width": 1000.0, "height": 1000.0, "lines": lines}
-
-
-def ocr_mode_hint(mode, settings=None):
-    """选中的引擎缺少前置条件时的操作指引（返回空串表示可用）。
-
-    识别过程只按设置执行，绝不自动下载运行库、也不自动改配置，缺东西就交给用户回设置里处理。
-    """
-    settings = settings if settings is not None else load_ocr_settings()
-    if mode == "rapidocr" and not rapidocr_available():
-        issue = ocr_runtime_abi_issue()
-        if issue:
-            return issue + "（识别过程不会自动下载）"
-        return ("本地离线引擎尚未下载，无法识别。请打开「设置 → 文字识别」点「下载引擎」下载后再试"
-                "（识别过程不会自动下载）。")
-    if mode == "llm" and not ocr_llm_ready(settings):
-        return ("大模型识别尚未配置完整，无法识别。请打开「设置 → 文字识别」填写接口地址、"
-                "API Key 与模型后保存。")
-    return ""
-
-
-def run_ocr(image, cancelled, register_process):
-    """按设置中选定的识别引擎执行，不降级、不下载、不改配置。"""
-    settings = load_ocr_settings()
-    mode = settings.get("mode") or "system"
-    hint = ocr_mode_hint(mode, settings)
-    if hint:
-        return None, OCR_ENGINE_LABELS.get(mode, mode), hint
-    if mode == "llm":
-        label = "大模型 · " + settings["model"]
-        try:
-            return llm_ocr_layout(image, settings), label, ""
-        except Exception as exc:  # 网络、鉴权、返回格式异常都如实报给用户
-            if cancelled.is_set():
-                return None, "", ""
-            return None, label, "大模型识别失败：%s" % str(exc)[:200]
-    if mode == "rapidocr":
-        layout, error = execute_rapidocr_layout(image, cancelled)
-        if layout is not None:
-            return layout, "本地 RapidOCR", ""
-        if cancelled.is_set():
-            return None, "", ""
-        return None, "本地 RapidOCR", error or "本地 RapidOCR 识别失败，请重试。"
-    layout, error = execute_ocr_layout(image, cancelled, register_process)
-    return layout, "系统 OCR", error
 
 
 class ScreenshotOcrWorker(QThread):
@@ -5838,7 +5217,7 @@ class CronWindow(QMainWindow):
             self.status_label.setStyleSheet("color: #999999;")
             return
         try:
-            plan = self.compute(expr, self.count_spin.value())
+            plan = cronkit.plan(expr, self.count_spin.value())
         except ValueError as e:
             self.output_text.setPlainText("")
             self.set_status(f"表达式错误: {e}", ok=False)
@@ -5857,112 +5236,6 @@ class CronWindow(QMainWindow):
         else:
             head = f"{expr} —  " + head
         self.set_status(head, ok=True)
-
-    # ---- cron parsing ----
-    @staticmethod
-    def _parse_field(token, lo, hi, is_dow=False):
-        token = token.strip()
-        if token == "":
-            raise ValueError("存在空的字段")
-        values = set()
-        for part in token.split(","):
-            step = 1
-            body = part
-            if "/" in part:
-                body, step_s = part.split("/", 1)
-                try:
-                    step = int(step_s)
-                except ValueError:
-                    raise ValueError(f"步长无效: {part}")
-                if step <= 0:
-                    raise ValueError(f"步长必须为正: {part}")
-            body = body.strip()
-            if body in ("*", "?"):
-                start, end = lo, hi
-            elif "-" in body:
-                a, b = body.split("-", 1)
-                start, end = int(a), int(b)
-            else:
-                v = int(body)
-                if "/" in part:
-                    start, end = v, hi
-                else:
-                    start = end = v
-            if start < lo or end > hi or start > end:
-                raise ValueError(f"字段超出范围 [{lo}-{hi}]: {part}")
-            for v in range(start, end + 1, step):
-                if is_dow and v == 7:
-                    v = 0
-                values.add(v)
-        return values
-
-    def compute(self, expr, count):
-        fields = expr.split()
-        if len(fields) == 5:
-            has_seconds = False
-            m_expr, h_expr, dom_expr, mon_expr, dow_expr = fields
-            sec_expr = "0"
-        elif len(fields) == 6:
-            has_seconds = True
-            sec_expr, m_expr, h_expr, dom_expr, mon_expr, dow_expr = fields
-        else:
-            raise ValueError("需要 5 个字段(分 时 日 月 周) 或 6 个字段(秒 分 时 日 月 周)")
-
-        minutes = self._parse_field(m_expr, 0, 59)
-        hours = self._parse_field(h_expr, 0, 23)
-        doms = self._parse_field(dom_expr, 1, 31)
-        mons = self._parse_field(mon_expr, 1, 12)
-        dows = self._parse_field(dow_expr, 0, 7, is_dow=True)
-        secs = self._parse_field(sec_expr, 0, 59) if has_seconds else {0}
-
-        dom_restricted = dom_expr.strip() not in ("*", "?")
-        dow_restricted = dow_expr.strip() not in ("*", "?")
-
-        def day_ok(dt):
-            d = dt.day
-            w = dt.isoweekday() % 7
-            if dom_restricted and dow_restricted:
-                return d in doms or w in dows
-            if dom_restricted:
-                return d in doms
-            if dow_restricted:
-                return w in dows
-            return True
-
-        now = datetime.datetime.now()
-        if has_seconds:
-            cur = now.replace(microsecond=0) + datetime.timedelta(seconds=1)
-            step = datetime.timedelta(seconds=1)
-        else:
-            cur = now.replace(second=0, microsecond=0) + datetime.timedelta(minutes=1)
-            step = datetime.timedelta(minutes=1)
-
-        end = now + datetime.timedelta(days=366 * 5)
-        results = []
-        while cur <= end and len(results) < count:
-            if cur.month not in mons:
-                # jump to first day of next month
-                y = cur.year + (1 if cur.month == 12 else 0)
-                mo = 1 if cur.month == 12 else cur.month + 1
-                cur = datetime.datetime(y, mo, 1, 0, 0, 0)
-                continue
-            if not day_ok(cur):
-                cur = datetime.datetime(cur.year, cur.month, cur.day) + datetime.timedelta(days=1)
-                continue
-            if cur.hour not in hours:
-                cur = datetime.datetime(cur.year, cur.month, cur.day, cur.hour) + datetime.timedelta(hours=1)
-                continue
-            if cur.minute not in minutes:
-                cur = cur.replace(second=0) + datetime.timedelta(minutes=1)
-                continue
-            if cur.second not in secs:
-                cur = cur + step
-                continue
-            results.append(cur)
-            cur = cur + step
-        if len(results) < count:
-            raise ValueError(f"在 5 年内不足 {count} 次执行")
-        return results
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
@@ -7121,78 +6394,6 @@ class QrCodeWindow(QMainWindow):
             self.close()
 
 
-# Code 128 条形码，自实现（不引入条码库）。表按 symbol 值索引：0..105 是六位
-# “条-空”宽度（每位和=11 模块），106 是结束符（七位，和=13）。错位不会报错，
-# 只会生成扫不出来的码，改动后需按值校验。
-_CODE128_PATTERNS = [
-    "212222", "222122", "222221", "121223", "121322", "131222", "122213", "122312",
-    "132212", "221213", "221312", "231212", "112232", "122132", "122231", "113222",
-    "123122", "123221", "223211", "221132", "221231", "213212", "223112", "312131",
-    "311222", "321122", "321221", "312212", "322112", "322211", "212123", "212321",
-    "232121", "111323", "131123", "131321", "112313", "132113", "132311", "211313",
-    "231113", "231311", "112133", "112331", "132131", "113123", "113321", "133121",
-    "313121", "211331", "231131", "213113", "213311", "213131", "311123", "311321",
-    "331121", "312113", "312311", "332111", "314111", "221411", "431111", "111224",
-    "111422", "121124", "121421", "141122", "141221", "112214", "112412", "122114",
-    "122411", "142112", "142211", "241211", "221114", "413111", "241112", "134111",
-    "111242", "121142", "121241", "114212", "124112", "124211", "411212", "421112",
-    "421211", "212141", "214121", "412121", "111143", "111341", "131141", "114113",
-    "114311", "411113", "411311", "113141", "114131", "311141", "411131", "211412",
-    "211214", "211232",
-]
-_CODE128_STOP = "2331112"
-_CODE128_START_B = 104   # Code Set B：可打印 ASCII 32..126
-_CODE128_QUIET = 10       # 左右静默区（模块数）
-
-
-def _code128_values(text):
-    """按 Code Set B 把文本编码为 symbol 值序列（含起始符与校验位）。"""
-    values = [_CODE128_START_B]
-    for ch in text:
-        o = ord(ch)
-        if o < 32 or o > 126:
-            raise ValueError(f"仅支持可打印 ASCII（空格 至 ~），不支持中文等字符：{ch!r}")
-        values.append(o - 32)
-    checksum = values[0] + sum(i * v for i, v in enumerate(values[1:], 1))
-    values.append(checksum % 103)
-    return values
-
-
-def _code128_widths(text):
-    """返回交替的条/空宽度序列（首个为条），供逐段绘制。"""
-    widths = []
-    for v in _code128_values(text):
-        widths.extend(int(d) for d in _CODE128_PATTERNS[v])
-    widths.extend(int(d) for d in _CODE128_STOP)
-    return widths
-
-
-def render_code128(text, module=3, height=130):
-    """用 QPainter 绘制 Code 128 位图（含底部可读文字），返回 QPixmap 原始分辨率。"""
-    widths = _code128_widths(text)
-    total_modules = sum(widths) + 2 * _CODE128_QUIET
-    pm_w = total_modules * module
-    img = QImage(pm_w, height + 24, QImage.Format_RGB32)
-    painter = QPainter(img)
-    painter.fillRect(0, 0, pm_w, height + 24, Qt.white)
-    painter.setPen(Qt.NoPen)
-    bar = QColor(0, 0, 0)
-    x = _CODE128_QUIET * module
-    black = True
-    for w in widths:
-        if black:
-            painter.fillRect(QRect(x, 0, w * module, height), bar)
-        x += w * module
-        black = not black
-    font = QFont("Menlo")
-    font.setPixelSize(16)
-    painter.setFont(font)
-    painter.setPen(QColor(0, 0, 0))
-    painter.drawText(QRect(0, height, pm_w, 24), Qt.AlignCenter, text)
-    painter.end()
-    return QPixmap.fromImage(img)
-
-
 class BarcodeWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -8262,124 +7463,6 @@ class JsonYamlWindow(QMainWindow):
             self.close()
 
 
-POSIX_ENV_FILE = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "env.sh")
-POSIX_RC_MARKER = "# personal_toolbox env"
-SHELL_RC_FILES = (".zshrc", ".bashrc")
-WIN_ENV_SUBKEY = "Environment"
-ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-
-def user_env_location():
-    return r"HKCU\Environment" if os.name == "nt" else POSIX_ENV_FILE
-
-
-def load_user_env():
-    return _win_load_env() if os.name == "nt" else _posix_load_env()
-
-
-def save_user_env(name, value):
-    if os.name == "nt":
-        _win_save_env(name, value)
-        _win_broadcast_env()
-    else:
-        items = _posix_load_env()
-        items[name] = value
-        _posix_write_env(items)
-    os.environ[name] = value
-
-
-def remove_user_env(name):
-    if os.name == "nt":
-        _win_remove_env(name)
-        _win_broadcast_env()
-    else:
-        items = _posix_load_env()
-        items.pop(name, None)
-        _posix_write_env(items)
-    os.environ.pop(name, None)
-
-
-def _win_load_env():
-    import winreg
-    items = {}
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WIN_ENV_SUBKEY) as key:
-            for i in range(winreg.QueryInfoKey(key)[1]):
-                name, value, _type = winreg.EnumValue(key, i)
-                items[name] = value
-    except OSError:
-        pass
-    return items
-
-
-def _win_save_env(name, value):
-    import winreg
-    # %VAR% references only survive as REG_EXPAND_SZ; REG_SZ would freeze them literally.
-    vtype = winreg.REG_EXPAND_SZ if "%" in value else winreg.REG_SZ
-    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, WIN_ENV_SUBKEY) as key:
-        winreg.SetValueEx(key, name, 0, vtype, value)
-
-
-def _win_remove_env(name):
-    import winreg
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WIN_ENV_SUBKEY, 0, winreg.KEY_SET_VALUE) as key:
-        winreg.DeleteValue(key, name)
-
-
-def _win_broadcast_env():
-    """Tell running shells/Explorer to reload the environment; best effort."""
-    _win_broadcast_setting("Environment")
-
-
-def _posix_load_env():
-    items = {}
-    try:
-        with open(POSIX_ENV_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line.startswith("export "):
-                    continue
-                name, sep, raw = line[len("export "):].partition("=")
-                if not sep or not ENV_NAME_RE.match(name):
-                    continue
-                try:
-                    # shlex does not treat "=" as a separator, so unquote the value alone.
-                    parts = shlex.split(raw)
-                except ValueError:
-                    continue
-                items[name] = parts[0] if parts else ""
-    except OSError:
-        pass
-    return items
-
-
-def _posix_write_env(items):
-    try:
-        os.makedirs(os.path.dirname(POSIX_ENV_FILE), exist_ok=True)
-        with open(POSIX_ENV_FILE, "w", encoding="utf-8") as f:
-            for name in sorted(items):
-                f.write("export %s=%s\n" % (name, shlex.quote(items[name])))
-    except OSError as e:
-        raise RuntimeError("无法写入 %s: %s" % (POSIX_ENV_FILE, e))
-    _posix_ensure_rc()
-
-
-def _posix_ensure_rc():
-    """Source the env file from interactive shells, once per rc file."""
-    for rc in SHELL_RC_FILES:
-        path = os.path.join(os.path.expanduser("~"), rc)
-        try:
-            existing = ""
-            if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    existing = f.read()
-            if POSIX_RC_MARKER in existing:
-                continue
-            with open(path, "a", encoding="utf-8") as f:
-                f.write("\n%s\n. %s\n" % (POSIX_RC_MARKER, shlex.quote(POSIX_ENV_FILE)))
-        except OSError:
-            continue
-
 
 class _ProcessEnvPage(QWidget):
     """当前进程看到的环境变量快照，只读。"""
@@ -8637,80 +7720,6 @@ class _UserEnvPage(QWidget):
     def _fail(self, title, error):
         self._set_status("%s: %s" % (title, error), "#D93025")
         QMessageBox.warning(self, title, str(error), QMessageBox.Ok)
-
-
-def git_global_path():
-    override = os.environ.get("GIT_CONFIG_GLOBAL")
-    if override:
-        return override
-    return os.path.join(os.path.expanduser("~"), ".gitconfig")
-
-
-def _refresh_path_from_system():
-    """Windows 上从注册表重新读取 PATH，识别新安装的工具（如 git）。"""
-    if os.name != "nt":
-        return
-    try:
-        import winreg
-        # 系统 PATH
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                           r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment") as key:
-            sys_path, _ = winreg.QueryValueEx(key, "Path")
-        # 用户 PATH
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
-            usr_path, _ = winreg.QueryValueEx(key, "Path")
-        # 合并并更新当前进程的环境变量
-        os.environ["PATH"] = sys_path + ";" + usr_path
-    except Exception:
-        pass
-
-
-def _run_git(args):
-    try:
-        return subprocess.run(["git", "config"] + args, capture_output=True,
-                              encoding="utf-8", errors="replace", **win_no_console())
-    except OSError:
-        raise RuntimeError("未找到 git 命令，请确认已安装 Git 并在 PATH 中")
-
-
-def _git_error(result):
-    return (result.stderr or "").strip() or "git config 执行失败"
-
-
-def git_global_list():
-    _refresh_path_from_system()
-    if shutil.which("git") is None:
-        raise RuntimeError("未找到 git 命令，请确认已安装 Git 并在 PATH 中")
-    # git exits 128 on a missing file and 1 on an empty one; neither is an error here.
-    if not os.path.exists(git_global_path()):
-        return []
-    result = _run_git(["--global", "--list"])
-    if result.returncode not in (0, 1):
-        raise RuntimeError(_git_error(result))
-    pairs = []
-    for line in (result.stdout or "").splitlines():
-        key, sep, value = line.partition("=")
-        if sep:
-            pairs.append((key, value))
-    return pairs
-
-
-def git_global_set(key, value):
-    _refresh_path_from_system()
-    result = _run_git(["--global", key, value])
-    if result.returncode != 0:
-        raise RuntimeError(_git_error(result))
-
-
-def git_global_unset(key):
-    _refresh_path_from_system()
-    # rc 1 = no entries left in the file, rc 5 = that key was not set. Both are no-ops.
-    result = _run_git(["--global", "--unset-all", key])
-    if result.returncode not in (0, 1, 5):
-        raise RuntimeError(_git_error(result))
-
-
-GIT_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]*(\.[A-Za-z0-9._-]+)*$")
 
 
 class _GitConfigPage(QWidget):
@@ -9863,199 +8872,6 @@ def reveal_in_folder(path):
         subprocess.Popen(["xdg-open", target])
 
 
-def npm_config_path():
-    return user_path(".npmrc")
-
-
-def pip_config_path():
-    return _app_config_dir("pip", "pip.ini" if platform.system() == "Windows" else "pip.conf")
-
-
-def go_env_path():
-    return _app_config_dir("go", "env")
-
-
-def docker_daemon_path():
-    return user_path(".docker", "daemon.json")
-
-
-def maven_settings_path():
-    return user_path(".m2", "settings.xml")
-
-
-MAVEN_NOTE = "<!-- 这一段由 系统工具箱 的「镜像源」标签维护 -->"
-MAVEN_OUR_ID = "toolbox-mirror"
-MAVEN_MIRROR_RE = re.compile(r"<mirror\b[^>]*>.*?</mirror>", re.S | re.I)
-MAVEN_OURS_RE = re.compile(
-    r"<mirror\b[^>]*>(?:(?!</mirror>).)*?<id>\s*" + MAVEN_OUR_ID + r"\s*</id>(?:(?!</mirror>).)*?</mirror>",
-    re.S | re.I)
-MAVEN_MIRROR_OF_RE = re.compile(r"<mirrorOf\b[^>]*>([^<]*)</mirrorOf>", re.I)
-MAVEN_URL_RE = re.compile(r"<url\b[^>]*>([^<]*)</url>", re.I)
-
-
-def _xml_escape(text):
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def maven_central_url():
-    text = _read_text(maven_settings_path())
-    if not text:
-        return None
-    for block in MAVEN_MIRROR_RE.finditer(text):
-        of = MAVEN_MIRROR_OF_RE.search(block.group(0))
-        if of and "central" in [p.strip().lower() for p in of.group(1).split(",")]:
-            url = MAVEN_URL_RE.search(block.group(0))
-            if url:
-                return url.group(1).strip()
-    return None
-
-
-def _maven_mirror_block(url, label):
-    return ('<mirror>\n      <id>%s</id>\n      <mirrorOf>central</mirrorOf>\n'
-            '      <name>%s</name>\n      <url>%s</url>\n    </mirror>'
-            % (MAVEN_OUR_ID, _xml_escape(label), _xml_escape(url)))
-
-
-def _maven_document(mirror):
-    return ('<?xml version="1.0" encoding="UTF-8"?>\n%s\n<settings>\n  <mirrors>\n    %s\n'
-            '  </mirrors>\n</settings>\n' % (MAVEN_NOTE, mirror))
-
-
-def maven_set_central(url, label):
-    """Only ever touch the mirror block we own, so a hand-written settings.xml survives."""
-    path = maven_settings_path()
-    text = _read_text(path)
-    mirror = _maven_mirror_block(url, label) if url else None
-    if text is None:
-        if url is None:
-            return
-        _write_text(path, _maven_document(mirror))
-        return
-    ours = MAVEN_OURS_RE.search(text)
-    if ours:
-        if url:
-            _write_text(path, text[:ours.start()] + mirror + text[ours.end():])
-            return
-        start = text.rfind("\n", 0, ours.start()) + 1
-        end = text.find("\n", ours.end())
-        end = len(text) if end < 0 else end + 1
-        _write_text(path, text[:start] + text[end:])
-        return
-    if MAVEN_MIRROR_RE.search(text):
-        raise RuntimeError("settings.xml 里已有别人写的 mirrors，工具不覆盖，请手动编辑：\n%s" % path)
-    if url is None:
-        return
-    lowered = text.lower()
-    if "<mirrors" in lowered:
-        close = lowered.find("</mirrors>", lowered.index("<mirrors"))
-        if close < 0:
-            raise RuntimeError("settings.xml 的 <mirrors> 没有闭合，请手动修正：%s" % path)
-        _write_text(path, text[:close].rstrip() + "\n    " + mirror + "\n  " + text[close:].lstrip())
-        return
-    if "<settings" not in lowered:
-        raise RuntimeError("settings.xml 缺少 <settings> 根节点，请手动修正：%s" % path)
-    close = lowered.rindex("</settings>")
-    _write_text(path, text[:close] + "  <mirrors>\n    %s\n  </mirrors>\n" % mirror + text[close:])
-
-
-def docker_read_mirror():
-    text = _read_text(docker_daemon_path())
-    if not text:
-        return None
-    data = json.loads(text)
-    mirrors = data.get("registry-mirrors") if isinstance(data, dict) else None
-    return mirrors[0] if isinstance(mirrors, list) and mirrors else None
-
-
-def docker_write_mirror(url):
-    path = docker_daemon_path()
-    text = _read_text(path)
-    data = {}
-    if text:
-        try:
-            data = json.loads(text)
-        except ValueError:
-            raise RuntimeError("daemon.json 不是合法 JSON，请手动修正：\n%s" % path)
-        if not isinstance(data, dict):
-            raise RuntimeError("daemon.json 顶层应为对象，请手动修正：\n%s" % path)
-        if url is None:
-            if "registry-mirrors" not in data:
-                return
-            data.pop("registry-mirrors")
-        else:
-            data["registry-mirrors"] = [url]
-        _write_text(path, json.dumps(data, indent=4, ensure_ascii=False))
-        return
-    if url is None:
-        return
-    _write_text(path, json.dumps({"registry-mirrors": [url]}, indent=4, ensure_ascii=False))
-
-
-class _MirrorTarget:
-    def __init__(self, name, read, write, path_of, options, note=""):
-        self.name, self.read, self.write, self.path_of = name, read, write, path_of
-        self.options, self.note = options, note
-
-
-CUSTOM_MIRROR = "__custom__"
-
-
-def mirror_targets():
-    npm = [
-        ("官方", "https://registry.npmjs.org/"),
-        ("淘宝 npmmirror", "https://registry.npmmirror.com"),
-        ("腾讯云", "https://mirrors.cloud.tencent.com/npm/"),
-    ]
-    pip = [
-        ("官方默认", None),
-        ("清华", "https://pypi.tuna.tsinghua.edu.cn/simple"),
-        ("阿里云", "https://mirrors.aliyun.com/pypi/simple/"),
-        ("腾讯云", "https://mirrors.cloud.tencent.com/pypi/simple"),
-    ]
-    go = [
-        ("官方", "https://proxy.golang.org,direct"),
-        ("goproxy.cn", "https://goproxy.cn,direct"),
-        ("阿里云", "https://mirrors.aliyun.com/goproxy/,direct"),
-    ]
-    maven = [
-        ("官方（不设镜像）", None),
-        ("阿里云", "https://maven.aliyun.com/repository/public"),
-        ("华为云", "https://repo.huaweicloud.com/repository/maven/"),
-    ]
-    docker = [
-        ("官方（不设镜像）", None),
-        ("DaoCloud 公共加速", "https://docker.m.daocloud.io"),
-        ("清华", "https://docker.mirrors.tuna.tsinghua.edu.cn"),
-    ]
-    return [
-        _MirrorTarget("npm / yarn",
-                      lambda: _ini_get(npm_config_path(), None, "registry"),
-                      lambda url: _ini_set(npm_config_path(), None, "registry", url, tight=True),
-                      npm_config_path, npm,
-                      "yarn 也读这个 .npmrc"),
-        _MirrorTarget("pip",
-                      lambda: _ini_get(pip_config_path(), "global", "index-url"),
-                      lambda url: _ini_set(pip_config_path(), "global", "index-url", url),
-                      pip_config_path, pip,
-                      "等价于 pip config set global.index-url"),
-        _MirrorTarget("Go modules",
-                      lambda: _ini_get(go_env_path(), None, "GOPROXY"),
-                      lambda url: _ini_set(go_env_path(), None, "GOPROXY", url, tight=True),
-                      go_env_path, go,
-                      "等价于 go env -w GOPROXY，新开的终端立刻生效"),
-        _MirrorTarget("Maven central",
-                      maven_central_url,
-                      lambda url: maven_set_central(url, "personal_toolbox mirror"),
-                      maven_settings_path, maven,
-                      "只改 central 的镜像；已有自定义 mirrors 时不覆盖"),
-        _MirrorTarget("Docker Hub",
-                      docker_read_mirror,
-                      docker_write_mirror,
-                      docker_daemon_path, docker,
-                      "改完需要重启 Docker 才生效"),
-    ]
-
-
 class _MirrorPage(QWidget):
     """一键切换各包管理器的国内镜像；写入前把原文件备份成 .bak。"""
 
@@ -10187,72 +9003,6 @@ class _MirrorPage(QWidget):
             self._set_status("%s（%s）" % (e, path), "#D93025")
             return
         self._set_status("已打开 %s" % os.path.dirname(path), "#188038")
-
-
-SSH_CONFIG_KEYS = ("HostName", "User", "Port", "IdentityFile", "ProxyJump")
-SSH_ALIAS_RE = re.compile(r"^[A-Za-z0-9._*:/\[\]-]+$")
-
-
-def ssh_config_path():
-    return user_path(".ssh", "config")
-
-
-def _ssh_canonical(key):
-    for name in SSH_CONFIG_KEYS:
-        if name.lower() == key.lower():
-            return name
-    return key
-
-
-def ssh_parse_config(text):
-    """Split into Host blocks; option order and comments are kept so untouched blocks
-    survive a rewrite byte-for-byte."""
-    preamble, blocks, has_match = [], [], False
-    current = None
-    for line in (text or "").splitlines():
-        s = line.strip()
-        low = s.lower()
-        if low.startswith("host ") and len(s.split()) > 1:
-            current = {"host": s.split()[1:], "opts": []}
-            blocks.append(current)
-            continue
-        if low.startswith("match"):
-            has_match = True
-        if current is None:
-            preamble.append(("#", line))
-        elif not s or s.startswith("#"):
-            current["opts"].append(("#", line))
-        else:
-            match = re.match(r"^(\S+?)\s*=\s*(.*)$", s) or re.match(r"^(\S+)\s+(.*)$", s)
-            if match:
-                current["opts"].append((match.group(1), match.group(2).strip()))
-            else:
-                current["opts"].append(("#", line))
-    return preamble, blocks, has_match
-
-
-def ssh_dump(preamble, blocks):
-    lines = [raw for _k, raw in preamble]
-    for block in blocks:
-        lines.append("Host " + " ".join(block["host"]))
-        for key, value in block["opts"]:
-            lines.append(value if key == "#" else "    %s %s" % (key, value))
-        lines.append("")
-    return "\n".join(lines).rstrip("\n") + "\n" if lines else ""
-
-
-def ssh_summary(block):
-    opts = {k.lower(): v for k, v in block["opts"] if k != "#"}
-    target = opts.get("hostname") or (block["host"][0] if block["host"] else "?")
-    bits = []
-    if opts.get("user"):
-        bits.append(opts["user"] + "@")
-    bits.append(target)
-    if opts.get("port"):
-        bits.append(":%s" % opts["port"])
-    if opts.get("proxyjump"):
-        bits.append(" 经 %s" % opts["proxyjump"])
-    return "".join(bits)
 
 
 class _SshConfigPage(QWidget):
@@ -10509,27 +9259,6 @@ class _SshConfigPage(QWidget):
             reveal_in_folder(ssh_config_path())
         except (RuntimeError, OSError) as e:
             self._set_status(str(e), "#D93025")
-
-
-def _ssh_merge_opts(old_opts, managed, extras):
-    """Replace only the keys the form manages; comments and unknown options stay in place."""
-    out, placed = [], set()
-    for key, value in old_opts:
-        if key == "#":
-            out.append((key, value))
-            continue
-        canonical = _ssh_canonical(key)
-        if canonical in managed:
-            placed.add(canonical)
-            if managed[canonical]:
-                out.append((canonical, managed[canonical]))
-        else:
-            out.append((key, value))
-    for key, value in managed.items():
-        if value and key not in placed:
-            out.append((key, value))
-    out.extend(extras)
-    return out
 
 
 VISIBILITY_ROWS = (
@@ -11493,119 +10222,11 @@ PINYIN_MAP = {
 
 
 # ---- 提醒事项 -------------------------------------------------------------
-REMINDERS_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "reminders.json")
-REPEAT_DAILY = "每天"
-REPEAT_WEEKDAY = "工作日"
-REPEAT_ONCE = "仅一次"
-REPEAT_CHOICES = (REPEAT_DAILY, REPEAT_WEEKDAY, REPEAT_ONCE)
-WEEKDAY_NAMES = ("", "周一", "周二", "周三", "周四", "周五", "周六", "周日")
-SNOOZE_MINUTES = 10
-# 错过太久就不再弹，避免开机时把昨天的提醒一次性补出来；只登记为已触发。
-MISSED_QUIET_SECONDS = 3 * 3600
 LAUNCH_AGENT_PATH = os.path.join(os.path.expanduser("~"), "Library",
                                  "LaunchAgents", "com.personal.toolbox.plist")
 LAUNCH_AGENT_LABEL = "com.personal.toolbox"
 WIN_RUN_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
 WIN_RUN_NAME = "PersonalToolbox"
-
-
-def _hhmm_valid(text):
-    return bool(re.match(r"^([01]\d|2[0-3]):[0-5]\d$", text or ""))
-
-
-def _rule_time(rule):
-    return int(rule["time"][:2]), int(rule["time"][3:5])
-
-
-def load_reminders():
-    try:
-        with open(REMINDERS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return {"rules": [], "sound": True}
-    rules = data.get("rules") if isinstance(data, dict) else None
-    clean = [r for r in (rules or [])
-             if isinstance(r, dict) and r.get("name") and _hhmm_valid(r.get("time"))]
-    for rule in clean:
-        if rule.get("repeat") == "仅当天":
-            rule["repeat"] = REPEAT_ONCE
-        elif rule.get("repeat") not in REPEAT_CHOICES:
-            rule["repeat"] = REPEAT_DAILY
-    sound = data.get("sound", True) if isinstance(data, dict) else True
-    return {"rules": clean, "sound": bool(sound)}
-
-
-def save_reminders(state):
-    try:
-        os.makedirs(os.path.dirname(REMINDERS_PATH), exist_ok=True)
-        with open(REMINDERS_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-        os.chmod(REMINDERS_PATH, 0o600)
-    except OSError:
-        pass
-
-
-def reminder_occurrence(rule, now):
-    """规则在 now 之前最近一次的触发时刻；还没到点返回 None。"""
-    if not _hhmm_valid(rule.get("time")):
-        return None
-    hh, mm = _rule_time(rule)
-    repeat = rule.get("repeat", REPEAT_DAILY)
-    if repeat == REPEAT_ONCE:
-        day = QDate.fromString(rule.get("date", ""), "yyyy-MM-dd")
-        if not day.isValid():
-            return None
-        occ = QDateTime(day, QTime(hh, mm))
-        return occ if occ <= now else None
-    for back in range(0, 8):
-        day = now.date().addDays(-back)
-        if repeat == REPEAT_WEEKDAY and day.dayOfWeek() > 5:
-            continue
-        occ = QDateTime(day, QTime(hh, mm))
-        if occ <= now:
-            return occ
-    return None
-
-
-def reminder_upcoming(rule, now):
-    """规则在 now 之后最近一次的触发时刻，用于"下一条提醒"提示。"""
-    if not _hhmm_valid(rule.get("time")):
-        return None
-    hh, mm = _rule_time(rule)
-    repeat = rule.get("repeat", REPEAT_DAILY)
-    if repeat == REPEAT_ONCE:
-        day = QDate.fromString(rule.get("date", ""), "yyyy-MM-dd")
-        if not day.isValid():
-            return None
-        occ = QDateTime(day, QTime(hh, mm))
-        return occ if occ > now else None
-    for ahead in range(0, 8):
-        day = now.date().addDays(ahead)
-        if repeat == REPEAT_WEEKDAY and day.dayOfWeek() > 5:
-            continue
-        occ = QDateTime(day, QTime(hh, mm))
-        if occ > now:
-            return occ
-    return None
-
-
-def next_reminder(rules, now):
-    best_name, best_when = None, None
-    for rule in rules:
-        if not rule.get("enabled", True):
-            continue
-        when = reminder_upcoming(rule, now)
-        if when and (best_when is None or when < best_when):
-            best_when, best_name = when, rule.get("name", "")
-    return best_name, best_when
-
-
-def reminder_when_text(when, now):
-    days = now.date().daysTo(when.date())
-    day = {0: "今天", 1: "明天", 2: "后天"}.get(days)
-    if day is None:
-        day = "%s %s" % (when.toString("MM-dd"), WEEKDAY_NAMES[when.date().dayOfWeek()])
-    return "%s %s" % (day, when.toString("HH:mm"))
 
 
 def play_alert_sound():
@@ -12012,52 +10633,6 @@ def save_shortcuts(bindings):
         with open(temporary, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(temporary, SHORTCUTS_PATH)
-    finally:
-        if os.path.exists(temporary):
-            os.remove(temporary)
-
-
-OCR_ENGINE_MODES = ("system", "rapidocr", "llm")
-OCR_ENGINE_LABELS = {"system": "系统 OCR", "rapidocr": "本地 RapidOCR", "llm": "大模型"}
-DEFAULT_OCR_SETTINGS = {"mode": "system", "base_url": "", "api_key": "", "model": ""}
-
-
-def _legacy_ocr_mode(data):
-    """旧版只有 enabled（大模型）/ local_enabled（本地）两个开关，换算成一个引擎选择。"""
-    fields = [str(data.get(name) or "").strip() for name in ("base_url", "api_key", "model")]
-    if data.get("enabled") and all(fields):
-        return "llm"
-    if data.get("local_enabled", True) and rapidocr_available():
-        return "rapidocr"
-    return "system"
-
-
-def load_ocr_settings():
-    """读取文字识别配置；识别引擎由用户在设置里显式选择，缺省为系统 OCR。"""
-    settings = dict(DEFAULT_OCR_SETTINGS)
-    try:
-        with open(OCR_SETTINGS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, ValueError):
-        return settings
-    if not isinstance(data, dict):
-        return settings
-    for key in ("base_url", "api_key", "model"):
-        value = data.get(key)
-        if isinstance(value, str):
-            settings[key] = value.strip()
-    mode = data.get("mode")
-    settings["mode"] = mode if mode in OCR_ENGINE_MODES else _legacy_ocr_mode(data)
-    return settings
-
-
-def save_ocr_settings(settings):
-    os.makedirs(os.path.dirname(OCR_SETTINGS_PATH), exist_ok=True)
-    temporary = OCR_SETTINGS_PATH + ".tmp"
-    try:
-        with open(temporary, "w", encoding="utf-8") as f:
-            json.dump(settings, f, ensure_ascii=False, indent=2)
-        os.replace(temporary, OCR_SETTINGS_PATH)
     finally:
         if os.path.exists(temporary):
             os.remove(temporary)
@@ -14450,106 +13025,6 @@ class ToolboxWindow(QMainWindow):
         self._update_dialog.show()
 
 
-def update_version_parts(version):
-    if not isinstance(version, str) or not re.fullmatch(r"[0-9]{1,5}(?:\.[0-9]{1,5}){1,3}", version):
-        raise ValueError("更新服务器返回了无效的版本号。")
-    parts = tuple(int(part) for part in version.split('.'))
-    return parts + (0,) * (4 - len(parts))
-
-
-def validate_update_url(url):
-    if not isinstance(url, str) or any(ord(char) < 33 for char in url):
-        raise ValueError("更新下载地址无效。")
-    parts = urllib.parse.urlsplit(url)
-    if parts.scheme != 'https' or not parts.hostname or parts.username or parts.password or parts.fragment:
-        raise ValueError("更新仅接受不含账号信息的 HTTPS 下载地址。")
-
-
-class UpdateRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        validate_update_url(newurl)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
-def mac_app_bundle(path=None):
-    """返回可执行文件所在的 .app 路径，不在 .app 内运行时返回空串。"""
-    path = path or sys.executable
-    marker = path.find('.app/')
-    return path[:marker + 4] if marker > 0 else ""
-
-
-def mac_app_translocated(path):
-    """Gatekeeper 会把「下载」里直接运行的 app 挂到只读虚拟目录，这种路径不能原地更新。"""
-    return '/AppTranslocation/' in path
-
-
-def mac_downloads_dir():
-    return os.path.realpath(QStandardPaths.writableLocation(QStandardPaths.DownloadLocation))
-
-
-def mac_applications_dir():
-    """优先系统级「应用程序」目录，不可写时退回用户级 ~/Applications。"""
-    if os.access('/Applications', os.W_OK):
-        return '/Applications'
-    user_applications = os.path.join(os.path.expanduser('~'), 'Applications')
-    try:
-        os.makedirs(user_applications, exist_ok=True)
-    except OSError:
-        return ''
-    return user_applications if os.access(user_applications, os.W_OK) else ''
-
-
-def load_update_target():
-    try:
-        with open(UPDATE_TARGET_PATH, encoding='utf-8') as file:
-            value = json.load(file).get('mac_target')
-    except (OSError, ValueError, AttributeError):
-        return ''
-    return value if isinstance(value, str) and value.endswith('.app') else ''
-
-
-def save_update_target(target):
-    try:
-        os.makedirs(os.path.dirname(UPDATE_TARGET_PATH), exist_ok=True)
-        temp = UPDATE_TARGET_PATH + '.tmp'
-        with open(temp, 'w', encoding='utf-8') as file:
-            json.dump({'mac_target': target}, file, ensure_ascii=False)
-        os.replace(temp, UPDATE_TARGET_PATH)
-    except OSError:
-        pass
-
-
-def mac_update_target():
-    """macOS 安装位置：原地更新 → 记住的位置 → /Applications → ~/Applications → 下载。
-
-    只在可写、且不是 Gatekeeper 虚拟路径或「下载」目录时选择原地更新，
-    避免把更新装回下载文件夹。
-    """
-    bundle = mac_app_bundle()
-    if bundle and not mac_app_translocated(bundle):
-        current = os.path.realpath(bundle)
-        if os.path.commonpath((current, mac_downloads_dir())) != mac_downloads_dir() \
-                and os.access(os.path.dirname(current), os.W_OK):
-            return current
-    remembered = load_update_target()
-    if remembered and os.access(os.path.dirname(remembered), os.W_OK):
-        return remembered
-    applications = mac_applications_dir()
-    if applications:
-        return os.path.join(applications, 'Toolbox.app')
-    return os.path.join(mac_downloads_dir(), 'Toolbox.app')
-
-
-def update_install_target(system):
-    if system == "Windows":
-        if getattr(sys, "frozen", False):
-            return os.path.abspath(sys.executable)
-        return os.path.join(os.environ['LOCALAPPDATA'], "PersonalToolbox", "Toolbox.exe")
-    if system == "Darwin":
-        return mac_update_target()
-    raise ValueError("应用内更新仅支持 Windows 和 macOS。")
-
-
 def move_mac_app(bundle, target):
     """把 .app 复制到「应用程序」目录，刷新启动服务，打开新位置并退出当前实例。"""
     staging = target + '.new'
@@ -14620,135 +13095,6 @@ def offer_mac_app_move(parent):
     except (OSError, shutil.Error) as exc:
         QMessageBox.warning(parent, '移动失败',
                             '无法移动应用：%s\n可以手动把 Toolbox.app 拖到「应用程序」文件夹。' % exc)
-
-
-def extract_update_package(archive_path, directory, system, cancelled):
-    with zipfile.ZipFile(archive_path) as archive:
-        entries = archive.infolist()
-        if len(entries) > 30000 or sum(entry.file_size for entry in entries) > 2 * 1024 ** 3:
-            raise ValueError("更新包解压后的大小或文件数超出限制。")
-        names = {}
-        for entry in entries:
-            name = entry.filename.rstrip('/')
-            parts = name.split('/')
-            mode = entry.external_attr >> 16
-            if (entry.orig_filename != entry.filename or not name or '\\' in name
-                    or ntpath.splitdrive(name)[0] or any(part in ('', '.', '..') for part in parts)
-                    or any(ord(char) < 32 for char in name)
-                    or stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR, stat.S_IFLNK)):
-                raise ValueError("更新包包含不安全的路径或文件类型。")
-            if system == 'Windows' and (stat.S_ISLNK(mode) or any(
-                    ':' in part or part.endswith(('.', ' ')) or re.fullmatch(
-                        r'(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?', part, re.I)
-                    for part in parts)):
-                raise ValueError("更新包包含不安全的 Windows 文件名。")
-            key = name.casefold()
-            if key in names:
-                raise ValueError("更新包包含重复的文件路径。")
-            names[key] = entry
-            if entry.flag_bits & 1:
-                raise ValueError("无法安装加密的更新包。")
-
-        files = [entry for entry in entries if not entry.is_dir()
-                 and not entry.filename.startswith('__MACOSX/')
-                 and posixpath.basename(entry.filename) != '.DS_Store']
-        if system == 'Windows':
-            candidates = [entry for entry in files if posixpath.basename(entry.filename).casefold()
-                          in ('toolbox.exe', 'toolbox-windows.exe')]
-            if len(candidates) != 1 or len(files) != 1:
-                raise ValueError("Windows 更新包应仅包含单文件 Toolbox.exe。")
-            selected = [(candidates[0], 'Toolbox.exe')]
-            payload = os.path.join(directory, 'Toolbox.exe')
-        elif system == 'Darwin':
-            candidates = [entry for entry in files
-                          if entry.filename.endswith('Toolbox.app/Contents/Info.plist')]
-            if len(candidates) != 1:
-                raise ValueError("macOS 更新包中未找到唯一的 Toolbox.app。")
-            prefix = candidates[0].filename[:-len('Contents/Info.plist')]
-            selected = [(entry, 'Toolbox.app/' + entry.filename[len(prefix):]) for entry in entries
-                        if entry.filename.startswith(prefix) and entry.filename != prefix]
-            payload = os.path.join(directory, 'Toolbox.app')
-        else:
-            raise ValueError("不支持的更新平台。")
-
-        links, directories = [], []
-        link_names = {relative.rstrip('/') for entry, relative in selected
-                      if stat.S_ISLNK(entry.external_attr >> 16)}
-        for entry, relative in selected:
-            if cancelled.is_set():
-                raise InterruptedError("已取消更新。")
-            components = relative.rstrip('/').split('/')
-            if any('/'.join(components[:index]) in link_names for index in range(1, len(components))):
-                raise ValueError("更新包不能通过符号链接写入文件。")
-            path = os.path.join(directory, *components)
-            mode = (entry.external_attr >> 16) & 0o777
-            if entry.is_dir():
-                os.makedirs(path, exist_ok=True)
-                directories.append((path, mode))
-                continue
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            if stat.S_ISLNK(entry.external_attr >> 16):
-                if entry.file_size > 4096:
-                    raise ValueError("更新包的符号链接过长。")
-                target = archive.read(entry).decode('utf-8')
-                resolved = posixpath.normpath(posixpath.join(posixpath.dirname(relative), target))
-                if (not target or '\\' in target or ntpath.splitdrive(target)[0]
-                        or target.startswith('/') or resolved == '..' or resolved.startswith('../')
-                        or not resolved.startswith('Toolbox.app/')):
-                    raise ValueError("更新包的符号链接指向应用目录之外。")
-                links.append((path, target))
-                continue
-            with archive.open(entry) as source, open(path, 'xb') as output:
-                while True:
-                    if cancelled.is_set():
-                        raise InterruptedError("已取消更新。")
-                    chunk = source.read(256 * 1024)
-                    if not chunk:
-                        break
-                    output.write(chunk)
-            if system == 'Darwin' and mode:
-                os.chmod(path, mode)
-        for path, target in links:
-            os.symlink(target, path)
-        for path, _ in links:
-            resolved = os.path.realpath(path)
-            if (os.path.commonpath((os.path.realpath(payload), resolved)) != os.path.realpath(payload)
-                    or not os.path.exists(path)):
-                raise ValueError("更新包包含越界或失效的符号链接。")
-        if system == 'Darwin':
-            for path, mode in reversed(directories):
-                if mode:
-                    os.chmod(path, mode)
-            with open(os.path.join(payload, 'Contents', 'Info.plist'), 'rb') as file:
-                info = plistlib.load(file)
-            if not isinstance(info, dict):
-                raise ValueError("更新包的应用信息格式无效。")
-            executable = info.get('CFBundleExecutable', '')
-            if (info.get('CFBundleIdentifier') != 'com.jimmy.personal_tool'
-                    or not isinstance(executable, str) or not executable
-                    or executable in ('.', '..') or ntpath.splitdrive(executable)[0]
-                    or '/' in executable or '\\' in executable):
-                raise ValueError("更新包不是系统工具箱应用。")
-            executable_path = os.path.join(payload, 'Contents', 'MacOS', executable)
-            with open(executable_path, 'rb') as file:
-                magic = file.read(4)
-            if magic not in (b'\xfe\xed\xfa\xce', b'\xce\xfa\xed\xfe', b'\xfe\xed\xfa\xcf',
-                             b'\xcf\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca',
-                             b'\xca\xfe\xba\xbf', b'\xbf\xba\xfe\xca'):
-                raise ValueError("更新包中缺少有效的 macOS 可执行程序。")
-            os.chmod(executable_path, os.stat(executable_path).st_mode | stat.S_IXUSR)
-        else:
-            with open(payload, 'rb') as file:
-                header = file.read(64)
-                if len(header) < 64 or header[:2] != b'MZ':
-                    raise ValueError("更新包不是有效的 Windows 应用程序。")
-                offset = int.from_bytes(header[60:64], 'little')
-                if offset < 64 or offset > os.path.getsize(payload) - 24:
-                    raise ValueError("更新包的 Windows 可执行文件头损坏。")
-                file.seek(offset)
-                if file.read(4) != b'PE\x00\x00':
-                    raise ValueError("更新包的 Windows 可执行文件头损坏。")
-        return payload
 
 
 class UpdateDownloadWorker(QThread):

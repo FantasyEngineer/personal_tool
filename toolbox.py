@@ -4798,9 +4798,13 @@ def _raise_above_menubar(widget):
 
 
 class LockScreenOverlay(QWidget):
-    """一块屏幕上的模拟锁屏：全屏置顶、吞掉键鼠，点两下才回到桌面。"""
+    """一块屏幕上的模拟锁屏：全屏置顶、吞掉键鼠，点两下才回到桌面。
 
-    def __init__(self, screen, on_unlock):
+    macOS 走深色渐变 + 正中大时钟的版式；Windows 走系统锁屏的版式——
+    日期在上、时间偏下、右下角网络/电量，点一下浮出居中的毛玻璃密码框。
+    """
+
+    def __init__(self, screen, on_unlock, style=None):
         super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
                          | Qt.NoDropShadowWindowHint)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
@@ -4808,40 +4812,109 @@ class LockScreenOverlay(QWidget):
         self.setCursor(Qt.ArrowCursor)
         self._on_unlock = on_unlock
         self._armed = False
+        style = style or ("windows" if platform.system() == "Windows" else "macos")
+        self._win_style = (style == "windows")
         self.setGeometry(screen.geometry())
 
-        self.unlock_btn = QPushButton("点击解锁", self)
+        self.unlock_btn = QPushButton("解锁" if self._win_style else "点击解锁", self)
         self.unlock_btn.setCursor(Qt.PointingHandCursor)
-        self.unlock_btn.setFixedHeight(34)
+        self.unlock_btn.setFixedHeight(36 if self._win_style else 34)
         self.unlock_btn.setVisible(False)
-        self.unlock_btn.setStyleSheet("""
-            QPushButton { background: rgba(255,255,255,0.18); color: #FFFFFF;
-                border: 1px solid rgba(255,255,255,0.38); border-radius: 17px;
-                font-size: 13px; padding: 0 24px; }
-            QPushButton:hover { background: rgba(255,255,255,0.30); }
-        """)
+        if self._win_style:
+            self.unlock_btn.setStyleSheet("""
+                QPushButton { background: #0067C0; color: #FFFFFF; border: none;
+                    border-radius: 6px; font-size: 13px; padding: 0 14px; }
+                QPushButton:hover { background: #1B79CE; }
+                QPushButton:pressed { background: #005AA8; }
+            """)
+        else:
+            self.unlock_btn.setStyleSheet("""
+                QPushButton { background: rgba(255,255,255,0.18); color: #FFFFFF;
+                    border: 1px solid rgba(255,255,255,0.38); border-radius: 17px;
+                    font-size: 13px; padding: 0 24px; }
+                QPushButton:hover { background: rgba(255,255,255,0.30); }
+            """)
         self.unlock_btn.clicked.connect(self._unlock)
+
+        # Windows 风格的密码输入框（只是样子，不校验密码，回车即解锁）
+        self.pwd_edit = None
+        if self._win_style:
+            self.pwd_edit = QLineEdit(self)
+            self.pwd_edit.setPlaceholderText("密码")
+            self.pwd_edit.setEchoMode(QLineEdit.Password)
+            self.pwd_edit.setFixedHeight(36)
+            self.pwd_edit.setVisible(False)
+            self.pwd_edit.setStyleSheet("""
+                QLineEdit { background: rgba(255,255,255,0.10); color: #FFFFFF;
+                    border: 1px solid rgba(255,255,255,0.22); border-radius: 6px;
+                    padding: 0 12px; font-size: 13px; }
+                QLineEdit:focus { border: 1px solid rgba(120,180,255,0.85); }
+            """)
+            self.pwd_edit.returnPressed.connect(self._unlock)
 
         self._timer = QTimer(self)
         self._timer.setInterval(500)
         self._timer.timeout.connect(self._tick)
         self._timer.start()
 
+    # ---------- 布局 ----------
+    def _panel_rect(self):
+        width = min(380, max(300, int(self.width() * 0.30)))
+        # 密码框放在大时钟下面，别压住时间
+        return QRect(int((self.width() - width) / 2), int(self.height() * 0.775), width, 56)
+
+    def _layout_widgets(self):
+        if self._win_style:
+            panel = self._panel_rect()
+            if self.pwd_edit is not None:
+                self.pwd_edit.setGeometry(panel.left() + 16, panel.top() + 10,
+                                          panel.width() - 16 - 92, 36)
+            self.unlock_btn.setGeometry(panel.right() - 86, panel.top() + 10, 74, 36)
+        else:
+            self.unlock_btn.adjustSize()
+            self.unlock_btn.move(int((self.width() - self.unlock_btn.width()) / 2),
+                                 int(self.height() * 0.74))
+
+    def _arm(self):
+        if self._armed:
+            return
+        self._armed = True
+        self._layout_widgets()
+        self.unlock_btn.show()
+        if self.pwd_edit is not None:
+            self.pwd_edit.show()
+            self.pwd_edit.setFocus()
+        self.update()
+
     # ---------- 画面 ----------
     def _tick(self):
         self.raise_()          # 别被别的窗口盖过去
+        if self._win_style:
+            try:
+                import ctypes
+                # 任务栏也是 topmost，定期重申一次置顶，别被它压下去
+                ctypes.windll.user32.SetWindowPos(int(self.winId()), -1, 0, 0, 0, 0,
+                                                  0x0001 | 0x0002 | 0x0010)
+            except Exception:
+                pass
         self.update()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.unlock_btn.move(int((self.width() - self.unlock_btn.width()) / 2),
-                             int(self.height() * 0.74))
+        self._layout_widgets()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
         rect = QRectF(self.rect())
+        now = QDateTime.currentDateTime()
+        if self._win_style:
+            self._paint_windows(painter, rect, now)
+        else:
+            self._paint_macos(painter, rect, now)
 
+    # ---- macOS 版式 ----
+    def _paint_macos(self, painter, rect, now):
         gradient = QLinearGradient(rect.topLeft(), QPointF(rect.width() * 0.45, rect.height()))
         gradient.setColorAt(0.0, QColor("#1B2440"))
         gradient.setColorAt(0.55, QColor("#141A31"))
@@ -4858,8 +4931,6 @@ class LockScreenOverlay(QWidget):
             painter.setBrush(QBrush(glow))
             painter.setPen(Qt.NoPen)
             painter.drawRect(rect)
-
-        now = QDateTime.currentDateTime()
 
         clock_font = QFont("Helvetica Neue")
         clock_font.setWeight(QFont.Light)
@@ -4910,29 +4981,121 @@ class LockScreenOverlay(QWidget):
                          Qt.AlignHCenter | Qt.AlignVCenter,
                          "模拟锁屏 · 屏幕常亮、系统不休眠，后台任务继续运行")
 
+    # ---- Windows 版式 ----
+    def _paint_windows(self, painter, rect, now):
+        gradient = QLinearGradient(rect.topLeft(), QPointF(rect.width() * 0.35, rect.height()))
+        gradient.setColorAt(0.0, QColor("#1E2838"))
+        gradient.setColorAt(0.55, QColor("#121A26"))
+        gradient.setColorAt(1.0, QColor("#070B12"))
+        painter.fillRect(rect, gradient)
+
+        glow = QRadialGradient(QPointF(rect.width() * 0.20, rect.height() * 0.88),
+                               rect.height() * 0.62)
+        glow.setColorAt(0.0, QColor(28, 92, 168, 72))
+        glow.setColorAt(1.0, QColor(0, 0, 0, 0))
+        painter.setBrush(QBrush(glow))
+        painter.setPen(Qt.NoPen)
+        painter.drawRect(rect)
+
+        weekday = "一二三四五六日"[now.date().dayOfWeek() - 1]
+
+        # Windows 的日期在大时钟上方
+        date_font = QFont("Microsoft YaHei")
+        date_font.setPixelSize(max(15, int(rect.height() * 0.021)))
+        painter.setFont(date_font)
+        painter.setPen(QColor(238, 244, 255, 215))
+        painter.drawText(QRectF(0, rect.height() * 0.505, rect.width(), 26),
+                         Qt.AlignHCenter | Qt.AlignVCenter,
+                         "%d月%d日，星期%s" % (now.date().month(), now.date().day(), weekday))
+
+        clock_font = QFont("Segoe UI Light")
+        clock_font.setWeight(QFont.Light)
+        clock_font.setPixelSize(max(56, int(rect.height() * 0.115)))
+        painter.setFont(clock_font)
+        painter.setPen(QColor("#FFFFFF"))
+        painter.drawText(QRectF(0, rect.height() * 0.545, rect.width(), rect.height() * 0.14),
+                         Qt.AlignHCenter | Qt.AlignVCenter, now.toString("HH:mm"))
+
+        self._paint_status_icons(painter, rect)
+
+        hint_font = QFont("Microsoft YaHei")
+        hint_font.setPixelSize(13)
+        painter.setFont(hint_font)
+        painter.setPen(QColor(222, 232, 250, 165))
+        if not self._armed:
+            painter.drawText(QRectF(0, rect.height() * 0.86, rect.width(), 26),
+                             Qt.AlignHCenter | Qt.AlignVCenter, "按任意键或点击屏幕以解锁")
+
+        if self._armed:
+            panel = QRectF(self._panel_rect())
+            painter.setBrush(QColor(26, 33, 46, 210))
+            painter.setPen(QColor(255, 255, 255, 45))
+            painter.drawRoundedRect(panel, 8, 8)
+
+            avatar_r = 24
+            acx, acy = rect.width() / 2, panel.top() - 58
+            painter.setBrush(QColor(255, 255, 255, 30))
+            painter.setPen(QColor(255, 255, 255, 70))
+            painter.drawEllipse(QPointF(acx, acy), avatar_r, avatar_r)
+            painter.setPen(QColor(240, 245, 255))
+            avatar_font = QFont("Microsoft YaHei")
+            avatar_font.setPixelSize(17)
+            painter.setFont(avatar_font)
+            painter.drawText(QRectF(acx - avatar_r, acy - avatar_r, avatar_r * 2, avatar_r * 2),
+                             Qt.AlignCenter, "🔒")
+
+            name_font = QFont("Microsoft YaHei")
+            name_font.setPixelSize(14)
+            painter.setFont(name_font)
+            painter.setPen(QColor(232, 240, 255, 200))
+            painter.drawText(QRectF(0, acy + avatar_r + 6, rect.width(), 22),
+                             Qt.AlignHCenter | Qt.AlignVCenter, self._user_name())
+
+        painter.setPen(QColor(178, 194, 226, 110))
+        footer_font = QFont("Microsoft YaHei")
+        footer_font.setPixelSize(12)
+        painter.setFont(footer_font)
+        painter.drawText(QRectF(0, rect.height() - 62, rect.width(), 22),
+                         Qt.AlignHCenter | Qt.AlignVCenter,
+                         "模拟锁屏 · 屏幕常亮、系统不休眠，后台任务继续运行")
+
+    def _paint_status_icons(self, painter, rect):
+        """右下角的网络 / 电量图标，Windows 锁屏的标志性角落。"""
+        pen = QPen(QColor(236, 242, 252, 200))
+        pen.setWidthF(2.0)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+
+        # WiFi：三条同心弧 + 底部圆点
+        cx, cy = rect.width() - 96, rect.height() - 34
+        for radius in (20, 13, 6):
+            painter.drawArc(QRectF(cx - radius, cy - radius, radius * 2, radius * 2),
+                            45 * 16, 90 * 16)
+        painter.setBrush(QColor(236, 242, 252, 200))
+        painter.drawEllipse(QPointF(cx, cy), 2.0, 2.0)
+
+        # 电池：外框 + 80% 电量 + 右侧电极
+        bx, by, bw, bh = rect.width() - 56, rect.height() - 41, 28, 14
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(QRectF(bx, by, bw, bh), 3, 3)
+        painter.setBrush(QColor(236, 242, 252, 150))
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(QRectF(bx + 3, by + 3, (bw - 6) * 0.8, bh - 6), 2, 2)
+        painter.setBrush(QColor(236, 242, 252, 200))
+        painter.drawRoundedRect(QRectF(bx + bw + 2, by + 4, 3, 6), 1, 1)
+
     def _user_name(self):
         home = os.path.expanduser("~")
         return os.path.basename(home.rstrip("/")) or "Toolbox"
 
     # ---------- 交互 ----------
     def mousePressEvent(self, event):
-        if not self._armed:
-            self._armed = True
-            self.unlock_btn.adjustSize()
-            self.unlock_btn.move(int((self.width() - self.unlock_btn.width()) / 2),
-                                 int(self.height() * 0.74))
-            self.unlock_btn.show()
-            self.update()
+        self._arm()
 
     def keyPressEvent(self, event):
         # 第一下按键只是「唤醒锁屏」，再按回车才解锁，避免手滑碰键盘就暴露桌面
         if not self._armed:
-            self._armed = True
-            self.unlock_btn.adjustSize()
-            self.unlock_btn.move(int((self.width() - self.unlock_btn.width()) / 2),
-                                 int(self.height() * 0.74))
-            self.unlock_btn.show()
-            self.update()
+            self._arm()
             return
         if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
             self._unlock()
@@ -4981,6 +5144,9 @@ class LockScreenController(QObject):
         self.unlocked.emit()
 
     def _keep_awake(self, active):
+        if platform.system() == "Windows":
+            self._keep_awake_windows(active)
+            return
         try:
             if active:
                 if self._awake is None or self._awake.poll() is not None:
@@ -4999,6 +5165,22 @@ class LockScreenController(QObject):
                 self._awake = None
         except Exception:
             self._awake = None
+
+    @staticmethod
+    def _keep_awake_windows(active):
+        """Windows 没有 caffeinate，改用 SetThreadExecutionState 按住显示与系统。"""
+        try:
+            import ctypes
+
+            ES_CONTINUOUS = 0x80000000
+            ES_SYSTEM_REQUIRED = 0x00000001
+            ES_DISPLAY_REQUIRED = 0x00000002
+            flags = ES_CONTINUOUS
+            if active:
+                flags |= ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+            ctypes.windll.kernel32.SetThreadExecutionState(ctypes.c_uint(flags))
+        except Exception:
+            pass
 
 
 class AdbWindow(QMainWindow):

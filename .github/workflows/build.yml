@@ -306,15 +306,21 @@ jobs:
           VERSION="${TAG#v}"
           BASE="${R2_PUBLIC_BASE_URL%/}/releases/$TAG"
 
+          # checkout 按提交取代码时不会带上 tag 对象，必须显式补一次，否则附注 tag
+          # 的正文拿不到，changelog 会退回提交记录。
+          git fetch --tags --force origin "+refs/tags/*:refs/tags/*" >/dev/null 2>&1 || true
           TAG_TYPE="$(git for-each-ref "refs/tags/$TAG" --format='%(objecttype)')"
           if [ "$TAG_TYPE" = "tag" ]; then
             CHANGELOG="$(git for-each-ref "refs/tags/$TAG" --format='%(contents)' | sed '/^[[:space:]]*$/d')"
           else
             PREV="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+            filter_commits() {
+              grep -viE 'update version\.json|\[skip ci\]|^\s*-\s*chore(\(|:)' || true
+            }
             if [ -n "$PREV" ]; then
-              CHANGELOG="$(git log --no-merges --pretty=format:'- %s' "$PREV..$TAG")"
+              CHANGELOG="$(git log --no-merges --pretty=format:'- %s' "$PREV..$TAG" | filter_commits)"
             else
-              CHANGELOG="$(git log --no-merges --pretty=format:'- %s' -n 10 "$TAG")"
+              CHANGELOG="$(git log --no-merges --pretty=format:'- %s' -n 10 "$TAG" | filter_commits)"
             fi
           fi
           [ -n "$CHANGELOG" ] || CHANGELOG="版本更新"

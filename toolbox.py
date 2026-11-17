@@ -14709,33 +14709,82 @@ def start_update_installer(directory, payload, target, shortcut, system):
     env = os.environ.copy()
     env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
     if system == 'Windows':
-        plan = {'source': payload, 'target': target, 'incoming': incoming, 'backup': backup,
-                'shortcut': shortcut, 'process_id': os.getpid(), 'ready': ready, 'error': error,
-                'directory': directory, 'old_program': old_command[0],
-                'old_arguments': subprocess.list2cmdline(old_command[1:])}
-        plan_path = os.path.join(directory, 'install.json')
-        with open(plan_path, 'w', encoding='utf-8') as file:
-            json.dump(plan, file, ensure_ascii=False)
-        env['PERSONAL_TOOLBOX_UPDATE_PLAN'] = plan_path
+        # 安装脚本只用 .NET API：个别 Windows 机器上 PowerShell 的模块加载异常，
+        # Get-FileHash / Start-Process / Remove-Item 这些 cmdlet 会直接「无法识别」。
+        env['PERSONAL_TOOLBOX_SOURCE'] = payload
+        env['PERSONAL_TOOLBOX_TARGET'] = target
+        env['PERSONAL_TOOLBOX_INCOMING'] = incoming
+        env['PERSONAL_TOOLBOX_BACKUP'] = backup
+        env['PERSONAL_TOOLBOX_SHORTCUT'] = shortcut or ''
+        env['PERSONAL_TOOLBOX_READY'] = ready
+        env['PERSONAL_TOOLBOX_ERROR'] = error
+        env['PERSONAL_TOOLBOX_DIRECTORY'] = directory
+        env['PERSONAL_TOOLBOX_SHA256'] = file_sha256(payload)
+        env['PERSONAL_TOOLBOX_OLD_PROGRAM'] = old_command[0]
+        env['PERSONAL_TOOLBOX_OLD_ARGUMENTS'] = subprocess.list2cmdline(old_command[1:])
+        env['PERSONAL_TOOLBOX_PROCESS_ID'] = str(os.getpid())
         script = r'''
 $ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-$plan = Get-Content -LiteralPath $env:PERSONAL_TOOLBOX_UPDATE_PLAN -Encoding UTF8 -Raw | ConvertFrom-Json
+$source = $env:PERSONAL_TOOLBOX_SOURCE
+$target = $env:PERSONAL_TOOLBOX_TARGET
+$incoming = $env:PERSONAL_TOOLBOX_INCOMING
+$backup = $env:PERSONAL_TOOLBOX_BACKUP
+$shortcut = $env:PERSONAL_TOOLBOX_SHORTCUT
+$readyFile = $env:PERSONAL_TOOLBOX_READY
+$errorFile = $env:PERSONAL_TOOLBOX_ERROR
+$workDirectory = $env:PERSONAL_TOOLBOX_DIRECTORY
+$expectedHash = $env:PERSONAL_TOOLBOX_SHA256
+$oldProgram = $env:PERSONAL_TOOLBOX_OLD_PROGRAM
+$oldArguments = $env:PERSONAL_TOOLBOX_OLD_ARGUMENTS
+$oldProcessId = [int]$env:PERSONAL_TOOLBOX_PROCESS_ID
+
 $prepared = $false
 $replaced = $false
 $successful = $false
-$started = $null
+$previousProcess = $null
+$startedProcess = $null
+
+# 只用 .NET API，不调用任何 cmdlet：个别机器上 PowerShell 模块加载异常，
+# Get-FileHash / Start-Process / Remove-Item 之类会直接报「无法识别」。
+function Get-FileSha256([string]$path) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [IO.File]::OpenRead($path)
+        try {
+            return [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '')
+        } finally {
+            $stream.Dispose()
+        }
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function Start-Program([string]$path, [string]$arguments) {
+    $info = [Diagnostics.ProcessStartInfo]::new()
+    $info.FileName = $path
+    if ($arguments) { $info.Arguments = $arguments }
+    $info.UseShellExecute = $true
+    return [Diagnostics.Process]::Start($info)
+}
+
+function Show-Message([string]$text, [string]$caption) {
+    try {
+        [void][Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms')
+        [void][Windows.Forms.MessageBox]::Show($text, $caption)
+    } catch {
+    }
+}
+
 try {
-    if ([IO.Directory]::Exists($plan.target)) { throw '安装位置被同名文件夹占用。' }
-    [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($plan.target)) | Out-Null
-    [IO.File]::Copy($plan.source, $plan.incoming, $false)
-    if ((Get-FileHash -LiteralPath $plan.source -Algorithm SHA256).Hash -ne
-        (Get-FileHash -LiteralPath $plan.incoming -Algorithm SHA256).Hash) {
+    if ([IO.Directory]::Exists($target)) { throw '安装位置被同名文件夹占用。' }
+    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target))
+    [IO.File]::Copy($source, $incoming, $false)
+    if ((Get-FileSha256 $incoming) -ne $expectedHash) {
         throw '安装文件复制校验失败。'
     }
-    $previousProcess = $null
-    try { $previousProcess = [Diagnostics.Process]::GetProcessById([int]$plan.process_id) } catch [ArgumentException] {}
-    [IO.File]::WriteAllText($plan.ready, 'ready')
+    try { $previousProcess = [Diagnostics.Process]::GetProcessById($oldProcessId) } catch {}
+    [IO.File]::WriteAllText($readyFile, 'ready')
     $prepared = $true
     if ($null -ne $previousProcess -and -not $previousProcess.WaitForExit(60000)) {
         throw '旧版本未能退出，更新已停止。'
@@ -14743,95 +14792,115 @@ try {
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     while ($true) {
         try {
-            if ([IO.File]::Exists($plan.target)) {
-                [IO.File]::Replace($plan.incoming, $plan.target, $plan.backup)
+            if ([IO.File]::Exists($target)) {
+                [IO.File]::Replace($incoming, $target, $backup)
             } else {
-                [IO.File]::Move($plan.incoming, $plan.target)
+                [IO.File]::Move($incoming, $target)
             }
             $replaced = $true
             break
         } catch [IO.IOException] {
             $code = $_.Exception.GetBaseException().HResult -band 65535
             if ($code -notin @(32, 33) -or [DateTime]::UtcNow -ge $deadline) { throw }
-            Start-Sleep -Milliseconds 200
+            [Threading.Thread]::Sleep(200)
         }
     }
-    $started = Start-Process -FilePath $plan.target -WorkingDirectory ([IO.Path]::GetDirectoryName($plan.target)) -PassThru
+    $startedProcess = Start-Program $target ''
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
-    $name = [IO.Path]::GetFileNameWithoutExtension($plan.target)
+    $processName = [IO.Path]::GetFileNameWithoutExtension($target)
     while ($true) {
-        $windows = @(Get-Process -Name $name -ErrorAction SilentlyContinue | Where-Object {
-            $_.Path -eq $plan.target -and $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -like '系统工具箱*'
-        })
-        if (@($windows | Where-Object { $_.MainWindowTitle -like '*启动失败*' }).Count -gt 0) {
-            throw '新版本报告启动失败。'
+        $windowSeen = $false
+        $startupFailed = $false
+        foreach ($candidate in [Diagnostics.Process]::GetProcessesByName($processName)) {
+            try {
+                if ($candidate.MainWindowHandle -ne 0 -and $candidate.MainWindowTitle -like '系统工具箱*') {
+                    if ($candidate.MainWindowTitle -like '*启动失败*') {
+                        $startupFailed = $true
+                    } else {
+                        $windowSeen = $true
+                    }
+                }
+            } catch {
+            }
         }
-        if ($windows.Count -gt 0) { break }
-        if ($started.HasExited) { throw '新版本未能启动。' }
+        if ($startupFailed) { throw '新版本报告启动失败。' }
+        if ($windowSeen) { break }
+        if ($null -ne $startedProcess -and $startedProcess.HasExited) { throw '新版本未能启动。' }
         if ([DateTime]::UtcNow -ge $deadline) { throw '新版本未能显示主窗口。' }
-        Start-Sleep -Milliseconds 200
+        [Threading.Thread]::Sleep(200)
     }
     $shortcutWarning = ''
-    if ($plan.shortcut) {
+    if ($shortcut) {
         try {
-            $shell = New-Object -ComObject WScript.Shell
-            $link = $shell.CreateShortcut($plan.shortcut)
-            $link.TargetPath = $plan.target
+            $shellType = [Type]::GetTypeFromProgID('WScript.Shell')
+            if ($null -eq $shellType) { throw 'WScript.Shell 不可用。' }
+            $shell = [Activator]::CreateInstance($shellType)
+            $link = $shell.CreateShortcut($shortcut)
+            $link.TargetPath = $target
             $link.Arguments = ''
             $link.WindowStyle = 1
-            $link.WorkingDirectory = [IO.Path]::GetDirectoryName($plan.target)
-            $link.IconLocation = $plan.target + ',0'
+            $link.WorkingDirectory = [IO.Path]::GetDirectoryName($target)
+            $link.IconLocation = $target + ',0'
             $link.Description = '系统工具箱'
             $link.Save()
-        } catch { $shortcutWarning = '新版已安装，但桌面快捷方式创建失败。应用位置：' + $plan.target }
+        } catch {
+            $shortcutWarning = '新版已安装，但桌面快捷方式创建失败。应用位置：' + $target
+        }
     }
     $successful = $true
-    try { if ([IO.File]::Exists($plan.backup)) { [IO.File]::Delete($plan.backup) } } catch {}
+    try { if ([IO.File]::Exists($backup)) { [IO.File]::Delete($backup) } } catch {}
     if ($shortcutWarning) {
-        Add-Type -AssemblyName System.Windows.Forms
-        [Windows.Forms.MessageBox]::Show($shortcutWarning, '工具箱更新') | Out-Null
+        Show-Message $shortcutWarning '工具箱更新'
     }
 } catch {
     $message = $_.Exception.Message
     if ($replaced) {
         try {
-            if ($null -ne $started -and -not $started.HasExited) {
-                $killer = Join-Path $env:SystemRoot 'System32\taskkill.exe'
-                & $killer /PID $started.Id /T /F | Out-Null
-                $started.WaitForExit(5000) | Out-Null
+            if ($null -ne $startedProcess -and -not $startedProcess.HasExited) {
+                $killer = [IO.Path]::Combine($env:SystemRoot, 'System32', 'taskkill.exe')
+                $killInfo = [Diagnostics.ProcessStartInfo]::new()
+                $killInfo.FileName = $killer
+                $killInfo.Arguments = '/PID ' + $startedProcess.Id + ' /T /F'
+                $killInfo.UseShellExecute = $false
+                $killInfo.CreateNoWindow = $true
+                $null = [Diagnostics.Process]::Start($killInfo).WaitForExit(5000)
             }
             $deadline = [DateTime]::UtcNow.AddSeconds(30)
             while ($true) {
                 try {
-                    if ([IO.File]::Exists($plan.backup)) {
-                        [IO.File]::Replace($plan.backup, $plan.target, [NullString]::Value)
-                    } elseif ([IO.File]::Exists($plan.target)) {
-                        [IO.File]::Delete($plan.target)
+                    if ([IO.File]::Exists($backup)) {
+                        [IO.File]::Replace($backup, $target, [NullString]::Value)
+                    } elseif ([IO.File]::Exists($target)) {
+                        [IO.File]::Delete($target)
                     }
                     break
                 } catch [IO.IOException] {
                     $code = $_.Exception.GetBaseException().HResult -band 65535
                     if ($code -notin @(32, 33) -or [DateTime]::UtcNow -ge $deadline) { throw }
-                    Start-Sleep -Milliseconds 200
+                    [Threading.Thread]::Sleep(200)
                 }
             }
-        } catch { $message += "`n恢复旧版本失败：" + $_.Exception.Message + "`n请保留备份：" + $plan.backup }
+        } catch {
+            $message += "`n恢复旧版本失败：" + $_.Exception.Message + "`n请保留备份：" + $backup
+        }
     }
-    [IO.File]::WriteAllText($plan.error, $message, [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($errorFile, $message, [Text.UTF8Encoding]::new($false))
     if ($prepared) {
-        Add-Type -AssemblyName System.Windows.Forms
-        [Windows.Forms.MessageBox]::Show('更新失败：' + $message, '工具箱更新失败') | Out-Null
+        Show-Message ('更新失败：' + $message) '工具箱更新失败'
         if ($null -ne $previousProcess -and $previousProcess.HasExited) {
             try {
-                if ($plan.old_arguments) {
-                    Start-Process -FilePath $plan.old_program -ArgumentList $plan.old_arguments | Out-Null
-                } else { Start-Process -FilePath $plan.old_program | Out-Null }
-            } catch {}
+                $null = Start-Program $oldProgram $oldArguments
+            } catch {
+            }
         }
     }
 } finally {
-    if ([IO.File]::Exists($plan.incoming)) { [IO.File]::Delete($plan.incoming) }
-    if ($successful) { Remove-Item -LiteralPath $plan.directory -Recurse -Force }
+    if ([IO.File]::Exists($incoming)) {
+        try { [IO.File]::Delete($incoming) } catch {}
+    }
+    if ($successful) {
+        try { [IO.Directory]::Delete($workDirectory, $true) } catch {}
+    }
 }
 '''
         encoded = base64.b64encode(script.encode('utf-16-le')).decode('ascii')

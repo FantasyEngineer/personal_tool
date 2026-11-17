@@ -1,38 +1,38 @@
 {
-  "version": "1.0.60",
-  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.60/Toolbox-macos.zip",
-  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.60/Toolbox-windows.zip",
-  "changelog": "- 安装包瘦身：Windows 版 37 MB → 27 MB（长截图拼接改纯 Pillow，不再打包 numpy；去掉用不到的 Qt 平台插件、全语言翻译表与 QtNetwork/DBus/Svg）\n- 长截图：滚动拼接换成 Pillow 实现，配准精度不变（真实截图回归逐像素命中），无重叠时照旧提示\n- 模拟锁屏（Windows 版式）：时钟上移到屏幕中部偏上，密码框下移到约 78% 处\n- 离线文字识别：Windows 运行库现在自带 numpy，首次下载的体积略有增加（约 +16 MB）；已下载过旧运行库的会提示重新下载\n- macOS 本次行为不变（numpy 仍随包内置）",
+  "version": "1.0.61",
+  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.61/Toolbox-macos.zip",
+  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.61/Toolbox-windows.zip",
+  "changelog": "- 修复本地离线文字识别一加载就失败（打包漏带标准库模块 queue，运行库下载了也用不了）\n- 启动自愈：槽函数/线程里漏出来的异常会先写进 startup.log，不再「闪一下就消失」且查不到原因\n- 内置诊断：`--test-ocr` 自检改为逐步落盘，扩展模块崩溃时也能定位到具体阶段",
   "ocr_runtime": {
-    "version": "1.0.60",
+    "version": "1.0.61",
     "windows": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.60/ocr-runtime-windows.zip",
-      "sha256": "699b2e29e6183b6fd4a85e333f657455e942d7d5b8dfa9899226b21d62dbd632",
-      "size": 96431964
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.61/ocr-runtime-windows.zip",
+      "sha256": "74f474dfdeddf69038198c02e71a9a2a4c60a6c33479c005405dcd06928536fb",
+      "size": 96597116
     },
     "windows_3_11": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.60/ocr-runtime-windows.zip",
-      "sha256": "699b2e29e6183b6fd4a85e333f657455e942d7d5b8dfa9899226b21d62dbd632",
-      "size": 96431964
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.61/ocr-runtime-windows.zip",
+      "sha256": "74f474dfdeddf69038198c02e71a9a2a4c60a6c33479c005405dcd06928536fb",
+      "size": 96597116
     },
     "windows_3_12": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.60/ocr-runtime-windows-312.zip",
-      "sha256": "47fb20d688ebb35d8afefc31885fadcddff963d0431defecdb38a064a20a0c81",
-      "size": 96350627
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.61/ocr-runtime-windows-312.zip",
+      "sha256": "6375a87814fbfc4000449183f48644e740215be9bac4d466911e0164c1252e24",
+      "size": 96515784
     },
     "macos": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.60/ocr-runtime-macos.zip",
-      "sha256": "3ae77f4a9dcc65d446cd01a0d95ea7830973ddbb31992a7bc67714386bb12d79",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.61/ocr-runtime-macos.zip",
+      "sha256": "960fd3335c6d59ac27dee3f3e7daa5d7abbd3db0d319f242469c2de84178150f",
       "size": 105664901
     },
     "macos_3_11": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.60/ocr-runtime-macos.zip",
-      "sha256": "3ae77f4a9dcc65d446cd01a0d95ea7830973ddbb31992a7bc67714386bb12d79",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.61/ocr-runtime-macos.zip",
+      "sha256": "960fd3335c6d59ac27dee3f3e7daa5d7abbd3db0d319f242469c2de84178150f",
       "size": 105664901
     },
     "macos_3_12": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.60/ocr-runtime-macos-312.zip",
-      "sha256": "e008f3e52c4de9b0b7de2186a85955b95f7448fb526654ed5b8b5c90b18071a6",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.61/ocr-runtime-macos-312.zip",
+      "sha256": "259a66392027935aec642d18327bcc9017e7f3bd658660cb02895604aec70f9d",
       "size": 105671524
     }
   }

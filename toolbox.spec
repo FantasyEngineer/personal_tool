@@ -85,7 +85,10 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=["tkinter", "matplotlib", "PyQt5.QtWebEngine", "PyQt5.QtQml",
-              "PyQt5.QtQuick", "PyQt5.QtQuickWidgets"] + OCR_EXCLUDES,
+              "PyQt5.QtQuick", "PyQt5.QtQuickWidgets",
+              # 纯 QWidget 应用，运行时不会用到这些标准库组件
+              "unittest", "doctest", "pydoc", "pydoc_data", "lib2to3",
+              "ensurepip", "pip", "test"] + OCR_EXCLUDES,
     win_no_prefer_redirects=False,
     noarchive=False,
 )
@@ -107,13 +110,31 @@ SLIM_PREFIXES = (
     "_avif",
 )
 
+# 只按名字匹配挡不住 macOS 上的 framework 目录，这里按收集路径再筛一遍：
+#   Qt5/lib/QtQuick.framework、QtQml、QtQmlModels、QtWebSockets —— 界面全是 QWidget；
+#   plugins/platforms/libqwebgl、libqminimal —— 平台插件只用 cocoa / qwindows；
+#   plugins/generic —— 触摸板输入插件，桌面端不用。
+SLIM_PATHS = (
+    "qt5/lib/qtquick.framework",
+    "qt5/lib/qtqml.framework",
+    "qt5/lib/qtqmlmodels.framework",
+    "qt5/lib/qtwebsockets.framework",
+    "plugins/platforms/libqwebgl",
+    "plugins/platforms/libqminimal",
+    "plugins/generic/",
+)
+
 
 def _keep_binary(entry):
     name = os.path.basename(entry[0]).lower()
-    return not any(name.startswith(prefix) for prefix in SLIM_PREFIXES)
+    path = entry[0].replace(os.sep, "/").lower()
+    if any(name.startswith(prefix) for prefix in SLIM_PREFIXES):
+        return False
+    return not any(part in path for part in SLIM_PATHS)
 
 
 a.binaries = [entry for entry in a.binaries if _keep_binary(entry)]
+a.datas = [entry for entry in a.datas if _keep_binary(entry)]
 
 # 统一 MSVC 运行时版本，避免按需下载的 onnxruntime（用新 MSVC 编译）加载到
 # Qt 自带的旧版 MSVCP140.dll（14.26）后在 MSVCP140.dll 里访问违例闪退。
@@ -160,7 +181,9 @@ EXE_OPTS = dict(
     name=APP_NAME,
     debug=False,
     bootloader_ignore_signals=False,
-    strip=False,
+    # 只在 macOS 上 strip：PyInstaller 不支持给 Windows 的 exe 做 strip，
+    # 而 macOS 的 dylib/framework 里留着大量调试符号，strip 后可省几个 MB。
+    strip=sys.platform == "darwin",
     upx=False,
     console=False,          # windowed app: no terminal window
     icon=icon,
@@ -176,7 +199,7 @@ else:
         exe,
         a.binaries,
         a.datas,
-        strip=False,
+        strip=sys.platform == "darwin",
         upx=False,
         name=APP_NAME,
     )

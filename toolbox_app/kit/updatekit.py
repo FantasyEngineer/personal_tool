@@ -3,6 +3,7 @@
 不依赖 QtWidgets；QStandardPaths 只是取「下载」目录的值类型。QThread/QDialog 与
 平台安装脚本仍在界面层。
 """
+import base64
 import json
 import ntpath
 import os
@@ -17,7 +18,8 @@ import plistlib
 
 from PyQt5.QtCore import QStandardPaths
 
-from toolbox_app.constants import UPDATE_TARGET_PATH
+from toolbox_app.constants import APP_VERSION, UPDATE_TARGET_PATH
+from toolbox_app.kit.netkit import https_context
 
 
 def update_version_parts(version):
@@ -33,6 +35,67 @@ def validate_update_url(url):
     parts = urllib.parse.urlsplit(url)
     if parts.scheme != 'https' or not parts.hostname or parts.username or parts.password or parts.fragment:
         raise ValueError("更新仅接受不含账号信息的 HTTPS 下载地址。")
+
+
+UPDATE_ENDPOINTS = (
+    ("Gitee 接口",
+     "https://gitee.com/api/v5/repos/jimmy_hou/personal_tool/contents/version.json?ref=main"),
+    ("GitHub 接口",
+     "https://api.github.com/repos/FantasyEngineer/personal_tool/contents/version.json?ref=main"),
+    ("GitHub 原文",
+     "https://raw.githubusercontent.com/FantasyEngineer/personal_tool/main/version.json"),
+    ("Gitee 原文",
+     "https://gitee.com/jimmy_hou/personal_tool/raw/main/version.json"),
+)
+
+
+class UpdateFetchError(Exception):
+    """所有更新源都连不上时的汇总错误，消息里逐条列出每个源的失败原因。"""
+
+
+def _read_version_bytes(url, timeout):
+    validate_update_url(url)
+    request = urllib.request.Request(url, headers={"User-Agent": "Toolbox/" + APP_VERSION})
+    opener = urllib.request.build_opener(
+        UpdateRedirectHandler(), urllib.request.HTTPSHandler(context=https_context()))
+    with opener.open(request, timeout=timeout) as response:
+        validate_update_url(response.geturl())
+        content = response.read(1024 * 1024 + 1)
+    if len(content) > 1024 * 1024:
+        raise ValueError("更新信息超出大小限制。")
+    return content
+
+
+def decode_version_envelope(content):
+    """Gitee / GitHub 的 contents 接口都返回 base64 信封，这里统一拆开。"""
+    envelope = json.loads(content.decode("utf-8"))
+    if (not isinstance(envelope, dict) or envelope.get("encoding") != "base64"
+            or not isinstance(envelope.get("content"), str)):
+        raise ValueError("更新服务器返回的文件信息无效。")
+    data = json.loads(base64.b64decode(envelope["content"], validate=True).decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("更新服务器返回的内容不是版本信息。")
+    return data
+
+
+def fetch_version_data(timeout=8):
+    """按 UPDATE_ENDPOINTS 顺序挨个试，拿到 version.json 的内容就返回。
+
+    有些网络（尤其国内访问 gitee 的 raw 文件）会在 TLS 握手后直接 RST，
+    报 WinError 10054 / 「远程主机强制关闭了一个现有的连接」，所以单源必然不稳。
+    """
+    failures = []
+    for name, url in UPDATE_ENDPOINTS:
+        try:
+            return decode_version_envelope(_read_version_bytes(url, timeout))
+        except Exception as exc:
+            failures.append("%s：%s" % (name, exc))
+    raise UpdateFetchError(
+        "所有更新源都连不上（多半是网络或代理拦了这些地址）：\n"
+        + "\n".join("- " + item for item in failures)
+        + "\n\n可以稍后重试，或手动从 GitHub Release 下载新版："
+          "\nhttps://github.com/FantasyEngineer/personal_tool/releases/latest"
+    )
 
 
 class UpdateRedirectHandler(urllib.request.HTTPRedirectHandler):

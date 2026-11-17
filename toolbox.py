@@ -66,7 +66,7 @@ from PyQt5.QtGui import (QFont, QCursor, QTextCursor, QColor, QPen, QPixmap, QPa
 
 
 from toolbox_app.constants import (
-    APP_VERSION, UPDATE_CHECK_URL,
+    APP_VERSION,
     LAUNCHER_BTN_W, LAUNCHER_BTN_H, LAUNCHER_GRID_SPACING,
     JSON_HISTORY_PATH, TOOL_USAGE_HISTORY_PATH, SEARCH_HISTORY_PATH,
     SHORTCUTS_PATH, TOOL_RENAMES,
@@ -119,6 +119,7 @@ from toolbox_app.kit import adbkit
 from toolbox_app.kit import cronkit
 from toolbox_app.kit.updatekit import (
     update_version_parts, validate_update_url, UpdateRedirectHandler,
+    fetch_version_data, UpdateFetchError,
     mac_app_bundle, mac_app_translocated, mac_downloads_dir, mac_applications_dir,
     save_update_target, update_install_target,
     extract_update_package,
@@ -14915,26 +14916,15 @@ class CheckUpdateThread(QThread):
     
     def run(self):
         try:
-            validate_update_url(UPDATE_CHECK_URL)
-            req = urllib.request.Request(UPDATE_CHECK_URL, headers={'User-Agent': f'Toolbox/{APP_VERSION}'})
-            opener = urllib.request.build_opener(
-                UpdateRedirectHandler(), urllib.request.HTTPSHandler(context=https_context()))
-            with opener.open(req, timeout=10) as response:
-                validate_update_url(response.geturl())
-                content = response.read(1024 * 1024 + 1)
-                if len(content) > 1024 * 1024:
-                    raise ValueError('更新信息超出大小限制。')
-                envelope = json.loads(content.decode('utf-8'))
-                if (not isinstance(envelope, dict) or envelope.get('encoding') != 'base64'
-                        or not isinstance(envelope.get('content'), str)):
-                    raise ValueError('更新服务器返回的文件信息无效。')
-                data = json.loads(base64.b64decode(envelope['content'], validate=True).decode('utf-8'))
-            if not isinstance(data, dict):
-                raise ValueError('更新服务器返回的内容不是版本信息。')
+            # Gitee 接口挂掉时自动换 GitHub 接口 / 原文地址，单源不稳（会被 RST）
+            data = fetch_version_data()
             update_version_parts(data.get('version'))
             if not isinstance(data.get('changelog', ''), str):
                 raise ValueError('更新说明格式无效。')
             self.result.emit(True, data, "")
+        except UpdateFetchError as e:
+            print(f"[Update] all sources failed: {e}")
+            self.result.emit(False, {}, str(e))
         except urllib.error.URLError as e:
             print(f"[Update] URLError: {e}")
             self.result.emit(False, {}, f"无法连接到更新服务器：\n{e}")

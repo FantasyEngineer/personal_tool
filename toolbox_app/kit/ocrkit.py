@@ -21,10 +21,10 @@ import zipfile
 from PIL import Image
 from PyQt5.QtCore import Qt
 
-from toolbox_app.constants import APP_VERSION, UPDATE_CHECK_URL, OCR_SETTINGS_PATH
+from toolbox_app.constants import OCR_SETTINGS_PATH
 from toolbox_app.natives import win_no_console
 from toolbox_app.storage import cache_root
-from toolbox_app.kit.updatekit import validate_update_url, UpdateRedirectHandler
+from toolbox_app.kit.updatekit import fetch_version_data, validate_update_url
 from toolbox_app.kit.netkit import https_context
 
 OCR_ENGINE_MODES = ("system", "rapidocr", "llm")
@@ -522,21 +522,8 @@ def reset_ocr_runtime_cache():
 
 
 def fetch_ocr_runtime_info():
-    """从 version.json 取当前平台的离线 OCR 运行时下载信息。"""
-    validate_update_url(UPDATE_CHECK_URL)
-    request = urllib.request.Request(UPDATE_CHECK_URL,
-                                     headers={"User-Agent": "Toolbox/" + APP_VERSION})
-    opener = urllib.request.build_opener(
-        UpdateRedirectHandler(), urllib.request.HTTPSHandler(context=https_context()))
-    with opener.open(request, timeout=10) as response:
-        content = response.read(1024 * 1024 + 1)
-    if len(content) > 1024 * 1024:
-        raise ValueError("更新信息超出大小限制。")
-    envelope = json.loads(content.decode("utf-8"))
-    if (not isinstance(envelope, dict) or envelope.get("encoding") != "base64"
-            or not isinstance(envelope.get("content"), str)):
-        raise ValueError("更新服务器返回的文件信息无效。")
-    data = json.loads(base64.b64decode(envelope["content"], validate=True).decode("utf-8"))
+    """从 version.json 取当前平台的离线 OCR 运行时下载信息（多源兜底）。"""
+    data = fetch_version_data()
     runtime = data.get("ocr_runtime") if isinstance(data, dict) else None
     if not isinstance(runtime, dict):
         raise ValueError("当前版本还没有提供离线识别引擎。")

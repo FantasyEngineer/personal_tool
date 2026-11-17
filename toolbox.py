@@ -4507,7 +4507,15 @@ class LongShotSession(QObject):
         self._busy = False
         if self._done:
             return
-        appended = self._take(first)
+        try:
+            appended = self._take(first)
+        except Exception:
+            # 这里是 Qt 定时器槽：异常漏出去 PyQt5 会直接 qFatal 结束进程（表现为闪退），
+            # 所以就地兜住，写成日志再给用户一句提示。
+            detail = traceback.format_exc()
+            write_startup_log("长截图抓帧失败：\n" + detail)
+            self._finish("长截图失败：%s" % detail.strip().splitlines()[-1][:160], ok=False)
+            return
         if self._done:
             return
         self._show_mask()

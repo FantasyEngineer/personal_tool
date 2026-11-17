@@ -1,38 +1,38 @@
 {
-  "version": "1.0.53",
-  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.53/Toolbox-macos.zip",
-  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.53/Toolbox-windows.zip",
-  "changelog": "- JSON 处理改成多标签：每标签独立输入/结果，结果改为可折叠树\n- chore: update version.json for v1.0.51 [skip ci]\n- chore: update version.json for v1.0.51",
+  "version": "1.0.54",
+  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.54/Toolbox-macos.zip",
+  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.54/Toolbox-windows.zip",
+  "changelog": "- Windows 应用内更新不再依赖 PowerShell cmdlet：安装脚本整体改成 .NET API（SHA256 校验、进程等待、文件替换、快捷方式、弹窗），修掉 Get-FileHash 无法识别导致的「安装失败，旧版本未被修改」\n- 安装参数从 install.json 改为逐个环境变量传递，SHA256 由 Python 预先算好\n- 更新弹窗的 changelog 不再混入 CI 自动提交：CI 生成 version.json 前补 fetch 附注 tag，回退到提交记录时过滤 update version.json / chore / [skip ci]",
   "ocr_runtime": {
-    "version": "1.0.53",
+    "version": "1.0.54",
     "windows": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.53/ocr-runtime-windows.zip",
-      "sha256": "2f85ef1d093df57d353c1aeafca13395c75fc7e6276bb7fd155bd3e631d70ac9",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.54/ocr-runtime-windows.zip",
+      "sha256": "9f6e77e89c9cf2309b5de23c694aa685d3d59290bf7e8cc7d1c72920d9699ceb",
       "size": 85492864
     },
     "windows_3_11": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.53/ocr-runtime-windows.zip",
-      "sha256": "2f85ef1d093df57d353c1aeafca13395c75fc7e6276bb7fd155bd3e631d70ac9",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.54/ocr-runtime-windows.zip",
+      "sha256": "9f6e77e89c9cf2309b5de23c694aa685d3d59290bf7e8cc7d1c72920d9699ceb",
       "size": 85492864
     },
     "windows_3_12": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.53/ocr-runtime-windows-312.zip",
-      "sha256": "e0858cc53619ab19d269800d175758492bf8175ebc341b0cc7b8d8b83486e023",
-      "size": 85474575
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.54/ocr-runtime-windows-312.zip",
+      "sha256": "556da6e69a170540307b88373a552a6811030a36ae0560a43aee55aaf06b71cd",
+      "size": 85474576
     },
     "macos": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.53/ocr-runtime-macos.zip",
-      "sha256": "ce87f7e8cebc6aa0519c02ee98f5ff3c48fc23069794e45ceb35f813e2d14d39",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.54/ocr-runtime-macos.zip",
+      "sha256": "cba121efdf028acf7437462c5fa15c4ca390b55b4b8fd36d496a4f369bff20d0",
       "size": 105664901
     },
     "macos_3_11": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.53/ocr-runtime-macos.zip",
-      "sha256": "ce87f7e8cebc6aa0519c02ee98f5ff3c48fc23069794e45ceb35f813e2d14d39",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.54/ocr-runtime-macos.zip",
+      "sha256": "cba121efdf028acf7437462c5fa15c4ca390b55b4b8fd36d496a4f369bff20d0",
       "size": 105664901
     },
     "macos_3_12": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.53/ocr-runtime-macos-312.zip",
-      "sha256": "a78e35e713f900a07bdfd2e466a99b2b086a46fc546f85252aeaa129f13dd9f4",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.54/ocr-runtime-macos-312.zip",
+      "sha256": "3b9cef1f6953cd3198b8c041a3061d572898b289075040784a0929854dc8cf26",
       "size": 105671524
     }
   }

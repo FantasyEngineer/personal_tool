@@ -1,38 +1,38 @@
 {
-  "version": "1.0.53",
-  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.53/Toolbox-macos.zip",
-  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.53/Toolbox-windows.zip",
-  "changelog": "- JSON 处理改成多标签：每标签独立输入/结果，结果改为可折叠树\n- chore: update version.json for v1.0.51 [skip ci]\n- chore: update version.json for v1.0.51",
+  "version": "0.0.99",
+  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v0.0.99/Toolbox-macos.zip",
+  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v0.0.99/Toolbox-windows.zip",
+  "changelog": "版本更新",
   "ocr_runtime": {
-    "version": "1.0.53",
+    "version": "0.0.99",
     "windows": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.53/ocr-runtime-windows.zip",
-      "sha256": "2f85ef1d093df57d353c1aeafca13395c75fc7e6276bb7fd155bd3e631d70ac9",
-      "size": 85492864
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v0.0.99/ocr-runtime-windows.zip",
+      "sha256": "d4bea1dc5e0c00595f2ba616afe9b993db211a246e6d4166ff192076b78cf9dd",
+      "size": 85492866
     },
     "windows_3_11": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.53/ocr-runtime-windows.zip",
-      "sha256": "2f85ef1d093df57d353c1aeafca13395c75fc7e6276bb7fd155bd3e631d70ac9",
-      "size": 85492864
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v0.0.99/ocr-runtime-windows.zip",
+      "sha256": "d4bea1dc5e0c00595f2ba616afe9b993db211a246e6d4166ff192076b78cf9dd",
+      "size": 85492866
     },
     "windows_3_12": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.53/ocr-runtime-windows-312.zip",
-      "sha256": "e0858cc53619ab19d269800d175758492bf8175ebc341b0cc7b8d8b83486e023",
-      "size": 85474575
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v0.0.99/ocr-runtime-windows-312.zip",
+      "sha256": "fc859926633f802b15ba0943af79c32700426af4709738ebb7f69b5593635f3f",
+      "size": 85474576
     },
     "macos": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.53/ocr-runtime-macos.zip",
-      "sha256": "ce87f7e8cebc6aa0519c02ee98f5ff3c48fc23069794e45ceb35f813e2d14d39",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v0.0.99/ocr-runtime-macos.zip",
+      "sha256": "ee3e89064e8c1df4094b65c550b3eb3117130b665641a54ae6ba16aa8077437b",
       "size": 105664901
     },
     "macos_3_11": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.53/ocr-runtime-macos.zip",
-      "sha256": "ce87f7e8cebc6aa0519c02ee98f5ff3c48fc23069794e45ceb35f813e2d14d39",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v0.0.99/ocr-runtime-macos.zip",
+      "sha256": "ee3e89064e8c1df4094b65c550b3eb3117130b665641a54ae6ba16aa8077437b",
       "size": 105664901
     },
     "macos_3_12": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.53/ocr-runtime-macos-312.zip",
-      "sha256": "a78e35e713f900a07bdfd2e466a99b2b086a46fc546f85252aeaa129f13dd9f4",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v0.0.99/ocr-runtime-macos-312.zip",
+      "sha256": "0014bdb98ce647803f452d6eafbbb41959c56c9df5d4066e4e56fd04ebc29c20",
       "size": 105671524
     }
   }

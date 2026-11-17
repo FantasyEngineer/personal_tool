@@ -12991,6 +12991,11 @@ class ToolboxWindow(QMainWindow):
                 if n not in assigned:
                     assigned.add(n)
                     self.tool_order[cat].append(n)
+        # 新工具默认会被追加到末尾；「模拟锁屏」挪到「防黑屏」旁边，语义上是一组
+        for names in self.tool_order.values():
+            if "模拟锁屏" in names and "防黑屏" in names:
+                names.remove("模拟锁屏")
+                names.insert(names.index("防黑屏") + 1, "模拟锁屏")
         self.apply_tool_order()
 
         self.empty_search_label = QLabel("没有找到匹配的工具\n试试功能名称、拼音，或清除搜索。")

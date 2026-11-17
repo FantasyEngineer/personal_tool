@@ -8,3 +8,6 @@ dist/
 vibe_images/
 .DS_Store
 assets/icon.iconset/
+
+# 本地派生 spec，只在打包时临时生成
+toolbox_local_ocr.spec

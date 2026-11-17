@@ -61,8 +61,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QAbstractItemView, QKeySequenceEdit, QProgressBar, QSizePolicy)
 from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QThread, QObject, pyqtSignal, QTimer, QUrl, QLockFile, QDate, QDateTime, QTime, QAbstractNativeEventFilter, QEvent, QSize, QStandardPaths, QPropertyAnimation, QEasingCurve
 from PyQt5.QtGui import (QFont, QCursor, QTextCursor, QColor, QPen, QPixmap, QPainter, QIcon,
-                         QImage, QLinearGradient, QBrush, QDesktopServices, QPalette, QKeySequence,
-                         QPainterPath, QPolygonF, QFontMetrics)
+                         QImage, QLinearGradient, QRadialGradient, QBrush, QDesktopServices, QPalette,
+                         QKeySequence, QPainterPath, QPolygonF, QFontMetrics)
 
 
 from toolbox_app.constants import (
@@ -4762,6 +4762,208 @@ class AdbDownloadWorker(QThread):
         except Exception as exc:
             if not self.cancelled.is_set():
                 self.failed.emit(str(exc)[:300])
+
+
+class LockScreenOverlay(QWidget):
+    """一块屏幕上的模拟锁屏：全屏置顶、吞掉键鼠，点两下才回到桌面。"""
+
+    def __init__(self, screen, on_unlock):
+        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setCursor(Qt.ArrowCursor)
+        self._on_unlock = on_unlock
+        self._armed = False
+        self.setGeometry(screen.geometry())
+
+        self.unlock_btn = QPushButton("点击解锁", self)
+        self.unlock_btn.setCursor(Qt.PointingHandCursor)
+        self.unlock_btn.setFixedHeight(34)
+        self.unlock_btn.setVisible(False)
+        self.unlock_btn.setStyleSheet("""
+            QPushButton { background: rgba(255,255,255,0.18); color: #FFFFFF;
+                border: 1px solid rgba(255,255,255,0.38); border-radius: 17px;
+                font-size: 13px; padding: 0 24px; }
+            QPushButton:hover { background: rgba(255,255,255,0.30); }
+        """)
+        self.unlock_btn.clicked.connect(self._unlock)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(500)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+
+    # ---------- 画面 ----------
+    def _tick(self):
+        self.raise_()          # 别被别的窗口盖过去
+        self.update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.unlock_btn.move(int((self.width() - self.unlock_btn.width()) / 2),
+                             int(self.height() * 0.74))
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        rect = QRectF(self.rect())
+
+        gradient = QLinearGradient(rect.topLeft(), QPointF(rect.width() * 0.45, rect.height()))
+        gradient.setColorAt(0.0, QColor("#1B2440"))
+        gradient.setColorAt(0.55, QColor("#141A31"))
+        gradient.setColorAt(1.0, QColor("#0B1020"))
+        painter.fillRect(rect, gradient)
+
+        # 两团柔光，模仿壁纸的景深，不至于一片死黑
+        for cx, cy, radius, color in ((0.16, 0.20, 0.62, QColor(96, 134, 255, 72)),
+                                      (0.88, 0.76, 0.68, QColor(255, 138, 92, 52))):
+            glow = QRadialGradient(QPointF(rect.width() * cx, rect.height() * cy),
+                                   rect.height() * radius)
+            glow.setColorAt(0.0, color)
+            glow.setColorAt(1.0, QColor(0, 0, 0, 0))
+            painter.setBrush(QBrush(glow))
+            painter.setPen(Qt.NoPen)
+            painter.drawRect(rect)
+
+        now = QDateTime.currentDateTime()
+
+        clock_font = QFont("Helvetica Neue")
+        clock_font.setWeight(QFont.Light)
+        clock_font.setPixelSize(max(56, int(rect.height() * 0.155)))
+        painter.setFont(clock_font)
+        painter.setPen(QColor("#F3F6FF"))
+        painter.drawText(QRectF(0, rect.height() * 0.26, rect.width(), rect.height() * 0.22),
+                         Qt.AlignHCenter | Qt.AlignVCenter, now.toString("HH:mm"))
+
+        date_font = QFont("PingFang SC")
+        date_font.setPixelSize(18)
+        painter.setFont(date_font)
+        painter.setPen(QColor(228, 236, 252, 205))
+        weekday = "一二三四五六日"[now.date().dayOfWeek() - 1]
+        painter.drawText(QRectF(0, rect.height() * 0.48, rect.width(), 30),
+                         Qt.AlignHCenter | Qt.AlignVCenter,
+                         "%d月%d日  星期%s" % (now.date().month(), now.date().day(), weekday))
+
+        # 头像圈
+        avatar_r = 22
+        painter.setBrush(QColor(255, 255, 255, 38))
+        painter.setPen(QColor(255, 255, 255, 60))
+        painter.drawEllipse(QPointF(rect.width() / 2, rect.height() * 0.62), avatar_r, avatar_r)
+        painter.setPen(QColor(240, 245, 255))
+        avatar_font = QFont("PingFang SC")
+        avatar_font.setPixelSize(16)
+        painter.setFont(avatar_font)
+        painter.drawText(QRectF(rect.width() / 2 - avatar_r, rect.height() * 0.62 - avatar_r,
+                                avatar_r * 2, avatar_r * 2),
+                         Qt.AlignCenter, "🔒")
+
+        name_font = QFont("PingFang SC")
+        name_font.setPixelSize(14)
+        painter.setFont(name_font)
+        painter.setPen(QColor(226, 235, 252, 190))
+        painter.drawText(QRectF(0, rect.height() * 0.62 + avatar_r + 6, rect.width(), 24),
+                         Qt.AlignHCenter | Qt.AlignVCenter, self._user_name())
+
+        hint_font = QFont("PingFang SC")
+        hint_font.setPixelSize(13)
+        painter.setFont(hint_font)
+        painter.setPen(QColor(214, 226, 250, 170))
+        hint = "点击任意位置，或按任意键，再点「点击解锁」" if not self._armed else ""
+        painter.drawText(QRectF(0, rect.height() * 0.72, rect.width(), 26),
+                         Qt.AlignHCenter | Qt.AlignVCenter, hint)
+        painter.setPen(QColor(178, 194, 226, 120))
+        painter.drawText(QRectF(0, rect.height() - 70, rect.width(), 24),
+                         Qt.AlignHCenter | Qt.AlignVCenter,
+                         "模拟锁屏 · 屏幕常亮、系统不休眠，后台任务继续运行")
+
+    def _user_name(self):
+        home = os.path.expanduser("~")
+        return os.path.basename(home.rstrip("/")) or "Toolbox"
+
+    # ---------- 交互 ----------
+    def mousePressEvent(self, event):
+        if not self._armed:
+            self._armed = True
+            self.unlock_btn.adjustSize()
+            self.unlock_btn.move(int((self.width() - self.unlock_btn.width()) / 2),
+                                 int(self.height() * 0.74))
+            self.unlock_btn.show()
+            self.update()
+
+    def keyPressEvent(self, event):
+        # 第一下按键只是「唤醒锁屏」，再按回车才解锁，避免手滑碰键盘就暴露桌面
+        if not self._armed:
+            self._armed = True
+            self.unlock_btn.adjustSize()
+            self.unlock_btn.move(int((self.width() - self.unlock_btn.width()) / 2),
+                                 int(self.height() * 0.74))
+            self.unlock_btn.show()
+            self.update()
+            return
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            self._unlock()
+
+    def _unlock(self):
+        if callable(self._on_unlock):
+            self._on_unlock()
+
+
+class LockScreenController(QObject):
+    """把所有屏幕铺满模拟锁屏，同时按住系统不休眠。"""
+
+    unlocked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.overlays = []
+        self._awake = None
+
+    def is_locked(self):
+        return bool(self.overlays)
+
+    def lock(self):
+        if self.overlays:
+            return
+        screens = QApplication.screens()
+        for screen in screens:
+            overlay = LockScreenOverlay(screen, self.unlock)
+            overlay.show()
+            overlay.raise_()
+            overlay.activateWindow()
+            overlay.setFocus()
+            self.overlays.append(overlay)
+        self._keep_awake(True)
+
+    def unlock(self):
+        for overlay in list(self.overlays):
+            try:
+                overlay.close()
+                overlay.deleteLater()
+            except Exception:
+                pass
+        self.overlays = []
+        self._keep_awake(False)
+        self.unlocked.emit()
+
+    def _keep_awake(self, active):
+        try:
+            if active:
+                if self._awake is None or self._awake.poll() is not None:
+                    # 屏幕不熄、系统不休眠，后台任务照常跑
+                    self._awake = subprocess.Popen(
+                        ["caffeinate", "-d", "-i", "-m", "-s"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                if self._awake is not None and self._awake.poll() is None:
+                    # caffeinate 对 SIGTERM / SIGINT 不响应，只能 SIGKILL
+                    self._awake.kill()
+                    try:
+                        self._awake.wait(timeout=2)
+                    except Exception:
+                        pass
+                self._awake = None
+        except Exception:
+            self._awake = None
 
 
 class AdbWindow(QMainWindow):
@@ -10868,6 +11070,7 @@ TOOL_TIPS = {
     "图片处理": "页签：转 Base64 / 格式转换 / 缩放压缩",
     "文字雨": "功能：桌面字符雨特效，开启时自动防黑屏（开关）",
     "防黑屏": "功能：阻止系统休眠与屏幕关闭（开关）",
+    "模拟锁屏": "功能：模仿 Windows / macOS 的全屏锁屏界面（时间日期 · 点击解锁），人走后挡住桌面，同时让电脑保持唤醒、后台程序继续运行",
     "数字转换": "页签：进制转换（二进制 / 八进制 / 十进制 / 十六进制）/ 罗马数字 / 金额大写",
     "商余计算": "功能：求整除的商和余数",
     "单位转换": "页签：字节 / 时间 / 长度 / 重量 / 面积 / 体积 / 速度 / 温度",
@@ -10970,6 +11173,9 @@ PINYIN_MAP = {
     "wenziyu": ["文字雨"],
     "yu": ["文字雨"],
     "fangheiping": ["防黑屏"],
+    "monisuoping": ["模拟锁屏"],
+    "suoping": ["模拟锁屏"],
+    "lock": ["模拟锁屏"],
     "heiping": ["防黑屏"],
     "xiuxi": ["防黑屏"],
     "jinzhi": ["数字转换"],
@@ -12699,13 +12905,15 @@ class ToolboxWindow(QMainWindow):
         self.toggle_buttons = {}
         self._caffeinate = None
         self._rain_overlay = None
+        self._locker = None
         self._rain_saved_awake = None
         self.all_buttons = {}  # 存储按钮引用用于搜索过滤
         self.sections = []  # 存储 (section_widget, [button_texts]) 用于搜索时隐藏空分类
         self._tool_callbacks = {}
 
         self.create_section("系统与桌面", [
-            "网络诊断", "进程管理", "配置", "截图贴图", "长截图", "取色器", "图片处理", "防黑屏", "文字雨"
+            "网络诊断", "进程管理", "配置", "截图贴图", "长截图", "取色器", "图片处理",
+            "防黑屏", "模拟锁屏", "文字雨"
         ], {
             "网络诊断": self.show_network,
             "进程管理": self.show_process_search,
@@ -12716,6 +12924,7 @@ class ToolboxWindow(QMainWindow):
             "图片处理": self.show_image_tool
         }, {
             "防黑屏": self.set_awake,
+            "模拟锁屏": self.set_fake_lock,
             "文字雨": self.set_matrix_rain
         })
 
@@ -13121,6 +13330,23 @@ class ToolboxWindow(QMainWindow):
             from PyQt5.QtWidgets import QMessageBox
             QMessageBox.warning(self, "防黑屏", f"无法启动防休眠: {e}")
 
+    def set_fake_lock(self, active):
+        """模拟锁屏开关：铺满屏幕挡住画面，同时按住系统不休眠。"""
+        if self._locker is None:
+            self._locker = LockScreenController(self)
+            self._locker.unlocked.connect(self._after_fake_lock_released)
+        if active:
+            self._locker.lock()
+        else:
+            self._locker.unlock()
+
+    def _after_fake_lock_released(self):
+        btn = self.toggle_buttons.get("模拟锁屏")
+        if btn is not None and btn.isChecked():
+            btn.blockSignals(True)
+            btn.setChecked(False)
+            btn.blockSignals(False)
+
     def set_matrix_rain(self, active):
         awake_btn = self.toggle_buttons.get("防黑屏")
         if active:
@@ -13203,6 +13429,11 @@ class ToolboxWindow(QMainWindow):
         # 无论哪种退出路径，都做资源清理
         try:
             self.set_awake(False)
+        except Exception:
+            pass
+        try:
+            if self._locker is not None:
+                self._locker.unlock()
         except Exception:
             pass
         try:

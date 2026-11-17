@@ -76,6 +76,18 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller --noconfirm toolbox.spec
 
+      - name: Trim dangling framework symlinks (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # 瘦身把 QtQuick/QtQml/QtWebSockets 等 framework 裁掉后，
+          # PyInstaller 仍在 Contents/Frameworks 和 Contents/Resources 下留了
+          # 指向这些 framework 的符号链接；断链会让后面的 codesign --verify
+          # 报 "No such file or directory"，所以签名前先清掉。
+          APP="$(find "$GITHUB_WORKSPACE/dist" -maxdepth 3 -name 'Toolbox.app' -type d | head -n1)"
+          if [ -z "$APP" ]; then echo "Toolbox.app not found under dist/"; ls -R dist; exit 1; fi
+          find "$APP" -type l ! -exec test -e {} \; -print -delete
+          echo "dangling symlinks cleaned: $APP"
+
       - name: Ad-hoc codesign (macOS)
         if: runner.os == 'macOS'
         run: |

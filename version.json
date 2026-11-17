@@ -1,38 +1,38 @@
 {
-  "version": "1.0.44",
-  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.44/Toolbox-macos.zip",
-  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.44/Toolbox-windows.zip",
-  "changelog": "- ADB 调试界面紧凑化：默认高度从 ~800 降到 517\n- chore: update version.json for v1.0.42 [skip ci]",
+  "version": "1.0.46",
+  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.46/Toolbox-macos.zip",
+  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.46/Toolbox-windows.zip",
+  "changelog": "- 模拟锁屏按钮挪到「防黑屏」旁边，旧 tool_order.json 也做迁移\n- chore: update version.json for v1.0.44 [skip ci]",
   "ocr_runtime": {
-    "version": "1.0.44",
+    "version": "1.0.46",
     "windows": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.44/ocr-runtime-windows.zip",
-      "sha256": "d549f8b5c20cb6b30bb2f821787063aef67315d0268a94d72bc42c2015ff2691",
-      "size": 85492864
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.46/ocr-runtime-windows.zip",
+      "sha256": "fd02d814eb40b79b1030bfee78ac618f66695986ce44fea51199ff5b81c0554b",
+      "size": 85492865
     },
     "windows_3_11": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.44/ocr-runtime-windows.zip",
-      "sha256": "d549f8b5c20cb6b30bb2f821787063aef67315d0268a94d72bc42c2015ff2691",
-      "size": 85492864
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.46/ocr-runtime-windows.zip",
+      "sha256": "fd02d814eb40b79b1030bfee78ac618f66695986ce44fea51199ff5b81c0554b",
+      "size": 85492865
     },
     "windows_3_12": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.44/ocr-runtime-windows-312.zip",
-      "sha256": "ced6c7c44154467e6d44df95c150a505e9e89ab7e32abc2914146a8fbb314efc",
-      "size": 85474577
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.46/ocr-runtime-windows-312.zip",
+      "sha256": "861eed24f7b2e1b2b799ebf5ed1ea7a0f756da8de2c3b8bb34a5d7ee90714690",
+      "size": 85474578
     },
     "macos": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.44/ocr-runtime-macos.zip",
-      "sha256": "d206f843ed222313040e287d9f0da1d6db9744ad609823e61e4dfd4fcf2673d8",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.46/ocr-runtime-macos.zip",
+      "sha256": "1568c1518f4a4c92d6957e6dc149f245a7f168ddb43622f8f19fc780f1e40d2e",
       "size": 105664901
     },
     "macos_3_11": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.44/ocr-runtime-macos.zip",
-      "sha256": "d206f843ed222313040e287d9f0da1d6db9744ad609823e61e4dfd4fcf2673d8",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.46/ocr-runtime-macos.zip",
+      "sha256": "1568c1518f4a4c92d6957e6dc149f245a7f168ddb43622f8f19fc780f1e40d2e",
       "size": 105664901
     },
     "macos_3_12": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.44/ocr-runtime-macos-312.zip",
-      "sha256": "b0c2645f2bb6e609ebecd534df4f1141566290b01f3a1f8473bdf59f80d2eefd",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.46/ocr-runtime-macos-312.zip",
+      "sha256": "9e09b02160ef10900a1a6e74d6e563e1a0fd368233b329beb4acb94272136ca0",
       "size": 105671524
     }
   }

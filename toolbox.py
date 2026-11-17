@@ -4765,6 +4765,29 @@ class AdbDownloadWorker(QThread):
                 self.failed.emit(str(exc)[:300])
 
 
+def _windows_force_foreground(widget):
+    """Windows：把窗口从最小化拉回来并抢到最前。
+
+    Qt 的 raise_/activateWindow 在 Windows 上不保证生效：窗口最小化时 isVisible()
+    仍然是 True，只 raise 不会解除最小化；还有「只有前台进程才能抢焦点」的限制，
+    后台进程调用 SetForegroundWindow 只会闪一下任务栏。这里补两步系统调用。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = int(widget.winId())
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        user32.SetForegroundWindow(hwnd)
+        if user32.GetForegroundWindow() != hwnd:
+            # 模拟一次 Alt 键，系统才会把前台权限交给本进程
+            user32.keybd_event(0x12, 0, 0, 0)
+            user32.keybd_event(0x12, 0, 2, 0)
+            user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+
+
 def _raise_above_menubar(widget):
     """macOS：把窗口层级抬到菜单栏 / Dock 之上，否则铺不满整块屏幕。"""
     if sys.platform != "darwin":
@@ -13692,18 +13715,20 @@ class ToolboxWindow(QMainWindow):
         self.tray_icon.show()
 
     def show_from_tray(self):
-        self.show()
+        """从托盘图标恢复主窗口：最小化状态也要先解除，再抢到最前。"""
+        if self.isMinimized():
+            self.showNormal()
+        if not self.isVisible():
+            self.show()
+        self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
         self.raise_()
         self.activateWindow()
+        _windows_force_foreground(self)
 
     def on_tray_activated(self, reason):
         # 双击（Mac 上单击）恢复窗口
         if reason in (QSystemTrayIcon.DoubleClick, QSystemTrayIcon.Trigger):
-            if self.isVisible():
-                self.raise_()
-                self.activateWindow()
-            else:
-                self.show_from_tray()
+            self.show_from_tray()
 
     def quit_app(self):
         """真正退出：清理托盘并结束进程。"""

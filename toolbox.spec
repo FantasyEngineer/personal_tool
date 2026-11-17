@@ -181,9 +181,7 @@ EXE_OPTS = dict(
     name=APP_NAME,
     debug=False,
     bootloader_ignore_signals=False,
-    # 只在 macOS 上 strip：PyInstaller 不支持给 Windows 的 exe 做 strip，
-    # 而 macOS 的 dylib/framework 里留着大量调试符号，strip 后可省几个 MB。
-    strip=sys.platform == "darwin",
+    strip=False,
     upx=False,
     console=False,          # windowed app: no terminal window
     icon=icon,
@@ -199,7 +197,7 @@ else:
         exe,
         a.binaries,
         a.datas,
-        strip=sys.platform == "darwin",
+        strip=False,
         upx=False,
         name=APP_NAME,
     )

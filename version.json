@@ -1,38 +1,38 @@
 {
-  "version": "1.0.54",
-  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.54/Toolbox-macos.zip",
-  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.54/Toolbox-windows.zip",
-  "changelog": "- Windows 应用内更新不再依赖 PowerShell cmdlet：安装脚本整体改成 .NET API（SHA256 校验、进程等待、文件替换、快捷方式、弹窗），修掉 Get-FileHash 无法识别导致的「安装失败，旧版本未被修改」\n- 安装参数从 install.json 改为逐个环境变量传递，SHA256 由 Python 预先算好\n- 更新弹窗的 changelog 不再混入 CI 自动提交：CI 生成 version.json 前补 fetch 附注 tag，回退到提交记录时过滤 update version.json / chore / [skip ci]",
+  "version": "1.0.56",
+  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.56/Toolbox-macos.zip",
+  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.56/Toolbox-windows.zip",
+  "changelog": "- 打包瘦身（不改功能）：裁掉 Qt 的 QML/Quick/QtQmlModels/QtWebSockets 框架与 qwebgl/qminimal/触摸板插件，排除 unittest、pydoc、lib2to3、ensurepip 等标准库组件\n- 体积：mac 安装包 110MB → 88MB（−22MB）；Windows onefile 同步下降\n- v1.0.55 的 strip 调试符号会让 macOS 二次签名校验失败，已去掉（实测只省约 1MB）",
   "ocr_runtime": {
-    "version": "1.0.54",
+    "version": "1.0.56",
     "windows": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.54/ocr-runtime-windows.zip",
-      "sha256": "9f6e77e89c9cf2309b5de23c694aa685d3d59290bf7e8cc7d1c72920d9699ceb",
-      "size": 85492864
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.56/ocr-runtime-windows.zip",
+      "sha256": "c75f718b3f3f2284461c2f54e2ab3656229d66415eabb2b1777d2da28e965027",
+      "size": 85492863
     },
     "windows_3_11": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.54/ocr-runtime-windows.zip",
-      "sha256": "9f6e77e89c9cf2309b5de23c694aa685d3d59290bf7e8cc7d1c72920d9699ceb",
-      "size": 85492864
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.56/ocr-runtime-windows.zip",
+      "sha256": "c75f718b3f3f2284461c2f54e2ab3656229d66415eabb2b1777d2da28e965027",
+      "size": 85492863
     },
     "windows_3_12": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.54/ocr-runtime-windows-312.zip",
-      "sha256": "556da6e69a170540307b88373a552a6811030a36ae0560a43aee55aaf06b71cd",
-      "size": 85474576
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.56/ocr-runtime-windows-312.zip",
+      "sha256": "f2879331d3978372e2b55591c89065e2eae1a16e6551782872af3492df1ed5b5",
+      "size": 85474575
     },
     "macos": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.54/ocr-runtime-macos.zip",
-      "sha256": "cba121efdf028acf7437462c5fa15c4ca390b55b4b8fd36d496a4f369bff20d0",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.56/ocr-runtime-macos.zip",
+      "sha256": "185d8d3979cba2f453f66d14190c1376e65f934af09beaafe17e8eb7f656ca47",
       "size": 105664901
     },
     "macos_3_11": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.54/ocr-runtime-macos.zip",
-      "sha256": "cba121efdf028acf7437462c5fa15c4ca390b55b4b8fd36d496a4f369bff20d0",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.56/ocr-runtime-macos.zip",
+      "sha256": "185d8d3979cba2f453f66d14190c1376e65f934af09beaafe17e8eb7f656ca47",
       "size": 105664901
     },
     "macos_3_12": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.54/ocr-runtime-macos-312.zip",
-      "sha256": "3b9cef1f6953cd3198b8c041a3061d572898b289075040784a0929854dc8cf26",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.56/ocr-runtime-macos-312.zip",
+      "sha256": "acfe0e5b0313e6c011fede4d14b1df82a84a17028d6449f4ac8f34a6d20151a5",
       "size": 105671524
     }
   }

@@ -13934,6 +13934,19 @@ class ToolboxWindow(QMainWindow):
         self.tray_icon.activated.connect(self.on_tray_activated)
         self.tray_icon.show()
 
+    def on_app_activated(self):
+        """macOS 点 Dock 图标回来时用：窗口被收进托盘/最小化就恢复，否则抬到最前。
+
+        Qt 不会把「点 Dock 图标」这个动作映射成窗口恢复，只会切应用状态，
+        所以窗口隐藏后点 Dock 看上去毫无反应，这里自己补上。
+        """
+        if self.isMinimized() or not self.isVisible():
+            self.show_from_tray()
+            return
+        if sys.platform == "darwin":
+            self.raise_()
+            self.activateWindow()
+
     def show_from_tray(self):
         """从托盘图标恢复主窗口：最小化状态也要先解除，再抢到最前。"""
         if self.isMinimized():
@@ -15352,6 +15365,10 @@ if __name__ == "__main__":
         window = ToolboxWindow()
         window.show()
         write_startup_log("界面已显示")
+        if sys.platform == "darwin":
+            # 点 Dock 图标只会把应用激活，Qt 不会把隐藏的窗口还回来
+            app.applicationStateChanged.connect(
+                lambda state: window.on_app_activated() if state == Qt.ApplicationActive else None)
         # macOS 若在「下载」里运行，提示迁到「应用程序」，让启动台能索引到
         if platform.system() == 'Darwin':
             QTimer.singleShot(600, lambda: offer_mac_app_move(window))

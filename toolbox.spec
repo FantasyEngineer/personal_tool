@@ -82,9 +82,10 @@ if not HAS_BUNDLED_NUMPY:
 # numpy.core 是 numpy 2 给旧代码留的兼容层：按需下载的 cv2 里仍有
 # import numpy.core.multiarray，构建时没有模块引用它就会被裁掉，导致运行时
 # 「No module named 'numpy.core.multiarray'」，这里显式带上（仅限仍带 numpy 的平台）。
-# http.cookies 同理：只有运行时下载的 requests 才会用到，应用本身不引用。
+# http.cookies / queue 同理：只有运行时下载的 requests / urllib3 才会用到，应用本身
+# 不引用，不加就会在本地 OCR 加载时报 No module named 'queue'。
 HIDDEN_IMPORTS = ["qrcode.image.pil", "cryptography.hazmat.bindings._rust",
-                  "http.cookies"]
+                  "http.cookies", "queue"]
 if HAS_BUNDLED_NUMPY:
     HIDDEN_IMPORTS += ["numpy.core", "numpy.core.multiarray"]
 

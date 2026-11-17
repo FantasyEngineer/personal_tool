@@ -15331,6 +15331,22 @@ if __name__ == "__main__":
             crash_file = None
     # 防止多开：用 QLockFile 锁定用户目录下的锁文件，进程退出自动释放。
     lock_dir = os.path.join(os.path.expanduser("~"), ".personal_toolbox")
+
+    # PyQt5 5.5 起，槽函数 / 重写的虚函数里漏出去的异常会直接 qFatal 结束进程，
+    # 用户看到的就是「窗口闪一下就没了」。装一个钩子先把栈写进 startup.log，
+    # 即便进程随后被 abort，也能知道死在哪一行。
+    def _log_uncaught(exc_type, exc_value, exc_tb):
+        try:
+            write_startup_log("未捕获异常（进程可能即将退出）：\n"
+                              + "".join(traceback.format_exception(exc_type, exc_value, exc_tb)[-6:]))
+        except Exception:
+            pass
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _log_uncaught
+    threading.excepthook = lambda args: _log_uncaught(
+        args.exc_type, args.exc_value, args.exc_traceback)
+
     os.makedirs(lock_dir, exist_ok=True)
     lock_file = QLockFile(os.path.join(lock_dir, "app.lock"))
     if not lock_file.tryLock(0):
@@ -15343,30 +15359,44 @@ if __name__ == "__main__":
         # ===== 临时 OCR 测试模式（验证冻结环境下 onnxruntime 能否正常加载推理）=====
         if "--test-ocr" in sys.argv:
             import threading as _th
-            _out = []
+            _p = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "ocr_test_result.txt")
+            # 逐步落盘：万一某个扩展模块直接把进程带走，也能看到死在哪一步
+            def _log(_line):
+                with open(_p, "a", encoding="utf-8") as _f:
+                    _f.write(_line + "\n")
+            try:
+                open(_p, "w", encoding="utf-8").close()
+            except OSError:
+                pass
             def _run_ocr():
                 try:
-                    _out.append(f"runtime_site={ocr_runtime_site()}")
+                    _log(f"runtime_site={ocr_runtime_site()}")
+                    _log("step: import numpy")
+                    import numpy as _np
+                    _log("numpy ok %s" % _np.__version__)
+                    _log("step: import cv2")
+                    import cv2 as _cv2
+                    _log("cv2 ok %s" % _cv2.__version__)
+                    _log("step: import rapidocr")
                     from rapidocr import RapidOCR as _RapidOCR
-                    _out.append("import rapidocr ok")
+                    _log("import rapidocr ok")
+                    _log("step: create engine")
                     _eng = _RapidOCR(params={"Global.log_level": "warning"})
-                    _out.append("engine created ok")
+                    _log("engine created ok")
                     # 造一张带噪声的白纸当输入（用 Pillow，不引入 numpy）
                     from PIL import Image as _Image
                     _img = _Image.effect_noise((300, 100), 40).convert("RGB")
+                    _log("step: infer")
                     _r = _eng(_img)
-                    _out.append(f"infer ok, txts={len(_r.txts or [])}")
+                    _log(f"infer ok, txts={len(_r.txts or [])}")
                 except Exception as _e:
                     import traceback as _tb
-                    _out.append(f"FAIL: {_e}\n{_tb.format_exc()[-2000:]}")
+                    _log(f"FAIL: {_e}\n{_tb.format_exc()[-2000:]}")
             # 模拟正式启动时的 warm_rapidocr：在 daemon 线程里加载引擎
             _t = _th.Thread(target=_run_ocr, daemon=True)
             _t.start()
             _t.join(timeout=30)
-            _out.append(f"thread_alive_after_join={_t.is_alive()}")
-            _p = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "ocr_test_result.txt")
-            with open(_p, "w", encoding="utf-8") as _f:
-                _f.write("\n".join(_out))
+            _log(f"thread_alive_after_join={_t.is_alive()}")
             sys.exit(0)
         # 下拉框整框可点（挂在 app 上，覆盖之后新建的所有 QComboBox）
         combo_click_filter = _ComboClickFilter(app)

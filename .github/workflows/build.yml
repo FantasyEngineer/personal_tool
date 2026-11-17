@@ -222,9 +222,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # numpy 由应用自带（PyInstaller 已打包），运行时目录里再放一份会出现两套
-          # ABI；视频解码后端、脚本入口和测试在文字识别里都用不到。
-          rm -rf runtime/numpy runtime/numpy.libs runtime/numpy-*.dist-info
+          # numpy：Windows 上应用不再自带长截图用的 numpy（已改纯 Pillow），运行时
+          # 必须保留自带的那份；macOS 上应用仍打包了 numpy，再放一份会出现两套 ABI。
+          # 视频解码后端、脚本入口和测试在文字识别里都用不到。
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            rm -rf runtime/numpy runtime/numpy.libs runtime/numpy-*.dist-info
+          fi
           rm -rf runtime/bin runtime/Scripts runtime/share
           find runtime -name '__pycache__' -type d -prune -exec rm -rf {} +
           find runtime -name 'opencv_videoio_ffmpeg*' -delete

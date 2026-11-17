@@ -3,8 +3,10 @@ qrcode==8.2
 pillow==11.3.0
 PyYAML==6.0.3
 cryptography==50.0.2
-# 长截图拼接用纯 numpy 实现：缺包会在 Qt 槽里抛 ImportError 被 PyQt5 转成 qFatal 闪退。
-numpy>=1.19.5,<3.0.0
+# 长截图拼接已改为纯 Pillow（toolbox_app/kit/screenkit.py），应用自己不再 import numpy。
+# Windows 上 numpy 完全不需要：本地 OCR 的运行时压缩包自带一份（内含 OpenBLAS，20 MB）。
+# macOS 暂时保留：打包版仍内置 numpy 给按需下载的 cv2 兜底（wheel 分架构，待验证后再切）。
+numpy>=1.19.5,<3.0.0; sys_platform == "darwin"
 tzdata==2025.3
 # 本地离线 OCR（rapidocr / onnxruntime / opencv）不再随安装包分发：
 # 首次识别时按需下载到用户目录，见 toolbox.py 的 ensure_ocr_runtime。

@@ -4764,11 +4764,45 @@ class AdbDownloadWorker(QThread):
                 self.failed.emit(str(exc)[:300])
 
 
+def _raise_above_menubar(widget):
+    """macOS：把窗口层级抬到菜单栏 / Dock 之上，否则铺不满整块屏幕。"""
+    if sys.platform != "darwin":
+        return
+    try:
+        import ctypes
+        from ctypes import c_void_p, c_char_p, c_long, c_ulong
+
+        objc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.A.dylib")
+        objc.sel_registerName.restype = c_void_p
+        objc.sel_registerName.argtypes = [c_char_p]
+
+        def sel(name):
+            return objc.sel_registerName(name.encode())
+
+        def send(restype, argtypes, *args):
+            fn = objc.objc_msgSend
+            fn.restype = restype
+            fn.argtypes = argtypes
+            return fn(*args)
+
+        view = c_void_p(int(widget.winId()))
+        window = send(c_void_p, [c_void_p, c_void_p], view, sel("window"))
+        if not window:
+            return
+        # NSScreenSaverWindowLevel = 1000，高于菜单栏(24)与 Dock(20)
+        send(None, [c_void_p, c_void_p, c_long], window, sel("setLevel:"), 1000)
+        # canJoinAllSpaces | stationary | fullScreenAuxiliary：任何桌面/全屏应用上都显示
+        send(None, [c_void_p, c_void_p, c_ulong], window, sel("setCollectionBehavior:"), 1 | 16 | 256)
+    except Exception:
+        pass
+
+
 class LockScreenOverlay(QWidget):
     """一块屏幕上的模拟锁屏：全屏置顶、吞掉键鼠，点两下才回到桌面。"""
 
     def __init__(self, screen, on_unlock):
-        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+                         | Qt.NoDropShadowWindowHint)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setCursor(Qt.ArrowCursor)
@@ -4928,6 +4962,7 @@ class LockScreenController(QObject):
         for screen in screens:
             overlay = LockScreenOverlay(screen, self.unlock)
             overlay.show()
+            _raise_above_menubar(overlay)
             overlay.raise_()
             overlay.activateWindow()
             overlay.setFocus()

@@ -4976,11 +4976,6 @@ class LockScreenOverlay(QWidget):
         hint = "点击任意位置，或按任意键，再点「点击解锁」" if not self._armed else ""
         painter.drawText(QRectF(0, rect.height() * 0.72, rect.width(), 26),
                          Qt.AlignHCenter | Qt.AlignVCenter, hint)
-        painter.setPen(QColor(178, 194, 226, 120))
-        painter.drawText(QRectF(0, rect.height() - 70, rect.width(), 24),
-                         Qt.AlignHCenter | Qt.AlignVCenter,
-                         "模拟锁屏 · 屏幕常亮、系统不休眠，后台任务继续运行")
-
     # ---- Windows 版式 ----
     def _paint_windows(self, painter, rect, now):
         gradient = QLinearGradient(rect.topLeft(), QPointF(rect.width() * 0.35, rect.height()))
@@ -5050,14 +5045,6 @@ class LockScreenOverlay(QWidget):
             painter.setPen(QColor(232, 240, 255, 200))
             painter.drawText(QRectF(0, acy + avatar_r + 6, rect.width(), 22),
                              Qt.AlignHCenter | Qt.AlignVCenter, self._user_name())
-
-        painter.setPen(QColor(178, 194, 226, 110))
-        footer_font = QFont("Microsoft YaHei")
-        footer_font.setPixelSize(12)
-        painter.setFont(footer_font)
-        painter.drawText(QRectF(0, rect.height() - 62, rect.width(), 22),
-                         Qt.AlignHCenter | Qt.AlignVCenter,
-                         "模拟锁屏 · 屏幕常亮、系统不休眠，后台任务继续运行")
 
     def _paint_status_icons(self, painter, rect):
         """右下角的网络 / 电量图标，Windows 锁屏的标志性角落。"""

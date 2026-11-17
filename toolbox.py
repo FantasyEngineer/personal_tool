@@ -11492,6 +11492,24 @@ def set_autostart(enable):
     return "当前平台不支持开机自启，请保持应用运行（含最小化到托盘）"
 
 
+_FULLSCREEN_OVERLAY_PROVIDER = {"fn": None}
+
+
+def set_fullscreen_overlay_provider(fn):
+    """由主窗口登记：当前是否有全屏覆盖层（模拟锁屏 / 文字雨）正盖着屏幕。"""
+    _FULLSCREEN_OVERLAY_PROVIDER["fn"] = fn
+
+
+def fullscreen_overlay_active():
+    fn = _FULLSCREEN_OVERLAY_PROVIDER.get("fn")
+    if fn is None:
+        return False
+    try:
+        return bool(fn())
+    except Exception:
+        return False
+
+
 class ReminderCard(QWidget):
     """屏幕正中的置顶提醒卡片。
 
@@ -11570,17 +11588,21 @@ class ReminderCard(QWidget):
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
-        self._center_on_screen()
+        self._place_bottom_right()
 
     def _do_snooze(self):
         self.snoozed.emit()
         self.close()
 
-    def _center_on_screen(self):
+    def _place_bottom_right(self):
+        """贴在鼠标所在那块屏幕的右下角，让开 Dock / 任务栏。"""
         screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
         geo = screen.availableGeometry()
-        self.move(geo.x() + (geo.width() - self.width()) // 2,
-                  geo.y() + (geo.height() - self.height()) // 2)
+        self.move(geo.x() + geo.width() - self.width() - 18,
+                  geo.y() + geo.height() - self.height() - 12)
+
+    def reposition(self):
+        self._place_bottom_right()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -11619,6 +11641,8 @@ class ReminderEngine(QObject):
         self.state = state
         self.card = None
         self.card_rule = None
+        self.card_info = None      # 当前卡片的 (rule, key, now, missed, again)，收回时要用
+        self.pending = None        # 被全屏层挡住、等层退掉再弹的那条提醒
         self.snoozes = []
         self._timer = QTimer(self)
         self._timer.setInterval(20000)
@@ -11642,8 +11666,21 @@ class ReminderEngine(QObject):
         self.changed.emit()
 
     def tick(self):
+        # 全屏层（模拟锁屏 / 文字雨）在的时候，提醒不弹到它上面去
         if self.card is not None:
+            if fullscreen_overlay_active():
+                self.dismiss_for_overlay()
             return
+        if self.pending is not None:
+            if fullscreen_overlay_active():
+                self._timer.setInterval(1500)      # 有积压就勤快点，层一退马上补弹
+                return
+            self._timer.setInterval(20000)
+            rule, key, now, missed, again = self.pending
+            self.pending = None
+            self._show_card(rule, key, now, missed=missed, again=again)
+            return
+        self._timer.setInterval(20000)
         now = QDateTime.currentDateTime()
 
         due = [s for s in self.snoozes if s[0] <= now]
@@ -11680,6 +11717,14 @@ class ReminderEngine(QObject):
             return
 
     def _popup(self, rule, key, now, missed=False, again=False):
+        if fullscreen_overlay_active():
+            # 有人正看着锁屏 / 文字雨，先攒着；等层退掉再弹，别糊在人家脸上
+            self.pending = (rule, key, now, missed, again)
+            self._timer.setInterval(1500)
+            return
+        self._show_card(rule, key, now, missed=missed, again=again)
+
+    def _show_card(self, rule, key, now, missed=False, again=False):
         subtitle = "%s · %s" % (rule.get("time", ""), rule.get("repeat", REPEAT_DAILY))
         note = ""
         if missed:
@@ -11688,11 +11733,28 @@ class ReminderEngine(QObject):
             note = "上次提醒后你选择了稍后再提醒"
         self.card = ReminderCard(rule.get("name", "提醒"), subtitle, note)
         self.card_rule = rule
+        self.card_info = (rule, key, now, missed, again)
         self.card.snoozed.connect(lambda: self._add_snooze(rule, key))
         self.card.dismissed.connect(self._clear_card)
         if self.state.get("sound", True):
             play_alert_sound()
         self.card.show()
+
+    def dismiss_for_overlay(self):
+        """全屏层起来时，把已经弹着的卡片收回去，等层退掉再补弹，避免压在锁屏上面。"""
+        if self.card is None:
+            return
+        info = self.card_info
+        try:
+            self.card.close()
+        except Exception:
+            pass
+        self.card = None
+        self.card_rule = None
+        self.card_info = None
+        if info is not None:
+            self.pending = info
+            self._timer.setInterval(1500)
 
     def _add_snooze(self, rule, key):
         when = QDateTime.currentDateTime().addSecs(SNOOZE_MINUTES * 60)
@@ -11703,6 +11765,7 @@ class ReminderEngine(QObject):
             self.card.deleteLater()
             self.card = None
             self.card_rule = None
+            self.card_info = None
 
 
 class _EventHotKeyID(ctypes.Structure):
@@ -13007,6 +13070,8 @@ class ToolboxWindow(QMainWindow):
         self.init_tray()
         # 引擎挂在主窗口上：窗口关掉、最小化到托盘后照样按点弹框
         self.reminder_engine = ReminderEngine(load_reminders(), self)
+        # 提醒卡片要知道屏幕上有没有锁屏 / 文字雨这类全屏层，别糊在它们上面
+        set_fullscreen_overlay_provider(self._overlays_covering_screen)
 
     def init_ui(self):
         central = QWidget()
@@ -13539,12 +13604,22 @@ class ToolboxWindow(QMainWindow):
             from PyQt5.QtWidgets import QMessageBox
             QMessageBox.warning(self, "防黑屏", f"无法启动防休眠: {e}")
 
+    def _overlays_covering_screen(self):
+        if self._locker is not None and self._locker.is_locked():
+            return True
+        return self._rain_overlay is not None and self._rain_overlay.isVisible()
+
     def set_fake_lock(self, active):
         """模拟锁屏开关：铺满屏幕挡住画面，同时按住系统不休眠。"""
         if self._locker is None:
             self._locker = LockScreenController(self)
             self._locker.unlocked.connect(self._after_fake_lock_released)
         if active:
+            # 已经弹着的提醒先收回去，别压在锁屏上面
+            try:
+                self.reminder_engine.dismiss_for_overlay()
+            except Exception:
+                pass
             self._locker.lock()
         else:
             self._locker.unlock()
@@ -13563,6 +13638,10 @@ class ToolboxWindow(QMainWindow):
                 self._rain_overlay = MatrixRainOverlay(
                     on_close=lambda: self.toggle_buttons["文字雨"].setChecked(False)
                 )
+            try:
+                self.reminder_engine.dismiss_for_overlay()
+            except Exception:
+                pass
             self._rain_overlay.start()
             # 文字雨自带防黑屏：记录开启前的状态，便于关闭时还原
             if awake_btn is not None and not awake_btn.isChecked():

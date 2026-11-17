@@ -1,38 +1,38 @@
 {
-  "version": "1.0.49",
-  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.49/Toolbox-macos.zip",
-  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.49/Toolbox-windows.zip",
-  "changelog": "- 锁屏界面去掉底部「模拟锁屏 · 屏幕常亮…」说明行，画面只留时钟、日期、头像、解锁提示\n- chore: update version.json for v1.0.47 [skip ci]",
+  "version": "1.0.50",
+  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.50/Toolbox-macos.zip",
+  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.50/Toolbox-windows.zip",
+  "changelog": "- 提醒卡片挪到屏幕右下角，且不再压在全屏层（模拟锁屏 / 文字雨）上面\n- chore: update version.json for v1.0.48 [skip ci]",
   "ocr_runtime": {
-    "version": "1.0.49",
+    "version": "1.0.50",
     "windows": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.49/ocr-runtime-windows.zip",
-      "sha256": "c648d7ddc2df2cfad230c52ed8767eb401d96e8c4900ae028e45627fa4bdc463",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.50/ocr-runtime-windows.zip",
+      "sha256": "161a3ecd546d5af4fc2bf81a8aea4079e5cad1592af97a350b2d66509589b3e3",
       "size": 85492865
     },
     "windows_3_11": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.49/ocr-runtime-windows.zip",
-      "sha256": "c648d7ddc2df2cfad230c52ed8767eb401d96e8c4900ae028e45627fa4bdc463",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.50/ocr-runtime-windows.zip",
+      "sha256": "161a3ecd546d5af4fc2bf81a8aea4079e5cad1592af97a350b2d66509589b3e3",
       "size": 85492865
     },
     "windows_3_12": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.49/ocr-runtime-windows-312.zip",
-      "sha256": "deb88ff4aabdcc585f163caeb526c634a2cc52cc58eb43ee5c0efb0f87644046",
-      "size": 85474577
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.50/ocr-runtime-windows-312.zip",
+      "sha256": "316a65378596bf73549931c161c2001d6dccb36662ea000f99a0b059afb7f9d6",
+      "size": 85474579
     },
     "macos": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.49/ocr-runtime-macos.zip",
-      "sha256": "9c4e57f78bea2996309846e0b42878222babd5c355a104026eb75d48e52b5104",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.50/ocr-runtime-macos.zip",
+      "sha256": "889d490c2b9040d2492d173e8c9819f0c2ca8539c37a5b68f5f1eed834e9b712",
       "size": 105664901
     },
     "macos_3_11": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.49/ocr-runtime-macos.zip",
-      "sha256": "9c4e57f78bea2996309846e0b42878222babd5c355a104026eb75d48e52b5104",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.50/ocr-runtime-macos.zip",
+      "sha256": "889d490c2b9040d2492d173e8c9819f0c2ca8539c37a5b68f5f1eed834e9b712",
       "size": 105664901
     },
     "macos_3_12": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.49/ocr-runtime-macos-312.zip",
-      "sha256": "5da4462a346519ee9623514bc29578e82677fe8bd791d429005a259e89434730",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.50/ocr-runtime-macos-312.zip",
+      "sha256": "d02acb30510743e0f1f0e5e9b687c7173aaa6a900a3f3666569469f0380a0d1a",
       "size": 105671524
     }
   }

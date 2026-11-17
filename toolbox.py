@@ -68,7 +68,7 @@ from PyQt5.QtGui import (QFont, QCursor, QTextCursor, QColor, QPen, QPixmap, QPa
 from toolbox_app.constants import (
     APP_VERSION,
     LAUNCHER_BTN_W, LAUNCHER_BTN_H, LAUNCHER_GRID_SPACING,
-    JSON_HISTORY_PATH, TOOL_USAGE_HISTORY_PATH, SEARCH_HISTORY_PATH,
+    TOOL_USAGE_HISTORY_PATH, SEARCH_HISTORY_PATH,
     SHORTCUTS_PATH, TOOL_RENAMES,
 )
 from toolbox_app.assets import app_asset_path, app_icon
@@ -77,7 +77,7 @@ from toolbox_app.theme import (
     _primary_btn, _secondary_btn, _plain_style, _output_style, _tab_style,
 )
 from toolbox_app.storage import (
-    user_path, load_history, append_history, _read_text, _write_text,
+    user_path, _read_text, _write_text,
     load_section_order, save_section_order, load_tool_order, save_tool_order,
 )
 from toolbox_app.natives import (
@@ -341,11 +341,14 @@ class ProcessManagerWindow(QMainWindow):
 
 
 class JsonFormatterWindow(QMainWindow):
+    """JSON 处理：底部一行是多个标签，每个标签各存一份输入和结果，互不干扰。"""
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("JSON 处理")
         self.setGeometry(*tool_win_geometry())
         self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
+        self._pages = {}
         self.init_ui()
 
     def init_ui(self):
@@ -380,6 +383,41 @@ class JsonFormatterWindow(QMainWindow):
         tool_layout.addStretch()
         layout.addLayout(tool_layout)
 
+        self.tabs = QTabWidget()
+        self.tabs.setTabPosition(QTabWidget.South)
+        self.tabs.setTabsClosable(True)
+        self.tabs.setDocumentMode(True)
+        self.tabs.setStyleSheet("""
+            QTabWidget::pane { border: 1px solid #E0E0E0; border-radius: 6px; }
+            QTabBar::tab { background: #F5F5F5; color: #666666; border: 1px solid #E0E0E0;
+                border-top: none; padding: 4px 12px; font-size: 12px; margin-right: 3px;
+                border-bottom-left-radius: 4px; border-bottom-right-radius: 4px; }
+            QTabBar::tab:selected { background: #FFFFFF; color: #1A73E8; font-weight: bold; }
+            QTabBar::tab:hover { color: #1A73E8; }
+        """)
+        self.tabs.tabCloseRequested.connect(self.close_tab)
+
+        add_btn = QPushButton("+ 新建")
+        add_btn.setFixedHeight(26)
+        add_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        add_btn.setStyleSheet("""
+            QPushButton { color: #1A73E8; background: #FFFFFF; border: 1px solid #CFE0FA;
+                border-radius: 4px; font-size: 12px; padding: 0 10px; }
+            QPushButton:hover { background: #EAF1FE; }
+        """)
+        add_btn.clicked.connect(lambda: self.add_tab())
+        self.tabs.setCornerWidget(add_btn, Qt.BottomRightCorner)
+
+        layout.addWidget(self.tabs, 1)
+
+        self.add_tab()
+
+    def _build_page(self):
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 8, 0, 0)
+        page_layout.setSpacing(8)
+
         splitter = QSplitter(Qt.Horizontal)
 
         left_widget = QWidget()
@@ -408,20 +446,19 @@ class JsonFormatterWindow(QMainWindow):
         """)
         format_btn.clicked.connect(self.do_format)
         left_header.addWidget(format_btn)
-
         left_layout.addLayout(left_header)
 
-        self.input_text = QPlainTextEdit()
-        self.input_text.setStyleSheet("""
+        input_text = QPlainTextEdit()
+        input_text.setStyleSheet("""
             QPlainTextEdit {
                 border: 1px solid #D0D0D0;
                 border-radius: 4px;
                 padding: 8px;
-                font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+                font-family: "Menlo", "Consolas", "PingFang SC", monospace;
                 font-size: 13px;
             }
         """)
-        left_layout.addWidget(self.input_text)
+        left_layout.addWidget(input_text)
 
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
@@ -434,10 +471,32 @@ class JsonFormatterWindow(QMainWindow):
         right_header.addWidget(right_label)
         right_header.addStretch()
 
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("搜索关键字...")
-        self.search_input.setFixedWidth(120)
-        self.search_input.setStyleSheet("""
+        flat_btn = QPushButton("全部展开")
+        flat_btn.setFixedHeight(28)
+        flat_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        flat_btn.setStyleSheet("""
+            QPushButton { color: #333333; background: #F0F0F0; border: 1px solid #D0D0D0;
+                border-radius: 4px; font-size: 12px; padding: 0 8px; }
+            QPushButton:hover { background: #E0E0E0; }
+        """)
+        flat_btn.clicked.connect(lambda: self._page()["tree"].expandAll())
+        right_header.addWidget(flat_btn)
+
+        fold_btn = QPushButton("折叠到第 2 层")
+        fold_btn.setFixedHeight(28)
+        fold_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        fold_btn.setStyleSheet("""
+            QPushButton { color: #333333; background: #F0F0F0; border: 1px solid #D0D0D0;
+                border-radius: 4px; font-size: 12px; padding: 0 8px; }
+            QPushButton:hover { background: #E0E0E0; }
+        """)
+        fold_btn.clicked.connect(self.collapse_to_second_level)
+        right_header.addWidget(fold_btn)
+
+        search_input = QLineEdit()
+        search_input.setPlaceholderText("搜索字段或值")
+        search_input.setFixedWidth(120)
+        search_input.setStyleSheet("""
             QLineEdit {
                 border: 1px solid #D0D0D0;
                 border-radius: 4px;
@@ -446,8 +505,8 @@ class JsonFormatterWindow(QMainWindow):
             }
             QLineEdit:focus { border-color: #1A73E8; }
         """)
-        self.search_input.returnPressed.connect(self.do_search)
-        right_header.addWidget(self.search_input)
+        search_input.returnPressed.connect(self.do_search)
+        right_header.addWidget(search_input)
 
         search_btn = QPushButton("搜索")
         search_btn.setFixedSize(50, 28)
@@ -483,70 +542,167 @@ class JsonFormatterWindow(QMainWindow):
 
         right_layout.addLayout(right_header)
 
-        self.output_text = QTextEdit()
-        self.output_text.setReadOnly(True)
-        self.output_text.setStyleSheet("""
-            QTextEdit {
+        stack = QStackedWidget()
+
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["字段", "值"])
+        tree.setColumnWidth(0, 220)
+        tree.setAlternatingRowColors(True)
+        tree.setAnimated(True)
+        tree.setStyleSheet("""
+            QTreeWidget {
+                border: 1px solid #D0D0D0;
+                border-radius: 4px;
+                background: #FAFAFA;
+                font-family: "Menlo", "Consolas", "PingFang SC", monospace;
+                font-size: 13px;
+            }
+            QTreeWidget::item { height: 22px; }
+        """)
+        stack.addWidget(tree)
+
+        text_out = QPlainTextEdit()
+        text_out.setReadOnly(True)
+        text_out.setStyleSheet("""
+            QPlainTextEdit {
                 border: 1px solid #D0D0D0;
                 border-radius: 4px;
                 padding: 8px;
-                font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+                font-family: "Menlo", "Consolas", "PingFang SC", monospace;
                 font-size: 13px;
                 background: #FAFAFA;
             }
         """)
-        right_layout.addWidget(self.output_text)
+        stack.addWidget(text_out)
+
+        right_layout.addWidget(stack)
 
         splitter.addWidget(left_widget)
         splitter.addWidget(right_widget)
         splitter.setSizes([450, 450])
 
-        layout.addWidget(splitter)
+        page_layout.addWidget(splitter)
 
-        history_layout = QHBoxLayout()
-        history_layout.setSpacing(8)
-        history_label = QLabel("历史")
-        history_label.setStyleSheet("color: #999999; font-size: 12px;")
-        history_layout.addWidget(history_label)
+        info = {"widget": page, "input": input_text, "tree": tree, "stack": stack,
+                "text": text_out, "search": search_input, "formatted": ""}
+        self._pages[page] = info
+        return info
 
-        self.history_combo = QComboBox()
-        self.history_combo.setStyleSheet(_combo_style())
-        self.history_combo.activated.connect(self.load_history_entry)
-        history_layout.addWidget(self.history_combo, 1)
-        layout.addLayout(history_layout)
+    def add_tab(self, title=None):
+        page = self._build_page()
+        index = self.tabs.addTab(page["widget"], title or self._next_title())
+        self.tabs.setCurrentIndex(index)
+        page["input"].setFocus()
+        return page
 
-        self.refresh_history()
+    def _next_title(self):
+        used = {self.tabs.tabText(i) for i in range(self.tabs.count())}
+        number = 1
+        while "JSON %d" % number in used:
+            number += 1
+        return "JSON %d" % number
 
-    def refresh_history(self):
-        self._history = load_history(JSON_HISTORY_PATH)
-        self.history_combo.blockSignals(True)
-        self.history_combo.clear()
-        for item in self._history:
-            head = (item.get("input") or "").strip().splitlines()
-            preview = head[0][:70] if head else ""
-            self.history_combo.addItem("%s  %s" % (item.get("time", ""), preview))
-        self.history_combo.blockSignals(False)
+    def close_tab(self, index):
+        if self.tabs.count() <= 1:
+            return
+        widget = self.tabs.widget(index)
+        self._pages.pop(widget, None)
+        self.tabs.removeTab(index)
 
-    def load_history_entry(self, index):
-        if 0 <= index < len(self._history):
-            self.input_text.setPlainText(self._history[index]["input"])
+    def _page(self):
+        page = self._pages.get(self.tabs.currentWidget())
+        if page is None:
+            page = self.add_tab()
+        return page
+
+    def collapse_to_second_level(self):
+        tree = self._page()["tree"]
+        tree.collapseAll()
+        tree.expandToDepth(1)
+
+    def _hint(self, value):
+        if isinstance(value, dict):
+            return "对象 · %d 个字段" % len(value)
+        if isinstance(value, list):
+            return "数组 · %d 项" % len(value)
+        return "值"
+
+    def _scalar(self, value):
+        if value is None:
+            return "null", "#999999"
+        if value is True:
+            return "true", "#0F7B3D"
+        if value is False:
+            return "false", "#0F7B3D"
+        if isinstance(value, (int, float)):
+            return repr(value), "#1C00CF"
+        return '"%s"' % value, "#C41A16"
+
+    def _add_node(self, parent, label, value):
+        if isinstance(value, (dict, list)):
+            item = QTreeWidgetItem(parent, [label, self._hint(value)])
+            item.setForeground(1, QBrush(QColor("#8A8A8A")))
+            self._add_children(item, value)
+        else:
+            text, color = self._scalar(value)
+            item = QTreeWidgetItem(parent, [label, text])
+            item.setForeground(1, QBrush(QColor(color)))
+            item.setToolTip(1, text)
+
+    def _add_children(self, parent, data):
+        if isinstance(data, dict):
+            for key, value in data.items():
+                self._add_node(parent, str(key), value)
+        elif isinstance(data, list):
+            for i, value in enumerate(data):
+                self._add_node(parent, "[%d]" % i, value)
+
+    def _fill_tree(self, tree, data):
+        tree.clear()
+        root = QTreeWidgetItem(tree, ["$", self._hint(data)])
+        root.setForeground(1, QBrush(QColor("#8A8A8A")))
+        self._add_children(root, data)
+        root.setExpanded(True)
+
+    def _preview_title(self, data):
+        if isinstance(data, dict):
+            keys = list(data.keys())
+            if keys:
+                name = str(keys[0])
+                return name if len(name) <= 14 else name[:14] + "…"
+        elif isinstance(data, list):
+            return "数组 %d 项" % len(data)
+        return ""
+
+    def _set_plain(self, text):
+        page = self._page()
+        page["stack"].setCurrentIndex(1)
+        page["text"].setPlainText(text)
 
     def do_format(self):
-        raw = self.input_text.toPlainText().strip()
+        page = self._page()
+        raw = page["input"].toPlainText().strip()
         if not raw:
-            self.output_text.setPlainText("")
+            page["tree"].clear()
+            page["formatted"] = ""
+            page["stack"].setCurrentIndex(0)
             return
         try:
             parsed = json.loads(raw)
-            formatted = json.dumps(parsed, indent=2, ensure_ascii=False)
-            self.output_text.setPlainText(formatted)
-            append_history(JSON_HISTORY_PATH, {
-                "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "input": raw,
-            })
-            self.refresh_history()
         except json.JSONDecodeError as e:
-            self.output_text.setPlainText(f"JSON 格式错误:\n{e}")
+            page["tree"].clear()
+            page["formatted"] = ""
+            self._set_plain("JSON 格式错误:\n%s" % e)
+            return
+        page["formatted"] = json.dumps(parsed, indent=2, ensure_ascii=False)
+        self._fill_tree(page["tree"], parsed)
+        page["stack"].setCurrentIndex(0)
+        page["tree"].expandToDepth(1)
+        index = self.tabs.currentIndex()
+        if self.tabs.tabText(index).startswith("JSON "):
+            preview = self._preview_title(parsed)
+            if preview:
+                self.tabs.setTabText(index, preview)
 
     def gen_sample(self):
         sample = json.dumps({
@@ -558,55 +714,61 @@ class JsonFormatterWindow(QMainWindow):
             "score": 95.5,
             "email": None
         }, indent=2, ensure_ascii=False)
-        self.input_text.setPlainText(sample)
+        self._page()["input"].setPlainText(sample)
         self.do_format()
 
     def do_minify(self):
-        raw = self.input_text.toPlainText().strip()
+        page = self._page()
+        raw = page["input"].toPlainText().strip()
         if not raw:
-            self.output_text.setPlainText("")
+            self._set_plain("")
             return
         try:
             parsed = json.loads(raw)
-            self.output_text.setPlainText(json.dumps(parsed, separators=(',', ':'), ensure_ascii=False))
         except json.JSONDecodeError as e:
-            self.output_text.setPlainText(f"JSON 格式错误:\n{e}")
+            self._set_plain("JSON 格式错误:\n%s" % e)
+            return
+        self._set_plain(json.dumps(parsed, separators=(',', ':'), ensure_ascii=False))
 
     def do_minify_escape(self):
-        raw = self.input_text.toPlainText().strip()
+        page = self._page()
+        raw = page["input"].toPlainText().strip()
         if not raw:
-            self.output_text.setPlainText("")
+            self._set_plain("")
             return
         try:
             parsed = json.loads(raw)
-            minified = json.dumps(parsed, separators=(',', ':'), ensure_ascii=False)
-            self.output_text.setPlainText(json.dumps(minified, ensure_ascii=False)[1:-1])
         except json.JSONDecodeError as e:
-            self.output_text.setPlainText(f"JSON 格式错误:\n{e}")
+            self._set_plain("JSON 格式错误:\n%s" % e)
+            return
+        minified = json.dumps(parsed, separators=(',', ':'), ensure_ascii=False)
+        self._set_plain(json.dumps(minified, ensure_ascii=False)[1:-1])
 
     def do_escape(self):
-        raw = self.input_text.toPlainText()
+        page = self._page()
+        raw = page["input"].toPlainText()
         if not raw:
-            self.output_text.setPlainText("")
+            self._set_plain("")
             return
-        self.output_text.setPlainText(json.dumps(raw, ensure_ascii=False)[1:-1])
+        self._set_plain(json.dumps(raw, ensure_ascii=False)[1:-1])
 
     def do_unescape(self):
-        raw = self.input_text.toPlainText().strip()
+        page = self._page()
+        raw = page["input"].toPlainText().strip()
         if not raw:
-            self.output_text.setPlainText("")
+            self._set_plain("")
             return
         if '\\' not in raw:
-            self.output_text.setPlainText(raw)
+            self._set_plain(raw)
             return
         try:
-            self.output_text.setPlainText(json.loads('"' + raw + '"'))
+            self._set_plain(json.loads('"' + raw + '"'))
         except json.JSONDecodeError:
             result = raw.replace('\\\\', '\x00').replace('\\"', '"') \
                         .replace('\\n', '\n').replace('\\t', '\t') \
                         .replace('\\r', '\r').replace('\\/', '/') \
                         .replace('\x00', '\\')
-            self.output_text.setPlainText(result)
+            self._set_plain(result)
 
     def do_fix_punct(self):
         mapping = {
@@ -615,35 +777,75 @@ class JsonFormatterWindow(QMainWindow):
             '“': '"', '”': '"', '‘': "'", '’': "'",
             '（': '(', '）': ')', '　': ' ',
         }
-        text = self.input_text.toPlainText()
+        page = self._page()
+        text = page["input"].toPlainText()
         for cn, en in mapping.items():
             text = text.replace(cn, en)
-        self.input_text.setPlainText(text)
+        page["input"].setPlainText(text)
         self.do_format()
 
     def do_clear(self):
-        self.input_text.setPlainText("")
-        self.output_text.setPlainText("")
+        page = self._page()
+        page["input"].setPlainText("")
+        page["tree"].clear()
+        page["text"].setPlainText("")
+        page["formatted"] = ""
+        page["stack"].setCurrentIndex(0)
+
+    def _walk(self, tree):
+        stack = [tree.topLevelItem(i) for i in range(tree.topLevelItemCount())]
+        while stack:
+            item = stack.pop()
+            yield item
+            for i in range(item.childCount()):
+                stack.append(item.child(i))
 
     def do_search(self):
-        keyword = self.search_input.text().strip()
+        page = self._page()
+        keyword = page["search"].text().strip()
         if not keyword:
             return
-        text = self.output_text.toPlainText()
-        if not text:
+        if page["stack"].currentIndex() == 1:
+            text = page["text"].toPlainText()
+            if not text:
+                return
+            cursor = page["text"].textCursor()
+            cursor.movePosition(QTextCursor.Start)
+            page["text"].setTextCursor(cursor)
+            if not page["text"].find(keyword):
+                QMessageBox.information(self, "搜索结果", "未找到匹配内容", QMessageBox.Ok)
             return
-        cursor = self.output_text.textCursor()
-        cursor.movePosition(cursor.Start)
-        self.output_text.setTextCursor(cursor)
-        found = self.output_text.find(keyword)
-        if not found:
+        tree = page["tree"]
+        if tree.topLevelItemCount() == 0:
+            QMessageBox.information(self, "搜索结果", "还没有格式化结果", QMessageBox.Ok)
+            return
+        items = list(self._walk(tree))
+        for item in items:
+            item.setBackground(0, QBrush())
+            item.setBackground(1, QBrush())
+        matches = [item for item in items
+                   if keyword in item.text(0) or keyword in item.text(1)]
+        if not matches:
             QMessageBox.information(self, "搜索结果", "未找到匹配内容", QMessageBox.Ok)
+            return
+        for item in matches:
+            ancestor = item.parent()
+            while ancestor is not None:
+                ancestor.setExpanded(True)
+                ancestor = ancestor.parent()
+            item.setBackground(0, QBrush(QColor("#FFF3B0")))
+            item.setBackground(1, QBrush(QColor("#FFF3B0")))
+        tree.scrollToItem(matches[0])
+        tree.setCurrentItem(matches[0])
 
     def do_copy(self):
-        text = self.output_text.toPlainText()
+        page = self._page()
+        if page["stack"].currentIndex() == 0:
+            text = page["formatted"]
+        else:
+            text = page["text"].toPlainText() or page["formatted"]
         if text:
-            clipboard = QApplication.clipboard()
-            clipboard.setText(text)
+            QApplication.clipboard().setText(text)
             QMessageBox.information(self, "已复制", "已复制到剪贴板", QMessageBox.Ok)
 
     def keyPressEvent(self, event):

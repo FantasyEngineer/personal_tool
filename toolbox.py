@@ -51,7 +51,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QGraphicsDropShadowEffect, QTextEdit, QSplitter,
                               QPlainTextEdit, QComboBox, QCheckBox, QStackedWidget,
                               QRadioButton, QButtonGroup,
-                              QGridLayout, QSpinBox, QTabWidget, QColorDialog,
+                              QGridLayout, QSpinBox, QTabWidget, QTabBar, QColorDialog,
                               QFileDialog, QInputDialog, QListWidget, QListWidgetItem,
                               QProgressDialog, QSystemTrayIcon, QMenu, QAction,
                               QTreeWidget, QTreeWidgetItem, QHeaderView,
@@ -340,6 +340,18 @@ class ProcessManagerWindow(QMainWindow):
         super().closeEvent(event)
 
 
+class BlankClickTabBar(QTabBar):
+    """点标签栏的空白处就新开一个标签，省掉旁边的“新建”按钮。"""
+
+    blank_clicked = pyqtSignal()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.tabAt(event.pos()) < 0:
+            self.blank_clicked.emit()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class JsonFormatterWindow(QMainWindow):
     """JSON 处理：底部一行是多个标签，每个标签各存一份输入和结果，互不干扰。"""
 
@@ -397,20 +409,26 @@ class JsonFormatterWindow(QMainWindow):
         """)
         self.tabs.tabCloseRequested.connect(self.close_tab)
 
-        add_btn = QPushButton("+ 新建")
-        add_btn.setFixedHeight(26)
-        add_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        add_btn.setStyleSheet("""
-            QPushButton { color: #1A73E8; background: #FFFFFF; border: 1px solid #CFE0FA;
-                border-radius: 4px; font-size: 12px; padding: 0 10px; }
-            QPushButton:hover { background: #EAF1FE; }
-        """)
-        add_btn.clicked.connect(lambda: self.add_tab())
-        self.tabs.setCornerWidget(add_btn, Qt.BottomRightCorner)
+        # 标签栏空白处一点就新建一个标签，不用再摆一个“新建”按钮。
+        tab_bar = BlankClickTabBar(self.tabs)
+        self.tabs.setTabBar(tab_bar)
+        tab_bar.blank_clicked.connect(self.add_tab)
+        # 标签栏本身只有标签那么宽，右侧那一截空白属于 QTabWidget，
+        # 在这里补一次判断，让两处空白都能新增标签。
+        self.tabs.installEventFilter(self)
 
         layout.addWidget(self.tabs, 1)
 
         self.add_tab()
+
+    def eventFilter(self, obj, event):
+        if obj is self.tabs and event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+            bar_area = self.tabs.tabBar().geometry()
+            pos = event.pos()
+            if bar_area.top() <= pos.y() <= bar_area.bottom() and pos.x() > bar_area.right():
+                self.add_tab()
+                return True
+        return super().eventFilter(obj, event)
 
     def _build_page(self):
         page = QWidget()

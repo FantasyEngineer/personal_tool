@@ -12023,16 +12023,19 @@ class _EventTypeSpec(ctypes.Structure):
 _CARBON_HANDLER = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
 
 
-SHORTCUT_ACTIONS = {"rain": "文字雨", "picker": "取色器", "capture": "截屏",
-                    "capture_copy": "截屏并自动复制", "long_capture": "长截图",
-                    "paste_image": "贴图", "toggle_pins": "隐藏 / 显示所有贴图"}
+SHORTCUT_ACTIONS = {"capture": "截屏",
+                    "capture_copy": "截屏并自动复制",
+                    "paste_image": "贴图", "toggle_pins": "隐藏 / 显示所有贴图",
+                    "long_capture": "长截图",
+                    "rain": "文字雨", "lock": "模拟锁屏"}
 
 
 def default_shortcuts():
     modifier = "Meta+Alt+" if platform.system() == "Darwin" else "Ctrl+Alt+"
-    return {"rain": modifier + "O", "picker": modifier + "C", "capture": modifier + "S",
+    return {"capture": modifier + "S",
             "capture_copy": modifier + "Shift+S", "long_capture": modifier + "L",
-            "paste_image": modifier + "V", "toggle_pins": modifier + "H"}
+            "paste_image": modifier + "V", "toggle_pins": modifier + "H",
+            "rain": modifier + "O", "lock": modifier + "K"}
 
 
 def shortcut_native(sequence, system=None):
@@ -13101,7 +13104,7 @@ class SettingsWindow(QMainWindow):
         body.setAutoFillBackground(False)
         layout.addWidget(scroll, 1)
         descriptions = {"rain": "开启 / 关闭桌面文字雨，自动联动防黑屏",
-                        "picker": "启动 / 关闭屏幕放大镜，快速获取颜色",
+                        "lock": "开启 / 关闭模拟锁屏，挡住桌面同时保持系统不休眠",
                         "capture": "像素取色与本地 OCR，框选后调整与标注，直接复制、保存或贴图",
                         "capture_copy": "框选完成后直接复制，不弹出预览",
                         "long_capture": "框选区域后自动滚动，逐帧拼接成一张长图",
@@ -13630,11 +13633,10 @@ class ToolboxWindow(QMainWindow):
             btn = self.toggle_buttons.get("文字雨")
             if btn is not None:
                 btn.setChecked(not btn.isChecked())
-        elif action == "picker":
-            if self._screen_pick_overlay is not None:
-                self._screen_pick_overlay.close()
-            else:
-                self._record_usage_and_call(self.show_screen_pick)
+        elif action == "lock":
+            btn = self.toggle_buttons.get("模拟锁屏")
+            if btn is not None:
+                btn.setChecked(not btn.isChecked())
         elif action == "long_capture":
             self.show_long_shot()
         elif action in ("capture", "capture_copy", "paste_image", "toggle_pins"):

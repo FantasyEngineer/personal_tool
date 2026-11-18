@@ -1,38 +1,38 @@
 {
-  "version": "1.0.62",
-  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.62/Toolbox-macos.zip",
-  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.62/Toolbox-windows.zip",
-  "changelog": "- 长截图抓帧失败时不再闪退：定时器槽里的异常会写进 startup.log，并给出一句失败提示后正常收尾",
+  "version": "1.0.63",
+  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.63/Toolbox-macos.zip",
+  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.63/Toolbox-windows.zip",
+  "changelog": "v1.0.63: 长截图修复（滚轮坐标 + 辅助功能权限门禁）",
   "ocr_runtime": {
-    "version": "1.0.62",
+    "version": "1.0.63",
     "windows": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.62/ocr-runtime-windows.zip",
-      "sha256": "297a1eb3c6c08ee5d456e49b582c882f96c38e4a94ae5b605be6117f5c3ba06b",
-      "size": 96597116
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.63/ocr-runtime-windows.zip",
+      "sha256": "ad56aaf26352dbc413a1792fd90e282a4373b7f066350f87217158c275e17464",
+      "size": 96597117
     },
     "windows_3_11": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.62/ocr-runtime-windows.zip",
-      "sha256": "297a1eb3c6c08ee5d456e49b582c882f96c38e4a94ae5b605be6117f5c3ba06b",
-      "size": 96597116
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.63/ocr-runtime-windows.zip",
+      "sha256": "ad56aaf26352dbc413a1792fd90e282a4373b7f066350f87217158c275e17464",
+      "size": 96597117
     },
     "windows_3_12": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.62/ocr-runtime-windows-312.zip",
-      "sha256": "d1e9b2e15f22484e444d5621b788b559d82f1bbb93b04418afa30cfb3dd9ec02",
-      "size": 96515779
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.63/ocr-runtime-windows-312.zip",
+      "sha256": "3ca8e9f449c1a1c84c878d9f5871ba55ca2d80bae7190e0d3986781a02679d2d",
+      "size": 96515782
     },
     "macos": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.62/ocr-runtime-macos.zip",
-      "sha256": "4cab6f55c322eac57cb545cdb0e0b33820214154b339028f3c733102ae49df36",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.63/ocr-runtime-macos.zip",
+      "sha256": "73ece838d1de84093c4f1c26d736ca6eb7137ce714513081970192c590e9b869",
       "size": 83166627
     },
     "macos_3_11": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.62/ocr-runtime-macos.zip",
-      "sha256": "4cab6f55c322eac57cb545cdb0e0b33820214154b339028f3c733102ae49df36",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.63/ocr-runtime-macos.zip",
+      "sha256": "73ece838d1de84093c4f1c26d736ca6eb7137ce714513081970192c590e9b869",
       "size": 83166627
     },
     "macos_3_12": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.62/ocr-runtime-macos-312.zip",
-      "sha256": "992d5322067ac82334db223f6aa46da0de5155c510aad9accf32a8090678c77d",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.63/ocr-runtime-macos-312.zip",
+      "sha256": "61c8c969fbc0f41f1a6b62981420ad1677874c2834ec5a75778769a61cae8da2",
       "size": 83173250
     }
   }

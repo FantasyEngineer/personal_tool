@@ -112,8 +112,9 @@ from toolbox_app.kit.convertkit import (
     unit_format, base_convert,
 )
 from toolbox_app.kit.screenkit import (
-LONG_SHOT_MAX_HEIGHT, crop_desktop, qimage_rgb_array, long_shot_missing_deps,
-    gray_array, block_mean, best_vertical_offset, offset_score,
+    LONG_SHOT_MAX_HEIGHT, crop_desktop, qimage_to_image, long_shot_missing_deps,
+    frame_identical, gray_image, block_mean, best_vertical_offset, offset_score,
+    stack_images,
 )
 
 mac_input_requested_once = [False]   # 首次用长截图时问一次辅助功能权限
@@ -4573,7 +4574,7 @@ class LongShotSession(QObject):
             return
         if not self._rows:
             return
-        frame_height = self._rows[0].shape[0]
+        frame_height = self._rows[0].height
         if self._calibrated:
             target = max(60, int(frame_height * 0.45))
             notches = max(1, int(round(target / self._pixels_per_notch)))
@@ -4600,7 +4601,15 @@ class LongShotSession(QObject):
         self._busy = False
         if self._done:
             return
-        appended = self._take(first)
+        try:
+            appended = self._take(first)
+        except Exception:
+            # 这里是 Qt 定时器槽：异常漏出去 PyQt5 会直接 qFatal 结束进程（表现为闪退），
+            # 所以就地兜住，写成日志再给用户一句提示。
+            detail = traceback.format_exc()
+            write_startup_log("长截图抓帧失败：\n" + detail)
+            self._finish("长截图失败：%s" % detail.strip().splitlines()[-1][:160], ok=False)
+            return
         if self._done:
             return
         self._show_mask()
@@ -4624,16 +4633,15 @@ class LongShotSession(QObject):
             self._last_result = "error"
             self._finish("无法读取屏幕，请检查系统的屏幕录制权限", ok=False)
             return False
-        current = qimage_rgb_array(image)
+        current = qimage_to_image(image)
         if first:
             self._rows = [current]
             self._last_frame = current
             self._frames = 1
+            self.progress.emit(current.height, self._frames)
             self._last_result = "ok"
-            self.progress.emit(current.shape[0], self._frames)
             return True
-        import numpy as np
-        if np.array_equal(current, self._last_frame):
+        if frame_identical(current, self._last_frame):
             self._last_result = "still"
             if self.auto:
                 self._still += 1
@@ -4649,11 +4657,11 @@ class LongShotSession(QObject):
             if not self.auto:
                 self.notice.emit("找不到重叠部分：滚动幅度请控制在选区高度的 80% 以内再按空格")
             return False
-        tail = current[start:]
+        tail = current.crop((0, start, current.width, current.height))
         remaining = LONG_SHOT_MAX_HEIGHT - self._total_height()
-        if tail.shape[0] > remaining:
-            tail = tail[:max(0, remaining)]
-        if tail.shape[0] == 0:
+        if tail.height > remaining:
+            tail = tail.crop((0, 0, tail.width, max(0, remaining)))
+        if tail.height == 0:
             self._last_result = "no_tail"
             if self._total_height() >= LONG_SHOT_MAX_HEIGHT:
                 self._finish("已达到最大长度 %d 像素" % LONG_SHOT_MAX_HEIGHT)
@@ -4669,7 +4677,7 @@ class LongShotSession(QObject):
         self._last_result = "ok"
         if start > 0:
             # start 是「新内容在当帧里的起始行」，实际位移 = 帧高 - start
-            shift = float(current.shape[0] - start)
+            shift = float(current.height - start)
             self._pixels_per_notch = max(4.0, shift / max(1, self._notches))
             self._calibrated = True
         self.progress.emit(self._total_height(), self._frames)
@@ -4721,18 +4729,19 @@ class LongShotSession(QObject):
     def _overlap_offset(self, previous, current):
         """返回 current 中新增内容的起始行；找不到可靠重叠返回 None。
 
-        纯 numpy 实现：先块平均降采样做粗匹配，再在原分辨率逐像素精修。
+        纯 Pillow 实现：先块平均降采样做粗匹配，再在原分辨率逐行精修。
+        相似度是平均绝对差（见 screenkit.match_score），不依赖 numpy。
         依次用底部两段条带做匹配（兼容滚动幅度不同的情况），
         每段都要求两处条带结果一致，避免页面元素重复时拼错或丢行。
         """
-        if previous.shape[1] != current.shape[1]:
+        if previous.width != current.width:
             return None
-        previous_gray = gray_array(previous)
-        current_gray = gray_array(current)
-        factor = max(1, min(8, previous_gray.shape[1] // 320))
+        previous_gray = gray_image(previous)
+        current_gray = gray_image(current)
+        factor = max(1, min(8, previous_gray.width // 320))
         previous_small = block_mean(previous_gray, factor)
         current_small = block_mean(current_gray, factor)
-        previous_height = previous_gray.shape[0]
+        previous_height = previous_gray.height
         for first_fraction, second_fraction in ((0.6, 0.82), (0.82, 0.92)):
             offsets = []
             for fraction in (first_fraction, second_fraction):
@@ -4756,7 +4765,7 @@ class LongShotSession(QObject):
         return None
 
     def _total_height(self):
-        return sum(row.shape[0] for row in self._rows)
+        return sum(row.height for row in self._rows)
 
     def _finish(self, message, ok=True):
         if self._done:
@@ -4775,9 +4784,8 @@ class LongShotSession(QObject):
         if not ok or not self._rows:
             self.finished.emit(None, message)
             return
-        import numpy as np
-        merged = np.vstack(self._rows)
-        height, width = merged.shape[0], merged.shape[1]
+        merged = stack_images(self._rows)
+        width, height = merged.width, merged.height
         image = QImage(merged.tobytes(), width, height, width * 3, QImage.Format_RGB888).copy()
         image.setDevicePixelRatio(self._dpr)
         self.finished.emit(image, message)
@@ -5267,10 +5275,16 @@ class LockScreenOverlay(QWidget):
         self._timer.start()
 
     # ---------- 布局 ----------
+    # Windows 锁屏的日期 / 时钟靠屏幕上方，密码框单独落在下面，两者不再绑在一起：
+    # 时钟取 0.355 起排（1440p 上时钟中心约 46.5%，原来 51.5% 仍偏下），
+    # 密码框回到 0.775，和大时钟之间留出空档。
+    WIN_TEXT_TOP = 0.355
+    WIN_PANEL_TOP = 0.775
+
     def _panel_rect(self):
         width = min(380, max(300, int(self.width() * 0.30)))
-        # 密码框放在大时钟下面，别压住时间
-        return QRect(int((self.width() - width) / 2), int(self.height() * 0.775), width, 56)
+        top = self.WIN_PANEL_TOP if self._win_style else 0.775
+        return QRect(int((self.width() - width) / 2), int(self.height() * top), width, 56)
 
     def _layout_widgets(self):
         if self._win_style:
@@ -5403,12 +5417,13 @@ class LockScreenOverlay(QWidget):
 
         weekday = "一二三四五六日"[now.date().dayOfWeek() - 1]
 
-        # Windows 的日期在大时钟上方
+        # Windows 的日期在大时钟上方（真实锁屏的日期 / 时间成组居中偏上，
+        # 原来按 0.505 / 0.545 排，1440p 上时钟中心落到 62% 高度，看着太靠下）
         date_font = QFont("Microsoft YaHei")
         date_font.setPixelSize(max(15, int(rect.height() * 0.021)))
         painter.setFont(date_font)
         painter.setPen(QColor(238, 244, 255, 215))
-        painter.drawText(QRectF(0, rect.height() * 0.505, rect.width(), 26),
+        painter.drawText(QRectF(0, rect.height() * self.WIN_TEXT_TOP, rect.width(), 26),
                          Qt.AlignHCenter | Qt.AlignVCenter,
                          "%d月%d日，星期%s" % (now.date().month(), now.date().day(), weekday))
 
@@ -5417,7 +5432,8 @@ class LockScreenOverlay(QWidget):
         clock_font.setPixelSize(max(56, int(rect.height() * 0.115)))
         painter.setFont(clock_font)
         painter.setPen(QColor("#FFFFFF"))
-        painter.drawText(QRectF(0, rect.height() * 0.545, rect.width(), rect.height() * 0.14),
+        painter.drawText(QRectF(0, rect.height() * (self.WIN_TEXT_TOP + 0.040),
+                                rect.width(), rect.height() * 0.14),
                          Qt.AlignHCenter | Qt.AlignVCenter, now.toString("HH:mm"))
 
         self._paint_status_icons(painter, rect)
@@ -15569,6 +15585,22 @@ if __name__ == "__main__":
 
     # 防止多开：用 QLockFile 锁定用户目录下的锁文件，进程退出自动释放。
     lock_dir = os.path.join(os.path.expanduser("~"), ".personal_toolbox")
+
+    # PyQt5 5.5 起，槽函数 / 重写的虚函数里漏出去的异常会直接 qFatal 结束进程，
+    # 用户看到的就是「窗口闪一下就没了」。装一个钩子先把栈写进 startup.log，
+    # 即便进程随后被 abort，也能知道死在哪一行。
+    def _log_uncaught(exc_type, exc_value, exc_tb):
+        try:
+            write_startup_log("未捕获异常（进程可能即将退出）：\n"
+                              + "".join(traceback.format_exception(exc_type, exc_value, exc_tb)[-6:]))
+        except Exception:
+            pass
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _log_uncaught
+    threading.excepthook = lambda args: _log_uncaught(
+        args.exc_type, args.exc_value, args.exc_traceback)
+
     os.makedirs(lock_dir, exist_ok=True)
     lock_file = QLockFile(os.path.join(lock_dir, "app.lock"))
     if not lock_file.tryLock(0):
@@ -15580,30 +15612,45 @@ if __name__ == "__main__":
         app.setWindowIcon(app_icon())
         # ===== 临时 OCR 测试模式（验证冻结环境下 onnxruntime 能否正常加载推理）=====
         if "--test-ocr" in sys.argv:
-            import numpy as _np
             import threading as _th
-            _out = []
+            _p = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "ocr_test_result.txt")
+            # 逐步落盘：万一某个扩展模块直接把进程带走，也能看到死在哪一步
+            def _log(_line):
+                with open(_p, "a", encoding="utf-8") as _f:
+                    _f.write(_line + "\n")
+            try:
+                open(_p, "w", encoding="utf-8").close()
+            except OSError:
+                pass
             def _run_ocr():
                 try:
-                    _out.append(f"runtime_site={ocr_runtime_site()}")
+                    _log(f"runtime_site={ocr_runtime_site()}")
+                    _log("step: import numpy")
+                    import numpy as _np
+                    _log("numpy ok %s" % _np.__version__)
+                    _log("step: import cv2")
+                    import cv2 as _cv2
+                    _log("cv2 ok %s" % _cv2.__version__)
+                    _log("step: import rapidocr")
                     from rapidocr import RapidOCR as _RapidOCR
-                    _out.append("import rapidocr ok")
+                    _log("import rapidocr ok")
+                    _log("step: create engine")
                     _eng = _RapidOCR(params={"Global.log_level": "warning"})
-                    _out.append("engine created ok")
-                    _img = (_np.random.rand(100, 300, 3) * 255).astype(_np.uint8)
+                    _log("engine created ok")
+                    # 造一张带噪声的白纸当输入（用 Pillow，不引入 numpy）
+                    from PIL import Image as _Image
+                    _img = _Image.effect_noise((300, 100), 40).convert("RGB")
+                    _log("step: infer")
                     _r = _eng(_img)
-                    _out.append(f"infer ok, txts={len(_r.txts or [])}")
+                    _log(f"infer ok, txts={len(_r.txts or [])}")
                 except Exception as _e:
                     import traceback as _tb
-                    _out.append(f"FAIL: {_e}\n{_tb.format_exc()[-2000:]}")
+                    _log(f"FAIL: {_e}\n{_tb.format_exc()[-2000:]}")
             # 模拟正式启动时的 warm_rapidocr：在 daemon 线程里加载引擎
             _t = _th.Thread(target=_run_ocr, daemon=True)
             _t.start()
             _t.join(timeout=30)
-            _out.append(f"thread_alive_after_join={_t.is_alive()}")
-            _p = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "ocr_test_result.txt")
-            with open(_p, "w", encoding="utf-8") as _f:
-                _f.write("\n".join(_out))
+            _log(f"thread_alive_after_join={_t.is_alive()}")
             sys.exit(0)
         # 下拉框整框可点（挂在 app 上，覆盖之后新建的所有 QComboBox）
         combo_click_filter = _ComboClickFilter(app)

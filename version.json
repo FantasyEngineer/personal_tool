@@ -1,39 +1,39 @@
 {
-  "version": "1.0.59",
-  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.59/Toolbox-macos.zip",
-  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.59/Toolbox-windows.zip",
-  "changelog": "- 快捷键：新增「模拟锁屏」全局快捷键（默认 ⌘⌥K / Ctrl+Alt+K），按一下锁屏再按解锁\n- 快捷键：去掉取色器的全局快捷键，取色器功能本身保留\n- 快捷键列表顺序调整为 截屏 / 截屏并自动复制 / 贴图 / 隐藏显示贴图 / 长截图 / 文字雨 / 模拟锁屏",
+  "version": "1.0.62",
+  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.62/Toolbox-macos.zip",
+  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.62/Toolbox-windows.zip",
+  "changelog": "- 长截图抓帧失败时不再闪退：定时器槽里的异常会写进 startup.log，并给出一句失败提示后正常收尾",
   "ocr_runtime": {
-    "version": "1.0.59",
+    "version": "1.0.62",
     "windows": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.59/ocr-runtime-windows.zip",
-      "sha256": "5721e4917fdee0e203dfba86911b48ff603c81c2bc10c720834fc08906325fa6",
-      "size": 85492867
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.62/ocr-runtime-windows.zip",
+      "sha256": "297a1eb3c6c08ee5d456e49b582c882f96c38e4a94ae5b605be6117f5c3ba06b",
+      "size": 96597116
     },
     "windows_3_11": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.59/ocr-runtime-windows.zip",
-      "sha256": "5721e4917fdee0e203dfba86911b48ff603c81c2bc10c720834fc08906325fa6",
-      "size": 85492867
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.62/ocr-runtime-windows.zip",
+      "sha256": "297a1eb3c6c08ee5d456e49b582c882f96c38e4a94ae5b605be6117f5c3ba06b",
+      "size": 96597116
     },
     "windows_3_12": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.59/ocr-runtime-windows-312.zip",
-      "sha256": "65e2bad3d012895ea9d814f5943a57f9f97f305d58b05b5bd08428132d15188f",
-      "size": 85474573
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.62/ocr-runtime-windows-312.zip",
+      "sha256": "d1e9b2e15f22484e444d5621b788b559d82f1bbb93b04418afa30cfb3dd9ec02",
+      "size": 96515779
     },
     "macos": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.59/ocr-runtime-macos.zip",
-      "sha256": "19fe3f9154963c57d9cf7533ba1045eb5a34819d427ca90880906cf5eac3b77c",
-      "size": 105664901
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.62/ocr-runtime-macos.zip",
+      "sha256": "4cab6f55c322eac57cb545cdb0e0b33820214154b339028f3c733102ae49df36",
+      "size": 83166627
     },
     "macos_3_11": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.59/ocr-runtime-macos.zip",
-      "sha256": "19fe3f9154963c57d9cf7533ba1045eb5a34819d427ca90880906cf5eac3b77c",
-      "size": 105664901
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.62/ocr-runtime-macos.zip",
+      "sha256": "4cab6f55c322eac57cb545cdb0e0b33820214154b339028f3c733102ae49df36",
+      "size": 83166627
     },
     "macos_3_12": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.59/ocr-runtime-macos-312.zip",
-      "sha256": "6641ca4c5426712401a1d2ba47a4000461361f941ea65a039a05fb16b8575e5b",
-      "size": 105671524
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.62/ocr-runtime-macos-312.zip",
+      "sha256": "992d5322067ac82334db223f6aa46da0de5155c510aad9accf32a8090678c77d",
+      "size": 83173250
     }
   }
 }

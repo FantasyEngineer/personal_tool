@@ -12,16 +12,13 @@ import os
 import unittest
 import zoneinfo
 
+from PIL import Image
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import toolbox
 from toolbox_app.kit import (adbkit, barcodekit, convertkit, cronkit, cryptokit, datetimekit,
                              diffkit, netkit, ocrkit, reminderkit, screenkit, updatekit)
-
-try:
-    import numpy as np
-except ImportError:
-    np = None
 
 UTC = zoneinfo.ZoneInfo("UTC")
 
@@ -316,45 +313,66 @@ class ConvertKitTest(unittest.TestCase):
         self.assertAlmostEqual(from_base[2](100), 373.15)     # ℃ -> K
 
 
-@unittest.skipIf(np is None, "长截图拼接依赖 numpy")
 class ScreenKitTest(unittest.TestCase):
-    """长截图拼接：灰度化、块降采样与相关系数配准。"""
+    """长截图拼接：灰度化、块降采样、相似度与垂直配准（纯 Pillow）。"""
 
     @staticmethod
-    def _rows(values):
-        """把一维灰度序列铺成 (H, 1) 的二维数组，贴近真实调用形状。"""
-        return np.asarray(values, dtype=np.float32)[:, None]
+    def _image(rows, width=4):
+        """按行灰度值铺成一张 width 宽的灰度图，贴近真实调用形状。"""
+        image = Image.new("L", (width, len(rows)))
+        for y, value in enumerate(rows):
+            image.paste(value, (0, y, width, y + 1))
+        return image
 
-    def test_gray_array(self):
-        rgb = np.zeros((4, 4, 3), dtype=np.uint8)
-        rgb[:, :, 0] = 255                       # 纯红 -> 0.299 * 255
-        gray = screenkit.gray_array(rgb)
-        self.assertEqual(gray.shape, (4, 4))
-        self.assertAlmostEqual(float(gray[0, 0]), 76.245, places=3)
+    def test_gray_image(self):
+        rgb = Image.new("RGB", (4, 4), (255, 0, 0))     # 纯红 -> 约 76 灰度
+        gray = screenkit.gray_image(rgb)
+        self.assertEqual(gray.mode, "L")
+        self.assertEqual(gray.size, (4, 4))
+        self.assertEqual(gray.getpixel((0, 0)), 76)
 
     def test_block_mean(self):
-        gray = np.arange(16, dtype=np.float32).reshape(4, 4)
-        self.assertEqual(screenkit.block_mean(gray, 1).shape, (4, 4))
+        gray = Image.new("L", (4, 4))
+        for y, row in enumerate(((0, 4, 8, 12),) * 4):
+            for x, value in enumerate(row):
+                gray.putpixel((x, y), value)
+        self.assertEqual(screenkit.block_mean(gray, 1).size, (4, 4))
         small = screenkit.block_mean(gray, 2)
-        self.assertEqual(small.shape, (2, 2))
-        self.assertAlmostEqual(float(small[0, 0]), 2.5)      # mean(0, 1, 4, 5)
+        self.assertEqual(small.size, (2, 2))
+        self.assertEqual(small.getpixel((0, 0)), 2)     # mean(0, 4, 0, 4)
+        self.assertEqual(small.getpixel((1, 0)), 10)    # mean(8, 12, 8, 12)
 
     def test_match_score(self):
-        strip = self._rows(range(20))
+        strip = self._image(range(20))
         self.assertAlmostEqual(screenkit.match_score(strip, strip), 1.0, places=6)
-        self.assertAlmostEqual(screenkit.match_score(strip, -strip), -1.0, places=6)
-        self.assertEqual(screenkit.match_score(strip, strip * 0), 0.0)
+        inverted = Image.eval(strip, lambda value: 255 - value)
+        # 完全反相：平均像素差 255，得分远低于阈值 0.7
+        self.assertLess(screenkit.match_score(strip, inverted), 0.0)
+        flat = Image.new("L", (4, 20), 128)
+        self.assertLess(screenkit.match_score(strip, flat), 0.7)
 
     def test_best_vertical_offset_and_score(self):
-        previous = np.zeros((60, 1), dtype=np.float32)
-        previous[10:] = self._rows(range(50))
-        current = np.zeros((70, 1), dtype=np.float32)
-        current[:50] = self._rows(range(50))
+        previous = self._image([0] * 10 + list(range(20, 70)))
+        current = self._image(list(range(20, 70)) + [200] * 20)
         # previous[10:] 与 current[0:50] 完全一致，新增内容从第 50 行开始
         self.assertEqual(screenkit.best_vertical_offset(previous, current, 10), 50)
         self.assertAlmostEqual(screenkit.offset_score(previous, current, 10, 0),
                                1.0, places=6)
         self.assertEqual(screenkit.offset_score(previous, current, 10, 60), -2.0)
+
+    def test_frame_identical(self):
+        first = self._image(range(6))
+        self.assertTrue(screenkit.frame_identical(first, first.copy()))
+        self.assertFalse(screenkit.frame_identical(first, self._image(range(1, 7))))
+        self.assertFalse(screenkit.frame_identical(first, self._image(range(6), width=8)))
+
+    def test_stack_images(self):
+        merged = screenkit.stack_images([self._image([10, 20]), self._image([30])])
+        self.assertEqual(merged.size, (4, 3))
+        self.assertEqual(merged.mode, "RGB")
+        self.assertEqual(merged.getpixel((0, 0)), (10, 10, 10))
+        self.assertEqual(merged.getpixel((0, 1)), (20, 20, 20))
+        self.assertEqual(merged.getpixel((0, 2)), (30, 30, 30))
 
     def test_long_shot_missing_deps(self):
         self.assertEqual(screenkit.long_shot_missing_deps(), [])

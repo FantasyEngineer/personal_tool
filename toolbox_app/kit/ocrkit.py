@@ -499,8 +499,14 @@ def ocr_runtime_site():
         # 扩展模块与解释器版本强绑定，版本不符时宁可不加载
         if not isinstance(info, dict) or info.get("python") != current:
             continue
+        required = ["rapidocr", "onnxruntime"]
+        if os.name == "nt":
+            # Windows 安装包不再自带 numpy（长截图拼接已改纯 Pillow），压缩包里必须
+            # 自带一份。早期下载的旧压缩包被 Trim 掉了 numpy，缺它时按「没装」处理，
+            # 让应用重新下载，否则 cv2 一 import 就报 No module named 'numpy'。
+            required.append("numpy")
         if not all(os.path.isdir(os.path.join(path, package))
-                   for package in ("rapidocr", "onnxruntime")):
+                   for package in required):
             continue
         mismatch = _ocr_runtime_abi_mismatch(path)
         if mismatch:

@@ -5,7 +5,7 @@
 """
 import os
 
-APP_VERSION = "1.0.60"
+APP_VERSION = "1.0.63"
 UPDATE_CHECK_URL = "https://gitee.com/api/v5/repos/jimmy_hou/personal_tool/contents/version.json?ref=main"
 
 TOOL_WIN_W = 720

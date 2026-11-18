@@ -69,6 +69,60 @@ def _mac_cover_menu_bar(widget):
     return True
 
 
+def mac_input_access():
+    """返回 (能否合成键鼠, 能否录屏)。长截图靠合成滚轮驱动目标窗口，缺辅助功能权限就会「滚不动」。"""
+    try:
+        import ctypes
+        import ctypes.util
+        cg = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreGraphics"))
+        cg.CGPreflightPostEventAccess.restype = ctypes.c_bool
+        cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
+        return bool(cg.CGPreflightPostEventAccess()), bool(cg.CGPreflightScreenCaptureAccess())
+    except (OSError, AttributeError):
+        return False, False
+
+
+def mac_request_post_event_access():
+    """申请（并弹出系统授权面板）合成输入权限。"""
+    try:
+        import ctypes
+        import ctypes.util
+        cg = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreGraphics"))
+        cg.CGRequestPostEventAccess.restype = ctypes.c_bool
+        return bool(cg.CGRequestPostEventAccess())
+    except (OSError, AttributeError):
+        return False
+
+
+def _mac_activate_app():
+    """把本应用切到前台（等价于点一下 Dock），覆盖层要用键盘时先激活自己。
+
+    macOS 14 起后台应用激活会被系统压制，activateIgnoringOtherApps 仍然有效；
+    探测 selector 再调用，避免旧系统上命中不存在的 selector 直接 abort。
+    """
+    if not _mac_is_cocoa():
+        return False
+    import ctypes
+    try:
+        objc = _mac_objc_runtime()
+        send = objc.objc_msgSend
+        send.restype = ctypes.c_void_p
+        send.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        nsapp = send(objc.objc_getClass(b"NSApplication"),
+                     objc.sel_registerName(b"sharedApplication"))
+        if not nsapp:
+            return False
+        send.restype = ctypes.c_bool
+        send.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        if not send(nsapp, objc.sel_registerName(b"respondsToSelector:"),
+                    objc.sel_registerName(b"activateIgnoringOtherApps:")):
+            return False
+        send.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+        return bool(send(nsapp, objc.sel_registerName(b"activateIgnoringOtherApps:"), 1))
+    except Exception:
+        return False
+
+
 def _mac_picker_nonactivating(widget):
     """把取色罩抬到菜单栏之上并覆盖所有 Space，但只 orderFront、不 makeKey、不 activate：
     被取色的应用保持原样停在最前，不会退到后台。键盘退出靠 HID 键态轮询。"""

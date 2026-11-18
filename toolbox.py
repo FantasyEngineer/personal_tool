@@ -83,7 +83,8 @@ from toolbox_app.storage import (
 from toolbox_app.natives import (
     WIN_ADVANCED_SUBKEY, win_no_console, visibility_read, visibility_write,
     _mac_cover_menu_bar, _mac_picker_nonactivating, _mac_is_cocoa,
-    _mac_frontmost_pid, _mac_reactivate,
+    _mac_frontmost_pid, _mac_reactivate, _mac_activate_app,
+    mac_input_access, mac_request_post_event_access,
 )
 from toolbox_app.kit.sysinfo import (
     get_effective_ip, get_system_stats, human_mem, kill_process,
@@ -111,9 +112,11 @@ from toolbox_app.kit.convertkit import (
     unit_format, base_convert,
 )
 from toolbox_app.kit.screenkit import (
-    LONG_SHOT_MAX_HEIGHT, crop_desktop, qimage_rgb_array, long_shot_missing_deps,
+LONG_SHOT_MAX_HEIGHT, crop_desktop, qimage_rgb_array, long_shot_missing_deps,
     gray_array, block_mean, best_vertical_offset, offset_score,
 )
+
+mac_input_requested_once = [False]   # 首次用长截图时问一次辅助功能权限
 from toolbox_app.kit.barcodekit import render_code128
 from toolbox_app.kit import adbkit
 from toolbox_app.kit import cronkit
@@ -3036,18 +3039,34 @@ def scroll_screen_at(point, notches):
             # CGEventCreateScrollWheelEvent 是可变参数函数，ctypes 在 Apple Silicon
             # 上无法正确传递可变参（滚轮量会读到栈上垃圾值），改用非可变的
             # CGEventCreate + CGEventSetType + CGEventSetIntegerValueField 组合。
+            cg.CGEventSourceCreate.restype = ctypes.c_void_p
+            cg.CGEventSourceCreate.argtypes = [ctypes.c_uint32]
             cg.CGEventCreate.restype = ctypes.c_void_p
             cg.CGEventCreate.argtypes = [ctypes.c_void_p]
             cg.CGEventSetType.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
             cg.CGEventSetIntegerValueField.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int64]
+            cg.CGEventSetLocation.argtypes = [ctypes.c_void_p, CGPoint]
             cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
             cg.CFRelease.argtypes = [ctypes.c_void_p]
-            event = cg.CGEventCreate(None)
+            # 用 HID 事件源，事件才像真的滚轮/触控板输入
+            source = cg.CGEventSourceCreate(1)  # kCGEventSourceStateHIDSystemState
+            event = cg.CGEventCreate(source)
             if event:
                 cg.CGEventSetType(event, 22)  # kCGEventScrollWheel
-                cg.CGEventSetIntegerValueField(event, 11, -3 * int(notches))  # kCGScrollWheelEventDeltaAxis1
+                # 关键：滚轮事件不带坐标时系统按 (0,0) 派发，光标下的窗口收不到，
+                # 于是「滚了但页面没动」，长截图只能抓到 1 帧。
+                cg.CGEventSetLocation(event, CGPoint(float(point.x()), float(point.y())))
+                # 伪装成「鼠标滚轮」而不是触控板：
+                # - isContinuous=0 不会触发系统惯性，滚动量不会忽大忽小
+                # - 行增量 + 定点增量一起给，AppKit 各控件都认
+                cg.CGEventSetIntegerValueField(event, 88, 0)  # kCGScrollWheelEventIsContinuous
+                ticks = int(notches)
+                cg.CGEventSetIntegerValueField(event, 11, -ticks)             # kCGScrollWheelEventDeltaAxis1
+                cg.CGEventSetIntegerValueField(event, 93, -ticks * 65536)     # kCGScrollWheelEventFixedPtDeltaAxis1
                 cg.CGEventPost(0, event)
                 cg.CFRelease(event)
+            if source:
+                cg.CFRelease(source)
     except (OSError, AttributeError, ValueError):
         pass
 
@@ -3300,6 +3319,57 @@ class ScreenshotOcrWorker(QThread):
         self._process = process
 
 
+class KeyStateWatcher(QObject):
+    """全屏覆盖层的按键兜底：直接读系统键态，不依赖键盘焦点。
+
+    macOS 上被热键唤起的应用不一定能从系统手里拿到键盘焦点，覆盖窗口看着在最前，
+    Qt 的 keyPressEvent 却收不到 Esc / 空格；取色器早就用 HID 键态轮询解决过这个
+    问题（CGEventSourceKeyState 不需要辅助功能授权），这里复用同样思路。
+    """
+
+    pressed = pyqtSignal(str)
+
+    KEYS = {"esc": (53, 0x1B), "space": (49, 0x20), "enter": (36, 0x0D)}
+
+    def __init__(self, names, parent=None):
+        super().__init__(parent)
+        self._names = tuple(names)
+        self._prev = {}
+        self._cg = None
+        self._timer = QTimer(self)
+        self._timer.setInterval(40)
+        self._timer.timeout.connect(self._poll)
+
+    def start(self):
+        # 打开瞬间先吃掉「已经按着」的键态，避免上一个动作的尾音进来
+        self._prev = {name: self._down(name) for name in self._names}
+        self._timer.start()
+
+    def stop(self):
+        self._timer.stop()
+
+    def _down(self, name):
+        mac_key, win_vk = self.KEYS[name]
+        if platform.system() == "Darwin":
+            if self._cg is None:
+                from ctypes.util import find_library
+                self._cg = ctypes.cdll.LoadLibrary(find_library("CoreGraphics"))
+                self._cg.CGEventSourceKeyState.restype = ctypes.c_bool
+                self._cg.CGEventSourceKeyState.argtypes = [ctypes.c_int, ctypes.c_uint16]
+            return bool(self._cg.CGEventSourceKeyState(1, mac_key))
+        if platform.system() == "Windows":
+            return bool(ctypes.windll.user32.GetAsyncKeyState(win_vk) & 0x8000)
+        return False
+
+    def _poll(self):
+        for name in self._names:
+            down = self._down(name)
+            rising = down and not self._prev.get(name, False)
+            self._prev[name] = down
+            if rising:
+                self.pressed.emit(name)
+
+
 class CaptureOverlay(QWidget):
     captured = pyqtSignal(QPixmap, str, QRect)
     cancelled = pyqtSignal()
@@ -3315,6 +3385,9 @@ class CaptureOverlay(QWidget):
         self.setMouseTracking(True)
         self.desktop = desktop
         self._desktop_image = desktop.toImage()
+        # 拿不到键盘焦点时 Esc 也要能用：读系统键态兜底
+        self._esc_watcher = KeyStateWatcher(("esc",), self)
+        self._esc_watcher.pressed.connect(lambda _name: self._handle_escape())
         self._desktop_image.setDevicePixelRatio(1.0)
         self._pixel_pos = None
         self._pixel_point = QPoint()
@@ -4100,17 +4173,25 @@ class CaptureOverlay(QWidget):
         self.captured.emit(image, action, self._selection.translated(self.geometry().topLeft()))
         self.close()
 
-    def keyPressEvent(self, event):
-        key, mods = event.key(), event.modifiers()
-        if key == Qt.Key_Escape and self._ocr_mode:
+    def _handle_escape(self):
+        """Esc：先退文字识别 / 文字输入，再关闭整个截图。"""
+        if self._ocr_mode:
             self._exit_ocr_mode()
             self.ocr_status.hide()
             return
-        if key == Qt.Key_Escape and self._text_editor is not None:
+        if self._text_editor is not None:
             self._cancel_text_editor()
             return
+        self.close()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._esc_watcher.start()
+
+    def keyPressEvent(self, event):
+        key, mods = event.key(), event.modifiers()
         if key == Qt.Key_Escape:
-            self.close()
+            self._handle_escape()
         elif self._ocr_busy:
             return
         elif mods & Qt.ControlModifier and key == Qt.Key_O:
@@ -4146,6 +4227,7 @@ class CaptureOverlay(QWidget):
             super().keyPressEvent(event)
 
     def closeEvent(self, event):
+        self._esc_watcher.stop()
         self._pixel_timer.stop()
         self._cancel_text_editor()
         if not self._accepted:
@@ -4327,6 +4409,12 @@ class LongShotOverlay(QWidget):
         self._origin = None
         self._rect = QRect()
         self._accepted = False
+        self._esc_watcher = KeyStateWatcher(("esc",), self)
+        self._esc_watcher.pressed.connect(lambda _name: self.close())
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._esc_watcher.start()
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -4405,6 +4493,7 @@ class LongShotOverlay(QWidget):
             super().keyPressEvent(event)
 
     def closeEvent(self, event):
+        self._esc_watcher.stop()
         if not self._accepted:
             self.cancelled.emit()
         super().closeEvent(event)
@@ -4432,6 +4521,11 @@ class LongShotSession(QObject):
         self._notches = 1
         self._pixels_per_notch = 160.0
         self._calibrated = False
+        # 没校准前先滚 6 格探一下：步子太小拼不上，太大会跳过头，失败后自动折半/加倍
+        self._probe_notches = 6
+        self._adapt_retry = 0
+        self._no_tail_streak = 0
+        self._last_result = "ok"
         self._still = 0
         self._cursor = QCursor.pos()
 
@@ -4487,8 +4581,8 @@ class LongShotSession(QObject):
             limit = max(1, int(frame_height * 0.7 / self._pixels_per_notch))
             notches = min(notches, limit, 12)
         else:
-            # 第一格先只滚一格，实测出「一格滚多少像素」后再按比例加速
-            notches = 1
+            # 还没实测出「一格滚多少像素」：先用探测步长，失败后自动调整
+            notches = self._probe_notches
         self._notches = notches
         scroll_screen_at(self.rect.center(), notches)
         QTimer.singleShot(320, lambda: self._request_grab(first=False))
@@ -4511,6 +4605,8 @@ class LongShotSession(QObject):
             return
         self._show_mask()
         if self.auto:
+            if not appended:
+                self._adapt_probe()
             QTimer.singleShot(150 if appended else 350, self._auto_step)
 
     def _show_mask(self):
@@ -4525,6 +4621,7 @@ class LongShotSession(QObject):
     def _take(self, first):
         image = self._grab()
         if image is None:
+            self._last_result = "error"
             self._finish("无法读取屏幕，请检查系统的屏幕录制权限", ok=False)
             return False
         current = qimage_rgb_array(image)
@@ -4532,10 +4629,12 @@ class LongShotSession(QObject):
             self._rows = [current]
             self._last_frame = current
             self._frames = 1
+            self._last_result = "ok"
             self.progress.emit(current.shape[0], self._frames)
             return True
         import numpy as np
         if np.array_equal(current, self._last_frame):
+            self._last_result = "still"
             if self.auto:
                 self._still += 1
                 # 连续两次画面不动就认为到底了，自动完成
@@ -4546,10 +4645,8 @@ class LongShotSession(QObject):
             return False
         start = self._overlap_offset(self._last_frame, current)
         if start is None:
-            if self.auto:
-                self.set_auto(False)
-                self.notice.emit("自动滚动没找到重叠部分，已暂停 · 手动滚动后按空格继续")
-            else:
+            self._last_result = "no_overlap"
+            if not self.auto:
                 self.notice.emit("找不到重叠部分：滚动幅度请控制在选区高度的 80% 以内再按空格")
             return False
         tail = current[start:]
@@ -4557,23 +4654,59 @@ class LongShotSession(QObject):
         if tail.shape[0] > remaining:
             tail = tail[:max(0, remaining)]
         if tail.shape[0] == 0:
+            self._last_result = "no_tail"
             if self._total_height() >= LONG_SHOT_MAX_HEIGHT:
                 self._finish("已达到最大长度 %d 像素" % LONG_SHOT_MAX_HEIGHT)
-            elif self.auto:
-                self.set_auto(False)
-                self.notice.emit("画面没有新增内容，已暂停自动滚动 · 继续滚动后按空格抓拍")
-            else:
+            elif not self.auto:
                 self.notice.emit("画面没有新增内容：请继续滚动后再按空格")
             return False
         self._rows.append(tail)
         self._last_frame = current
         self._frames += 1
         self._still = 0
+        self._adapt_retry = 0
+        self._no_tail_streak = 0
+        self._last_result = "ok"
         if start > 0:
-            self._pixels_per_notch = max(20.0, float(start) / max(1, self._notches))
+            # start 是「新内容在当帧里的起始行」，实际位移 = 帧高 - start
+            shift = float(current.shape[0] - start)
+            self._pixels_per_notch = max(4.0, shift / max(1, self._notches))
             self._calibrated = True
         self.progress.emit(self._total_height(), self._frames)
         return True
+
+    def _adapt_probe(self):
+        """自动模式下这一格没拼上：调整探测步长再试，实在找不到合适步长才暂停。
+
+        不同 App 一格滚轮位移差别极大（文本编辑器约 20 像素、浏览器约 160 像素），
+        所以不能写死一个步长，靠失败反馈自动收敛。
+        """
+        if self._done or not self.auto:
+            return
+        result = self._last_result
+        if result == "still":
+            if self._still >= 2:
+                return                     # 真的到底了，_take 里已经收尾
+            self._no_tail_streak = 0
+            self._probe_notches = min(40, self._probe_notches * 2)
+        elif result == "no_tail":
+            # 画面没往上走：可能是这一格滚不动（步长太小），也可能是真的到底了
+            self._no_tail_streak += 1
+            if self._no_tail_streak >= 3:
+                self._finish("共 %d 帧（已到底部）" % self._frames)
+                return
+            self._probe_notches = min(40, self._probe_notches * 2)
+        elif result == "no_overlap":
+            # 滚过头了，「新内容」全部跑出画面
+            self._no_tail_streak = 0
+            self._probe_notches = max(1, self._probe_notches // 2)
+        else:
+            return
+        self._adapt_retry += 1
+        if self._adapt_retry > 5:
+            self.auto = False
+            self.mode_changed.emit(False)
+            self.notice.emit("自动滚动没找到合适的步长，已暂停 · 手动滚动后按空格继续")
 
     def _grab(self):
         try:
@@ -4630,6 +4763,15 @@ class LongShotSession(QObject):
             return
         self._done = True
         QCursor.setPos(self._cursor)
+        if self._frames <= 1 and ok:
+            hint = "未检测到滚动"
+            if sys.platform == "darwin":
+                try:
+                    if not mac_input_access()[0]:
+                        hint += "：缺少「辅助功能」权限"
+                except Exception:
+                    pass
+            message = "共 1 帧 · %s" % hint
         if not ok or not self._rows:
             self.finished.emit(None, message)
             return
@@ -4654,6 +4796,9 @@ class LongShotStatus(QWidget):
         self.setAttribute(Qt.WA_ShowWithoutActivating, False)
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setFocusPolicy(Qt.StrongFocus)
+        # 状态条同样可能拿不到焦点：Esc 取消、空格抓拍、回车完成都读键态兜底
+        self._key_watcher = KeyStateWatcher(("esc", "space", "enter"), self)
+        self._key_watcher.pressed.connect(self._on_key_state)
         self.setStyleSheet("QWidget { background: #202B3D; border-radius: 10px; }"
                            "QLabel { color: #FFFFFF; background: transparent; }"
                            "QPushButton { color: #FFFFFF; background: #38465C; border: none;"
@@ -4709,6 +4854,24 @@ class LongShotStatus(QWidget):
         self.adjustSize()
         self._place()
         self._refocus()
+
+    def _on_key_state(self, name):
+        if not self.isVisible():
+            return
+        if name == "esc":
+            self.cancel_requested.emit()
+        elif name == "space":
+            self.capture_requested.emit()
+        else:
+            self.finish_requested.emit()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._key_watcher.start()
+
+    def closeEvent(self, event):
+        self._key_watcher.stop()
+        super().closeEvent(event)
 
     def _refocus(self):
         self.raise_()
@@ -4841,6 +5004,8 @@ class ScreenshotTool(QObject):
         self.overlay.raise_()
         self.overlay.activateWindow()
         self.overlay.setFocus()
+        if _mac_is_cocoa():
+            _mac_activate_app()   # 后台应用的覆盖层不一定能自己抢到前台
 
     def _restore(self):
         windows, self._restore_windows = self._restore_windows, []
@@ -13665,8 +13830,32 @@ class ToolboxWindow(QMainWindow):
             return
         self._add_to_history("长截图")
         if self._long_overlay is not None:
-            self._long_overlay.close()
+            # 选区层是 WA_DeleteOnClose，可能已经被系统删掉了，不能再碰它的属性
+            try:
+                self._long_overlay.close()
+            except RuntimeError:
+                pass
+            self._long_overlay = None
             return
+        if sys.platform == "darwin" and not mac_input_requested_once[0]:
+            # 长截图靠模拟滚轮驱动被截取的窗口，没有「辅助功能」授权系统会把事件丢掉
+            mac_input_requested_once[0] = True
+            if not mac_input_access()[0]:
+                mac_request_post_event_access()
+                box = QMessageBox(self)
+                box.setWindowTitle("长截图需要「辅助功能」权限")
+                box.setIcon(QMessageBox.Information)
+                box.setText("长截图用模拟滚轮驱动被截取的窗口，macOS 需要授权才能发送这类事件。")
+                box.setInformativeText(
+                    "打开「系统设置 → 隐私与安全性 → 辅助功能」，勾选「系统工具箱」后重试；"
+                    "列表里没有「系统工具箱」就点 + 从「应用程序」添加。")
+                open_btn = box.addButton("打开设置", QMessageBox.ActionRole)
+                box.addButton("稍后", QMessageBox.RejectRole)
+                box.exec_()
+                if box.clickedButton() is open_btn:
+                    QDesktopServices.openUrl(QUrl(
+                        "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"))
+                return
         self._long_restore = self.isVisible()
         if self._long_restore:
             self.hide()
@@ -13683,13 +13872,21 @@ class ToolboxWindow(QMainWindow):
         overlay.selected.connect(self._start_long_shot)
         overlay.cancelled.connect(self._restore_after_long_shot)
         self._long_overlay = overlay
+        overlay.destroyed.connect(self._clear_long_overlay_ref)
         overlay.show()
         overlay.raise_()
         overlay.activateWindow()
         overlay.setFocus()
+        if _mac_is_cocoa():
+            _mac_activate_app()
+
+    def _clear_long_overlay_ref(self, *_args):
+        """选区层被 Qt 删掉（WA_DeleteOnClose）后同步清掉引用，避免访问已删除对象。"""
+        self._long_overlay = None
 
     def _start_long_shot(self, rect):
         self._long_overlay = None
+        write_startup_log("长截图：开始选区 %dx%d" % (rect.width(), rect.height()))
         status = LongShotStatus()
         session = LongShotSession(rect, self)
         session.mask = status
@@ -13707,9 +13904,13 @@ class ToolboxWindow(QMainWindow):
         status.raise_()
         status.activateWindow()
         status.setFocus()
+        if _mac_is_cocoa():
+            _mac_activate_app()
         session.start()
 
     def _finish_long_shot(self, image, message):
+        self._long_overlay = None
+        write_startup_log("长截图：%s%s" % (message, "" if image is not None else "（无输出）"))
         if self._long_status is not None:
             self._long_status.close()
             self._long_status = None
@@ -13725,6 +13926,7 @@ class ToolboxWindow(QMainWindow):
         preview.activateWindow()
 
     def _restore_after_long_shot(self):
+        self._long_overlay = None
         if self._long_restore:
             self._long_restore = False
             self.show()
@@ -13936,12 +14138,32 @@ class ToolboxWindow(QMainWindow):
         self.tray_icon.activated.connect(self.on_tray_activated)
         self.tray_icon.show()
 
+    def _screen_overlay_active(self):
+        """屏幕上是否正铺着工具自己的全屏层（截图 / 长截图 / 锁屏 / 文字雨 / 取色）。"""
+        try:
+            if self._locker is not None and self._locker.is_locked():
+                return True
+            if self._rain_overlay is not None and self._rain_overlay.isVisible():
+                return True
+            if self._long_overlay is not None or self._long_status is not None:
+                return True
+            if self._screen_pick_overlay is not None:
+                return True
+            return self.screenshot_tool is not None and self.screenshot_tool.overlay is not None
+        except RuntimeError:
+            # 某个层已经被 Qt 删掉了，按「没有覆盖层」处理，别把主窗口一起带崩
+            return False
+
     def on_app_activated(self):
         """macOS 点 Dock 图标回来时用：窗口被收进托盘/最小化就恢复，否则抬到最前。
 
         Qt 不会把「点 Dock 图标」这个动作映射成窗口恢复，只会切应用状态，
         所以窗口隐藏后点 Dock 看上去毫无反应，这里自己补上。
+        但全屏工具（截图 / 长截图等）正在工作时不能把主窗口翻出来，
+        否则会盖住正要截取的画面。
         """
+        if self._screen_overlay_active():
+            return
         if self.isMinimized() or not self.isVisible():
             self.show_from_tray()
             return
@@ -15321,6 +15543,30 @@ if __name__ == "__main__":
             faulthandler.enable(file=crash_file, all_threads=True)
         except OSError:
             crash_file = None
+    if sys.platform == "darwin":
+        try:
+            post_ok, screen_ok = mac_input_access()
+            write_startup_log("权限：合成键鼠=%s 屏幕录制=%s"
+                              % ("已授权" if post_ok else "未授权",
+                                 "已授权" if screen_ok else "未授权"))
+        except Exception:
+            pass
+    # PyQt 在「槽函数里抛出没被捕获的异常」时是直接 abort，进程只留一份崩溃报告，
+    # 看不到 Python 的报错原文。挂一个只负责落盘的钩子，把 traceback 写进 startup.log。
+    def _log_uncaught(exc_type, exc, tb):
+        try:
+            write_startup_log("未捕获异常：\n"
+                              + "".join(traceback.format_exception(exc_type, exc, tb)))
+        except Exception:
+            pass
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = _log_uncaught
+    if hasattr(threading, "excepthook"):
+        def _log_uncaught_thread(args):
+            _log_uncaught(args.exc_type, args.exc_value, args.exc_traceback)
+        threading.excepthook = _log_uncaught_thread
+
     # 防止多开：用 QLockFile 锁定用户目录下的锁文件，进程退出自动释放。
     lock_dir = os.path.join(os.path.expanduser("~"), ".personal_toolbox")
     os.makedirs(lock_dir, exist_ok=True)

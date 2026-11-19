@@ -100,6 +100,9 @@ a = Analysis(
     runtime_hooks=[],
     excludes=["tkinter", "matplotlib", "PyQt5.QtWebEngine", "PyQt5.QtQml",
               "PyQt5.QtQuick", "PyQt5.QtQuickWidgets",
+              # 纯 QWidget + 打印/导出全走 Pillow/QImage，这几个 Qt 模块代码里没有引用
+              "PyQt5.QtPrintSupport", "PyQt5.QtSvg", "PyQt5.QtDBus",
+              "PyQt5.QtSql", "PyQt5.QtTest", "PyQt5.QtXml",
               # 纯 QWidget 应用，运行时不会用到这些标准库组件
               "unittest", "doctest", "pydoc", "pydoc_data", "lib2to3",
               "ensurepip", "pip", "test"] + OCR_EXCLUDES,

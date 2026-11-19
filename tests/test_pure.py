@@ -208,6 +208,53 @@ class ReminderKitTest(unittest.TestCase):
         self.assertEqual(reminderkit.reminder_upcoming(rule, saturday),
                          QDateTime(2026, 11, 23, 9, 0, 0))  # 周一
 
+    def test_interval_days(self):
+        from PyQt5.QtCore import QDateTime
+        rule = {"time": "09:00", "repeat": reminderkit.REPEAT_INTERVAL,
+                "every": 2, "unit": "天", "anchor": "2026-11-16"}
+        now = QDateTime(2026, 11, 18, 10, 0, 0)
+        self.assertEqual(reminderkit.reminder_occurrence(rule, now),
+                         QDateTime(2026, 11, 18, 9, 0, 0))
+        self.assertEqual(reminderkit.reminder_upcoming(rule, now),
+                         QDateTime(2026, 11, 20, 9, 0, 0))
+        # 起算日之前没有班次
+        before = QDateTime(2026, 11, 15, 10, 0, 0)
+        self.assertIsNone(reminderkit.reminder_occurrence(rule, before))
+
+    def test_interval_weeks(self):
+        from PyQt5.QtCore import QDateTime
+        rule = {"time": "09:00", "repeat": reminderkit.REPEAT_INTERVAL,
+                "every": 3, "unit": "周", "anchor": "2026-11-02"}
+        now = QDateTime(2026, 11, 20, 0, 0, 0)
+        self.assertEqual(reminderkit.reminder_occurrence(rule, now),
+                         QDateTime(2026, 11, 2, 9, 0, 0))
+        self.assertEqual(reminderkit.reminder_upcoming(rule, now),
+                         QDateTime(2026, 11, 23, 9, 0, 0))
+
+    def test_interval_month_clamped_to_month_end(self):
+        from PyQt5.QtCore import QDateTime
+        rule = {"time": "09:00", "repeat": reminderkit.REPEAT_INTERVAL,
+                "every": 1, "unit": "月", "anchor": "2026-01-31"}
+        self.assertEqual(reminderkit.reminder_upcoming(rule, QDateTime(2026, 2, 1, 0, 0, 0)),
+                         QDateTime(2026, 2, 28, 9, 0, 0))
+        # 下一班回到 31 号，不会因为 2 月被钳位就整体漂移
+        self.assertEqual(reminderkit.reminder_upcoming(rule, QDateTime(2026, 3, 1, 0, 0, 0)),
+                         QDateTime(2026, 3, 31, 9, 0, 0))
+
+    def test_interval_every_two_months_crosses_year(self):
+        from PyQt5.QtCore import QDateTime
+        rule = {"time": "09:00", "repeat": reminderkit.REPEAT_INTERVAL,
+                "every": 2, "unit": "月", "anchor": "2026-11-19"}
+        self.assertEqual(reminderkit.reminder_upcoming(rule, QDateTime(2026, 11, 19, 10, 0, 0)),
+                         QDateTime(2027, 1, 19, 9, 0, 0))
+
+    def test_interval_preview_points(self):
+        from PyQt5.QtCore import QDate, QDateTime
+        points = reminderkit.interval_points(QDate(2026, 11, 19), 2, "天", "09:00",
+                                             QDateTime(2026, 11, 19, 10, 0, 0), 3)
+        self.assertEqual([p.toString("yyyy-MM-dd") for p in points],
+                         ["2026-11-21", "2026-11-23", "2026-11-25"])
+
     def test_invalid_rule_ignored(self):
         from PyQt5.QtCore import QDateTime
         now = QDateTime.currentDateTime()

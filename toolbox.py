@@ -1,4 +1,5 @@
 import sys
+import atexit
 import os
 import platform
 import subprocess
@@ -137,8 +138,9 @@ from toolbox_app.kit.ocrkit import (
     ocr_llm_ready, load_ocr_settings, save_ocr_settings,
 )
 from toolbox_app.kit.reminderkit import (
-    REPEAT_CHOICES, REPEAT_DAILY, REPEAT_ONCE, REPEAT_WEEKDAY, SNOOZE_MINUTES,
-    MISSED_QUIET_SECONDS, load_reminders, save_reminders,
+    REPEAT_CHOICES, REPEAT_DAILY, REPEAT_ONCE, REPEAT_WEEKDAY, REPEAT_INTERVAL,
+    UNIT_CHOICES, INTERVAL_MAX, SNOOZE_MINUTES, MISSED_QUIET_SECONDS,
+    load_reminders, save_reminders, interval_fields, interval_points,
     reminder_occurrence, reminder_upcoming, next_reminder, reminder_when_text,
 )
 from toolbox_app.kit.envkit import (
@@ -5566,6 +5568,7 @@ class LockScreenController(QObject):
                     self._awake = subprocess.Popen(
                         ["caffeinate", "-d", "-i", "-m", "-s"],
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    record_awake_process(self._awake)
             else:
                 if self._awake is not None and self._awake.poll() is None:
                     # caffeinate 对 SIGTERM / SIGINT 不响应，只能 SIGKILL
@@ -5575,6 +5578,7 @@ class LockScreenController(QObject):
                     except Exception:
                         pass
                 self._awake = None
+                forget_awake_process()
         except Exception:
             self._awake = None
 
@@ -10117,6 +10121,42 @@ COMMAND_ITEMS = [
     ("adb shell df -h", "查看设备存储空间", "ADB"),
     ("adb forward tcp:8080 tcp:8080", "端口转发：电脑 8080 → 设备 8080", "ADB"),
     ("adb reverse tcp:8080 tcp:8080", "反向转发：设备 8080 → 电脑 8080（真机调本地接口）", "ADB"),
+    # ---------- Nginx ----------
+    ("nginx -t", "检查配置文件语法（改完配置先跑这个再 reload）", "Nginx"),
+    ("nginx -T", "打印合并 include 后的完整生效配置", "Nginx"),
+    ("nginx -s reload", "平滑重载配置，不断已有连接", "Nginx"),
+    ("nginx -s quit", "优雅退出：处理完现有请求再停", "Nginx"),
+    ("nginx -s stop", "立即停止", "Nginx"),
+    ("nginx -s reopen", "重开日志文件（日志轮转后执行）", "Nginx"),
+    ("nginx -v", "查看版本号", "Nginx"),
+    ("nginx -V", "查看版本 + 编译参数与已装模块", "Nginx"),
+    ("nginx -c /etc/nginx/nginx.conf", "指定配置文件启动", "Nginx"),
+    ("systemctl reload nginx", "systemd 平滑重载", "Nginx"),
+    ("systemctl restart nginx", "重启服务（会断开现有连接）", "Nginx"),
+    ("systemctl status nginx", "查看运行状态与最近日志", "Nginx"),
+    ("tail -f /var/log/nginx/access.log", "实时看访问日志", "Nginx"),
+    ("tail -f /var/log/nginx/error.log", "实时看错误日志（502/504 先看它）", "Nginx"),
+    ("awk '{print $1}' access.log | sort | uniq -c | sort -r | head -10", "统计访问量前十的客户端 IP", "Nginx"),
+    ("awk '$9==404' access.log | wc -l", "统计 404 请求条数", "Nginx"),
+    ("ss -lntp | grep -E ':(80|443)'", "确认 80/443 端口是否真的在监听", "Nginx"),
+    ("ps -ef | grep nginx", "查看 master / worker 进程", "Nginx"),
+    ("proxy_pass http://127.0.0.1:8080;", "反向代理到本地后端服务", "Nginx"),
+    ("proxy_set_header Host $host;", "转发原始域名（后端拼跳转地址时必须）", "Nginx"),
+    ("proxy_set_header X-Real-IP $remote_addr;", "把真实客户端 IP 传给后端", "Nginx"),
+    ("proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;", "追加代理链上的客户端 IP", "Nginx"),
+    ("proxy_set_header X-Forwarded-Proto $scheme;", "告诉后端原始协议是 http 还是 https", "Nginx"),
+    ("proxy_read_timeout 60s;", "后端响应超时，慢接口调大（默认 60s）", "Nginx"),
+    ("client_max_body_size 100m;", "放开上传体积限制（默认只有 1m）", "Nginx"),
+    ("try_files $uri $uri/ /index.html;", "SPA 前端路由回退到 index.html", "Nginx"),
+    ("return 301 https://$host$request_uri;", "全站 301 跳到 HTTPS", "Nginx"),
+    ("rewrite ^/old/(.*)$ /new/$1 permanent;", "路径重写并 301 到新地址", "Nginx"),
+    ("gzip on; gzip_types text/css application/javascript application/json;", "开 gzip 并指定要压缩的类型", "Nginx"),
+    ("limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;", "按客户端 IP 声明限流区（放在 http 块）", "Nginx"),
+    ("limit_req zone=api burst=20 nodelay;", "在 location 里启用限流", "Nginx"),
+    ("ssl_certificate /etc/nginx/ssl/fullchain.pem;", "HTTPS 证书链", "Nginx"),
+    ("ssl_certificate_key /etc/nginx/ssl/privkey.pem;", "HTTPS 私钥", "Nginx"),
+    ("nginx.exe -s reload", "Windows 下平滑重载", "Nginx"),
+    ("tasklist | findstr nginx", "Windows 下查看 nginx 进程", "Nginx"),
 ]
 
 COMMAND_CAT_COLORS = {
@@ -10125,6 +10165,7 @@ COMMAND_CAT_COLORS = {
     "Windows": "#1A7F37",
     "Git": "#D81E06",
     "ADB": "#0C9A55",
+    "Nginx": "#0B7A45",
     "SSH": "#6950C8",
     "Vim": "#00838F",
 }
@@ -10171,7 +10212,7 @@ class CommandRow(QWidget):
 
 
 class DeveloperReferenceWindow(QMainWindow):
-    CATEGORIES = ["全部", "Docker", "Linux", "SSH", "Vim", "Windows", "Git", "ADB", "HTTP"]
+    CATEGORIES = ["全部", "Docker", "Linux", "SSH", "Vim", "Windows", "Git", "ADB", "Nginx", "HTTP"]
 
     def __init__(self):
         super().__init__()
@@ -10255,6 +10296,10 @@ class DeveloperReferenceWindow(QMainWindow):
             item = self._results_layout.takeAt(0)
             w = item.widget()
             if w:
+                # 只 deleteLater 不够：出栈的控件仍是可见子控件，新行铺上来会叠影，
+                # 先隐藏并脱离父级，等事件循环再真正销毁。
+                w.hide()
+                w.setParent(None)
                 w.deleteLater()
 
     def apply_filter(self):
@@ -11690,11 +11735,11 @@ TOOL_TIPS = {
     "文本工具": "页签：处理与统计（排序 · 去重 · uniq -c · 命名风格 · 合并拆分 · SQL IN · 选区实时统计 · 编码字节 · 不可见字符）/ 文本对比（行内高亮 · 忽略空白/大小写 · 差异跳转 · unified diff）",
     "Cron 表达式": "页签：执行计划 / 书写规范",
     "哈希计算": "页签：文本哈希 / 文件哈希（MD5 / SHA1 / SHA256 / SHA512）",
-    "开发速查": "分类：Docker / Linux / SSH / Vim / Windows / Git / ADB（安卓调试）命令速查 / HTTP 状态码 · 统一搜索 · 点击复制",
+    "开发速查": "分类：Docker / Linux / SSH / Vim / Windows / Git / ADB（安卓调试）/ Nginx 命令速查 / HTTP 状态码 · 统一搜索 · 点击复制",
     "ADB 调试": "功能：检测手机连接 · 无线连接 / 配对 · 安装 APK · 卸载应用 · 触发手机调试授权弹窗 · 日志输出 · 首次使用自动下载 Google 官方 platform-tools",
     "chmod 权限": "功能：八进制 ↔ 符号表示互转，可视化 9 个权限位",
     "日期时间": "页签：时间戳转换（秒/毫秒/微秒/纳秒自动识别 · ISO 8601 / RFC 2822 / 自定义格式）/ 日期计算（间隔 · 工作日 · 加减）/ 时区转换（夏令时）",
-    "提醒事项": "功能：定时弹框提醒（如上下班打卡）· 每天/工作日/仅一次 · 稍后再提醒 · 提示音",
+    "提醒事项": "功能：定时弹框提醒（如上下班打卡）· 每天 / 工作日 / 每 N 天·周·月 / 仅一次 · 新建与修改 · 稍后再提醒 · 提示音",
     "房贷计算器": "功能：等额本息 / 等额本金",
     "图片处理": "页签：转 Base64 / 格式转换 / 缩放压缩",
     "文字雨": "功能：桌面字符雨特效，开启时自动防黑屏（开关）",
@@ -11780,6 +11825,8 @@ PINYIN_MAP = {
     "git": ["开发速查", "配置"],
     "http": ["开发速查"],
     "adb": ["ADB 调试", "开发速查"],
+    "nginx": ["开发速查"],
+    "fuwuqi": ["开发速查"],
     "android": ["ADB 调试", "开发速查"],
     "anzhuo": ["ADB 调试", "开发速查"],
     "shouji": ["ADB 调试", "开发速查"],
@@ -11832,6 +11879,22 @@ WIN_RUN_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
 WIN_RUN_NAME = "PersonalToolbox"
 
 
+def reminder_repeat_label(rule):
+    """规则重复方式的可读文案：每天 / 工作日 / 每 2 周 · 自 11-19 / 仅一次 11-20。"""
+    repeat = rule.get("repeat", REPEAT_DAILY)
+    if repeat == REPEAT_INTERVAL:
+        fields = interval_fields(rule)
+        if fields is None:
+            return REPEAT_INTERVAL
+        anchor, every, unit = fields
+        return "每 %d %s · 自 %s" % (every, unit, anchor.toString("MM-dd"))
+    if repeat == REPEAT_ONCE:
+        day = QDate.fromString(rule.get("date", ""), "yyyy-MM-dd")
+        if day.isValid():
+            return "%s · %s" % (repeat, day.toString("MM-dd"))
+    return repeat
+
+
 def play_alert_sound():
     """用系统自带能力发声，不引入依赖；环境不配合时静默。"""
     system = platform.system()
@@ -11866,12 +11929,54 @@ def autostart_programs():
 
 def autostart_status():
     if platform.system() == "Darwin":
-        return os.path.exists(LAUNCH_AGENT_PATH)
+        if not os.path.exists(LAUNCH_AGENT_PATH):
+            return False
+        # plist 在、但里面记的目标已经不存在（换过安装位置）时不能算开启，
+        # 否则界面显示"已开启"而登录时 open -a 直接失败。
+        import plistlib
+        try:
+            with open(LAUNCH_AGENT_PATH, "rb") as f:
+                payload = plistlib.load(f)
+            target = (payload.get("ProgramArguments") or [None])[-1]
+        except (OSError, ValueError, AttributeError):
+            return False
+        return bool(target) and os.path.exists(target)
     if platform.system() == "Windows":
         result = subprocess.run(["reg", "query", WIN_RUN_KEY, "/v", WIN_RUN_NAME],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return result.returncode == 0
     return False
+
+
+def repair_autostart_target():
+    """自启项里记录的目标路径和「当前应用所在位置」不一致时（应用被移动/改名，
+    或当初是源码运行、后来换成 .app），就地改写 plist，避免登录时 open -a 指向
+    不存在的路径导致开机自启静默失效。返回是否改写过。"""
+    if platform.system() != "Darwin":
+        return False
+    if not os.path.exists(LAUNCH_AGENT_PATH):
+        return False
+    import plistlib
+    try:
+        with open(LAUNCH_AGENT_PATH, "rb") as f:
+            payload = plistlib.load(f)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    expected = autostart_programs()
+    if payload.get("ProgramArguments") == expected:
+        return False
+    payload["ProgramArguments"] = expected
+    payload["RunAtLoad"] = True
+    try:
+        with open(LAUNCH_AGENT_PATH, "wb") as f:
+            plistlib.dump(payload, f)
+        os.chmod(LAUNCH_AGENT_PATH, 0o600)
+    except OSError:
+        return False
+    write_startup_log("开机自启目标已更新：%s" % " ".join(expected))
+    return True
 
 
 def set_autostart(enable):
@@ -12150,7 +12255,7 @@ class ReminderEngine(QObject):
         self._show_card(rule, key, now, missed=missed, again=again)
 
     def _show_card(self, rule, key, now, missed=False, again=False):
-        subtitle = "%s · %s" % (rule.get("time", ""), rule.get("repeat", REPEAT_DAILY))
+        subtitle = "%s · %s" % (rule.get("time", ""), reminder_repeat_label(rule))
         note = ""
         if missed:
             note = "已错过 %s（现在 %s）" % (key.split(" ")[1], now.toString("HH:mm"))
@@ -12489,6 +12594,7 @@ class ReminderWindow(QMainWindow):
         self.setStyleSheet("QMainWindow { background: #FFFFFF; }"
                            ' QWidget { font-family: "PingFang SC", "Microsoft YaHei", sans-serif; }')
         self._loading = False
+        self._editing_index = None
         self.init_ui()
         self.engine.changed.connect(self.refresh)
         self.refresh()
@@ -12520,7 +12626,8 @@ class ReminderWindow(QMainWindow):
 
         head = QHBoxLayout()
         head.setSpacing(6)
-        head.addWidget(self._title("新建提醒"))
+        self.form_title = self._title("新建提醒")
+        head.addWidget(self.form_title)
         head.addStretch()
         head.addWidget(self._field_label("快速填写"))
         chip_style = """
@@ -12541,7 +12648,7 @@ class ReminderWindow(QMainWindow):
         self.name_input.setPlaceholderText("提醒内容，如 上班打卡、喝水、开会")
         self.name_input.setMaxLength(40)
         self.name_input.setStyleSheet(_lineedit_style())
-        self.name_input.returnPressed.connect(self.add_rule)
+        self.name_input.returnPressed.connect(self.submit_rule)
         self.name_input.textChanged.connect(lambda _: self.form_message.hide())
         form.addWidget(self.name_input)
 
@@ -12572,15 +12679,60 @@ class ReminderWindow(QMainWindow):
         self.date_input.setStyleSheet(_lineedit_style().replace("QLineEdit", "QDateEdit"))
         row.addWidget(self.date_input)
         row.addStretch()
+        self.cancel_btn = QPushButton("取消修改")
+        self.cancel_btn.setFixedSize(84, 32)
+        self.cancel_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.cancel_btn.setStyleSheet(_secondary_btn() + "QPushButton { font-size: 13px; }")
+        self.cancel_btn.clicked.connect(self.cancel_edit)
+        self.cancel_btn.hide()
+        row.addWidget(self.cancel_btn)
         add_btn = QPushButton("添加提醒")
         add_btn.setFixedSize(96, 32)
         add_btn.setCursor(QCursor(Qt.PointingHandCursor))
         add_btn.setStyleSheet(_primary_btn() + "QPushButton { font-size: 13px; }")
-        add_btn.clicked.connect(self.add_rule)
+        add_btn.clicked.connect(self.submit_rule)
         row.addWidget(add_btn)
+        self.add_btn = add_btn
         form.addLayout(row)
-        self.repeat_input.currentTextChanged.connect(self._sync_date_field)
-        self._sync_date_field(self.repeat_input.currentText())
+
+        # 间隔重复专用一行：每 N 天/周/月 · 起算日 · 下几次预览
+        self.interval_card = QWidget()
+        interval_row = QHBoxLayout(self.interval_card)
+        interval_row.setContentsMargins(0, 0, 0, 0)
+        interval_row.setSpacing(8)
+        interval_row.addWidget(self._field_label("每"))
+        self.every_input = QSpinBox()
+        self.every_input.setRange(1, INTERVAL_MAX)
+        self.every_input.setValue(2)
+        self.every_input.setFixedSize(64, 32)
+        self.every_input.setStyleSheet(_lineedit_style().replace("QLineEdit", "QSpinBox"))
+        interval_row.addWidget(self.every_input)
+        self.unit_input = QComboBox()
+        self.unit_input.addItems(UNIT_CHOICES)
+        self.unit_input.setFixedSize(72, 32)
+        self.unit_input.setStyleSheet(_combo_style())
+        interval_row.addWidget(self.unit_input)
+        interval_row.addSpacing(8)
+        interval_row.addWidget(self._field_label("起算日"))
+        self.anchor_input = QDateEdit(QDate.currentDate())
+        self.anchor_input.setDisplayFormat("yyyy-MM-dd")
+        self.anchor_input.setCalendarPopup(True)
+        self.anchor_input.setFixedSize(124, 32)
+        self.anchor_input.setStyleSheet(_lineedit_style().replace("QLineEdit", "QDateEdit"))
+        interval_row.addWidget(self.anchor_input)
+        interval_row.addSpacing(8)
+        self.preview_label = QLabel("")
+        self.preview_label.setStyleSheet("color: #57606A; font-size: 12px;")
+        interval_row.addWidget(self.preview_label, 1)
+        self.interval_card.hide()
+        form.addWidget(self.interval_card)
+
+        self.repeat_input.currentTextChanged.connect(self._sync_repeat_fields)
+        self.every_input.valueChanged.connect(lambda _: self._update_interval_preview())
+        self.unit_input.currentTextChanged.connect(lambda _: self._update_interval_preview())
+        self.anchor_input.dateChanged.connect(lambda _: self._update_interval_preview())
+        self.time_input.timeChanged.connect(lambda _: self._update_interval_preview())
+        self._sync_repeat_fields(self.repeat_input.currentText())
 
         self.form_message = QLabel("")
         self.form_message.setStyleSheet("color: #CF222E; font-size: 12px;")
@@ -12594,6 +12746,15 @@ class ReminderWindow(QMainWindow):
         self.count_label = self._field_label("")
         list_head.addWidget(self.count_label)
         list_head.addStretch()
+        self.edit_btn = QPushButton("修改")
+        self.edit_btn.setFixedSize(72, 28)
+        self.edit_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.edit_btn.setToolTip("把选中的提醒填回上方表单修改（也可直接双击）")
+        self.edit_btn.setStyleSheet(_secondary_btn() + """
+            QPushButton:disabled { color: #A0A8B4; background: #F6F8FA; border-color: #E4E8EE; }
+        """)
+        self.edit_btn.clicked.connect(lambda: self.start_edit())
+        list_head.addWidget(self.edit_btn)
         self.delete_btn = QPushButton("删除")
         self.delete_btn.setFixedSize(72, 28)
         self.delete_btn.setCursor(QCursor(Qt.PointingHandCursor))
@@ -12626,6 +12787,8 @@ class ReminderWindow(QMainWindow):
             self.table.setColumnWidth(column, width)
         self.table.itemChanged.connect(self.on_item_changed)
         self.table.itemSelectionChanged.connect(self._sync_delete_btn)
+        self.table.itemDoubleClicked.connect(
+            lambda item, _col: self.start_edit(self.table.indexOfTopLevelItem(item)))
         layout.addWidget(self.table, 1)
 
         self.empty_label = QLabel("还没有提醒\n在上方填写内容和时间，点击“添加提醒”")
@@ -12646,17 +12809,37 @@ class ReminderWindow(QMainWindow):
         layout.addLayout(footer)
 
         hint = QLabel("工具箱运行时（包括最小化到托盘）才会提醒，错过的提醒在 3 小时内补弹；"
-                      "提醒删除或停用后不会再弹出。")
+                      "提醒删除或停用后不会再弹出。双击一条提醒可直接修改。")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #8290A5; font-size: 11px;")
         layout.addWidget(hint)
 
-    def _sync_date_field(self, repeat):
+    def _sync_repeat_fields(self, repeat=None):
+        repeat = repeat or self.repeat_input.currentText()
         once = repeat == REPEAT_ONCE
+        interval = repeat == REPEAT_INTERVAL
         self.date_label.setVisible(once)
         self.date_input.setVisible(once)
+        self.interval_card.setVisible(interval)
         if once and QDateTime(self.date_input.date(), self.time_input.time()) <= QDateTime.currentDateTime():
             self.date_input.setDate(QDate.currentDate().addDays(1))
+        self._update_interval_preview()
+
+    def _update_interval_preview(self):
+        if self.repeat_input.currentText() != REPEAT_INTERVAL:
+            self.preview_label.setText("")
+            return
+        points = interval_points(self.anchor_input.date(), self.every_input.value(),
+                                 self.unit_input.currentText(),
+                                 self.time_input.time().toString("HH:mm"),
+                                 QDateTime.currentDateTime(), 3)
+        if not points:
+            self.preview_label.setText("起算日之后才会有提醒")
+            return
+        today = QDate.currentDate()
+        self.preview_label.setText("下 %d 次：%s" % (
+            len(points), "、".join(p.toString("MM-dd") if p.date().year() == today.year()
+                                   else p.toString("yyyy-MM-dd") for p in points)))
 
     def _form_error(self, text):
         self.form_message.setText(text)
@@ -12669,7 +12852,55 @@ class ReminderWindow(QMainWindow):
         self.form_message.hide()
         self.name_input.setFocus()
 
-    def add_rule(self):
+    def _selected_index(self):
+        items = self.table.selectedItems()
+        return self.table.indexOfTopLevelItem(items[0]) if items else -1
+
+    def start_edit(self, index=None):
+        """把选中的规则填回上方表单，进入「修改」状态。"""
+        if index is None or index < 0:
+            index = self._selected_index()
+        rules = self.engine.rules()
+        if not (0 <= index < len(rules)):
+            return
+        rule = rules[index]
+        self._editing_index = index
+        self.name_input.setText(rule.get("name", ""))
+        parsed = QTime.fromString(rule.get("time", ""), "HH:mm")
+        if parsed.isValid():
+            self.time_input.setTime(parsed)
+        self.repeat_input.setCurrentText(rule.get("repeat", REPEAT_DAILY))
+        if rule.get("repeat") == REPEAT_ONCE:
+            day = QDate.fromString(rule.get("date", ""), "yyyy-MM-dd")
+            if day.isValid():
+                self.date_input.setDate(day)
+        elif rule.get("repeat") == REPEAT_INTERVAL:
+            fields = interval_fields(rule)
+            if fields is not None:
+                anchor, every, unit = fields
+                self.anchor_input.setDate(anchor)
+                self.every_input.setValue(every)
+                self.unit_input.setCurrentText(unit)
+        self.form_title.setText("修改提醒")
+        self.add_btn.setText("保存修改")
+        self.cancel_btn.setVisible(True)
+        self.form_message.hide()
+        self.name_input.setFocus()
+        self.name_input.selectAll()
+
+    def cancel_edit(self):
+        self._editing_index = None
+        self.form_title.setText("新建提醒")
+        self.add_btn.setText("添加提醒")
+        self.cancel_btn.hide()
+        self.form_message.hide()
+        self.name_input.clear()
+        self.every_input.setValue(2)
+        self.unit_input.setCurrentText(UNIT_CHOICES[0])
+        self.anchor_input.setDate(QDate.currentDate())
+
+    def submit_rule(self):
+        """新建或保存修改：同一套校验，修改时跳过自己那条的重复检查。"""
         name = self.name_input.text().strip()
         if not name:
             self._form_error("请填写提醒内容")
@@ -12684,11 +12915,55 @@ class ReminderWindow(QMainWindow):
             if reminder_upcoming(rule, QDateTime.currentDateTime()) is None:
                 self._form_error("这个时间已经过去了，请选择之后的日期或时间")
                 return
-        same = ("name", "time", "repeat", "date")
-        if any(all(r.get(k) == rule.get(k) for k in same) for r in self.engine.rules()):
-            self._form_error("已经有一条相同的提醒")
+        elif rule["repeat"] == REPEAT_INTERVAL:
+            rule["every"] = int(self.every_input.value())
+            rule["unit"] = self.unit_input.currentText()
+            rule["anchor"] = self.anchor_input.date().toString("yyyy-MM-dd")
+            if reminder_upcoming(rule, QDateTime.currentDateTime()) is None:
+                self._form_error("这组间隔算不出下次提醒，请检查间隔和起算日")
+                return
+        rules = self.engine.rules()
+        editing = self._editing_index
+        same = ("name", "time", "repeat", "date", "every", "unit", "anchor")
+        for i, other in enumerate(rules):
+            if editing is not None and i == editing:
+                continue
+            if all(other.get(k) == rule.get(k) for k in same):
+                self._form_error("已经有一条相同的提醒")
+                return
+
+        now = QDateTime.currentDateTime()
+        if editing is not None and 0 <= editing < len(rules):
+            target = rules[editing]
+            enabled = target.get("enabled", True)
+            if rule["repeat"] == REPEAT_ONCE and not enabled:
+                enabled = True       # 改成新的时间点，已提醒过的「仅一次」应当重新生效
+            target.update(rule)      # 覆盖内容/时间/重复（含 date）
+            if rule["repeat"] != REPEAT_ONCE:
+                target.pop("date", None)
+            if rule["repeat"] != REPEAT_INTERVAL:
+                target.pop("every", None)
+                target.pop("unit", None)
+                target.pop("anchor", None)
+            target["enabled"] = enabled
+            occ = reminder_occurrence(target, now)
+            if occ is None:
+                target.pop("last_fired", None)
+            elif occ.secsTo(now) <= MISSED_QUIET_SECONDS:
+                # 只把「刚过点不久」的这一班记为已触发，免得改个名字就补弹一次；
+                # 早就过完的旧班次不去写，否则会把昨天时刻记成已提醒
+                target["last_fired"] = occ.toString("yyyy-MM-dd HH:mm")
+            self.engine.forget(target)      # 旧时刻排队的「稍后再提醒」一并作废
+            save_reminders(self.engine.state)
+            self.cancel_edit()
+            self.refresh()
+            item = self.table.topLevelItem(editing)
+            if item is not None:
+                self.table.setCurrentItem(item)
+                self.table.scrollToItem(item)
             return
-        self.engine.rules().append(rule)
+
+        rules.append(rule)
         save_reminders(self.engine.state)
         self.name_input.clear()
         self.form_message.hide()
@@ -12702,16 +12977,13 @@ class ReminderWindow(QMainWindow):
         index = self.table.indexOfTopLevelItem(items[0])
         rules = self.engine.rules()
         if 0 <= index < len(rules):
+            if self._editing_index == index:
+                self.cancel_edit()
             self.table.clearSelection()
             self.engine.remove_rule(rules[index])
 
     def _repeat_text(self, rule):
-        repeat = rule.get("repeat", REPEAT_DAILY)
-        if repeat == REPEAT_ONCE:
-            day = QDate.fromString(rule.get("date", ""), "yyyy-MM-dd")
-            if day.isValid():
-                return "%s · %s" % (repeat, day.toString("MM-dd"))
-        return repeat
+        return reminder_repeat_label(rule)
 
     def _next_text(self, rule, now):
         if not rule.get("enabled", True):
@@ -12762,7 +13034,9 @@ class ReminderWindow(QMainWindow):
         self._sync_delete_btn()
 
     def _sync_delete_btn(self):
-        self.delete_btn.setEnabled(bool(self.table.selectedItems()))
+        has_selection = bool(self.table.selectedItems())
+        self.delete_btn.setEnabled(has_selection)
+        self.edit_btn.setEnabled(has_selection)
 
     def on_item_changed(self, item, column):
         if self._loading or column != 0:
@@ -14049,10 +14323,12 @@ class ToolboxWindow(QMainWindow):
                             ["caffeinate", "-d", "-i", "-u"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                         )
+                        record_awake_process(self._caffeinate)
                 else:
                     if self._caffeinate is not None and self._caffeinate.poll() is None:
                         self._caffeinate.terminate()
                     self._caffeinate = None
+                    forget_awake_process()
             elif platform.system() == "Windows":
                 import ctypes
                 ES_CONTINUOUS = 0x80000000
@@ -15502,6 +15778,54 @@ class CheckUpdateThread(QThread):
             self.result.emit(False, {}, f"检查更新时出错：\n{e}")
 
 
+def _awake_pid_file():
+    return os.path.join(os.path.expanduser("~"), ".personal_toolbox", "awake.pid")
+
+
+def record_awake_process(proc):
+    """记下防休眠进程的 pid：应用被强杀时它可能变成孤儿，下次启动好清理。"""
+    if platform.system() != "Darwin" or proc is None:
+        return
+    try:
+        with open(_awake_pid_file(), "w", encoding="utf-8") as handle:
+            handle.write(str(proc.pid))
+    except OSError:
+        pass
+
+
+def forget_awake_process():
+    try:
+        os.remove(_awake_pid_file())
+    except OSError:
+        pass
+
+
+def cleanup_stale_awake():
+    """清掉上一次遗留的 caffeinate（应用被 kill -9 后它会继续按住不休眠）。"""
+    if platform.system() != "Darwin":
+        return False
+    try:
+        with open(_awake_pid_file(), encoding="utf-8") as handle:
+            pid = int((handle.read() or "0").strip() or 0)
+    except (OSError, ValueError):
+        return False
+    forget_awake_process()
+    if pid <= 0:
+        return False
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "comm="],
+                             capture_output=True, text=True, timeout=2).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if "caffeinate" not in out:
+        return False          # pid 已被别的进程复用，别误杀
+    try:
+        os.kill(pid, 9)
+        return True
+    except OSError:
+        return False
+
+
 def startup_log_path():
     """启动日志：统一保存到用户缓存目录。"""
     folder = os.path.join(os.path.expanduser("~"), ".personal_toolbox")
@@ -15559,14 +15883,6 @@ if __name__ == "__main__":
             faulthandler.enable(file=crash_file, all_threads=True)
         except OSError:
             crash_file = None
-    if sys.platform == "darwin":
-        try:
-            post_ok, screen_ok = mac_input_access()
-            write_startup_log("权限：合成键鼠=%s 屏幕录制=%s"
-                              % ("已授权" if post_ok else "未授权",
-                                 "已授权" if screen_ok else "未授权"))
-        except Exception:
-            pass
     # PyQt 在「槽函数里抛出没被捕获的异常」时是直接 abort，进程只留一份崩溃报告，
     # 看不到 Python 的报错原文。挂一个只负责落盘的钩子，把 traceback 写进 startup.log。
     def _log_uncaught(exc_type, exc, tb):
@@ -15657,9 +15973,24 @@ if __name__ == "__main__":
         app.installEventFilter(combo_click_filter)
         # 有托盘时隐藏主窗口不应退出程序（由托盘"退出"显式结束）
         app.setQuitOnLastWindowClosed(not QSystemTrayIcon.isSystemTrayAvailable())
+        if cleanup_stale_awake():
+            write_startup_log("已清理上次遗留的防休眠进程（caffeinate）")
+        try:
+            repair_autostart_target()
+        except Exception:
+            pass
+        atexit.register(cleanup_stale_awake)   # 锁屏状态被关掉时也把 caffeinate 收走
         window = ToolboxWindow()
         window.show()
         write_startup_log("界面已显示")
+        if sys.platform == "darwin":
+            # 只报「合成键鼠」：屏幕录制的 preflight 在能正常截图的机器上也会报未授权，
+            # 写进日志只会误导；真缺权限时首次截图自己会弹系统授权框。
+            try:
+                post_ok = mac_input_access()[0]
+                write_startup_log("权限：合成键鼠=%s" % ("已授权" if post_ok else "未授权"))
+            except Exception:
+                pass
         if sys.platform == "darwin":
             # 点 Dock 图标只会把应用激活，Qt 不会把隐藏的窗口还回来
             app.applicationStateChanged.connect(

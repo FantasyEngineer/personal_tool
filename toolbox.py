@@ -15288,9 +15288,13 @@ def offer_mac_app_move(parent):
 
 class UpdateDownloadWorker(QThread):
     progress = pyqtSignal(int, int)
+    retrying = pyqtSignal(int, str)
     unpacking = pyqtSignal()
     ready = pyqtSignal(str, str)
     failed = pyqtSignal(str)
+
+    MAX_ATTEMPTS = 4          # R2 在国内偶发限速/断流，给几次断点续传的机会
+    CHUNK = 128 * 1024
 
     def __init__(self, url, system, parent):
         super().__init__(parent)
@@ -15309,34 +15313,8 @@ class UpdateDownloadWorker(QThread):
             directory = tempfile.mkdtemp(prefix='toolbox_update_')
             self.directory = directory
             archive_path = os.path.join(directory, 'update.zip')
-            request = urllib.request.Request(self.url, headers={
-                'User-Agent': 'Mozilla/5.0', 'Accept': 'application/zip, application/octet-stream'})
-            opener = urllib.request.build_opener(
-                UpdateRedirectHandler(), urllib.request.HTTPSHandler(context=https_context()))
-            with opener.open(request, timeout=15) as response, open(archive_path, 'wb') as output:
-                validate_update_url(response.geturl())
-                total = int(response.headers.get('Content-Length', '0'))
-                limit = 1024 ** 3
-                if total < 0 or total > limit:
-                    raise ValueError("更新包大小超出 1 GB 限制。")
-                received, last_progress = 0, 0
-                self.progress.emit(0, total)
-                while True:
-                    if self.cancelled.is_set():
-                        raise InterruptedError("已取消更新。")
-                    chunk = response.read(256 * 1024)
-                    if not chunk:
-                        break
-                    received += len(chunk)
-                    if received > limit:
-                        raise ValueError("更新包大小超出 1 GB 限制。")
-                    output.write(chunk)
-                    if time.monotonic() - last_progress >= 0.1:
-                        self.progress.emit(received, total)
-                        last_progress = time.monotonic()
-                if total and received != total:
-                    raise ValueError("更新包下载不完整，请重试。")
-                self.progress.emit(received, total)
+            download_update_archive(self.url, archive_path, self.cancelled,
+                                    self.progress, self.retrying)
             if self.cancelled.is_set():
                 raise InterruptedError("已取消更新。")
             self.unpacking.emit()
@@ -15354,6 +15332,62 @@ class UpdateDownloadWorker(QThread):
         finally:
             if directory is not None and not delivered:
                 shutil.rmtree(directory, ignore_errors=True)
+
+
+def download_update_archive(url, archive_path, cancelled, progress, retrying):
+    """把更新包下到本地，带断点续传重试。
+
+    单个连接在国内访问 r2.dev 时会被限速甚至直接断流（实测同一地址有时 3 MB/s、
+    有时 70 KB/s 卡死），所以断了就带着 Range 从断点续传，最多重试 MAX_ATTEMPTS 次。
+    """
+    limit = 1024 ** 3
+    received, total, attempt = 0, 0, 0
+    while attempt < UpdateDownloadWorker.MAX_ATTEMPTS:
+        attempt += 1
+        try:
+            request = urllib.request.Request(url, headers={
+                'User-Agent': 'Mozilla/5.0', 'Accept': 'application/zip, application/octet-stream'})
+            if received:
+                request.add_header('Range', 'bytes=%d-' % received)
+            opener = urllib.request.build_opener(
+                UpdateRedirectHandler(), urllib.request.HTTPSHandler(context=https_context()))
+            with opener.open(request, timeout=30) as response:
+                validate_update_url(response.geturl())
+                if received and response.getcode() != 206:
+                    received = 0  # 服务器不认断点，只能整包重来
+                length = int(response.headers.get('Content-Length', '0') or 0)
+                total = received + length if length else 0
+                if total < 0 or total > limit:
+                    raise ValueError("更新包大小超出 1 GB 限制。")
+                progress.emit(received, total)
+                with open(archive_path, 'ab' if received else 'wb') as output:
+                    last_progress = time.monotonic()
+                    while True:
+                        if cancelled.is_set():
+                            raise InterruptedError("已取消更新。")
+                        chunk = response.read(UpdateDownloadWorker.CHUNK)
+                        if not chunk:
+                            break
+                        received += len(chunk)
+                        if received > limit:
+                            raise ValueError("更新包大小超出 1 GB 限制。")
+                        output.write(chunk)
+                        if time.monotonic() - last_progress >= 0.1:
+                            progress.emit(received, total)
+                            last_progress = time.monotonic()
+                if not total or received < total:
+                    raise urllib.error.URLError('下载连接提前中断')
+            progress.emit(received, total)
+            return received
+        except (InterruptedError, ValueError):
+            raise
+        except Exception as exc:            # 网络类异常：留着已下的部分，下一轮续传
+            if attempt >= UpdateDownloadWorker.MAX_ATTEMPTS:
+                raise urllib.error.URLError(
+                    '%s（已自动重试 %d 次，可用弹窗里的「手动下载」链接直接下）' % (exc, attempt))
+            retrying.emit(attempt, str(exc)[:120])
+            time.sleep(min(2 ** attempt, 8))
+    raise urllib.error.URLError('下载失败，可用弹窗里的「手动下载」链接直接下')
 
 
 def start_update_installer(directory, payload, target, shortcut, system):
@@ -15833,6 +15867,7 @@ class AppUpdateDialog(QDialog):
         self.progress_bar.setRange(0, 0)
         self._worker = UpdateDownloadWorker(self.url, self.system, self)
         self._worker.progress.connect(self._download_progress)
+        self._worker.retrying.connect(self._download_retrying)
         self._worker.unpacking.connect(self._unpacking)
         self._worker.ready.connect(self._download_ready)
         self._worker.failed.connect(self._failed)
@@ -15847,6 +15882,11 @@ class AppUpdateDialog(QDialog):
             self.progress_bar.setValue(received * 100 // total)
         self.status.setText('正在下载：%.1f MB%s' % (received / 1024 ** 2,
                             ' / %.1f MB' % (total / 1024 ** 2) if total else ''))
+
+    def _download_retrying(self, attempt, error):
+        if self._phase != 'downloading':
+            return
+        self.status.setText('网络中断（%s），正在续传重试第 %d 次…' % (error, attempt))
 
     def _unpacking(self):
         if self._phase == 'downloading':

@@ -123,6 +123,25 @@ class _ComboClickFilter(QObject):
         return rect.contains(pos)
 
 
+class _SelectAllFilter(QObject):
+    """macOS 上 Qt 把物理 Ctrl 映射成 MetaModifier，所以 Ctrl+A 默认不触发全选
+    （系统约定的全选是 Cmd+A，对应 ControlModifier）。这里两头都认，Ctrl+A 直接用。"""
+
+    def eventFilter(self, obj, event):
+        if event.type() != QEvent.KeyPress or event.key() != Qt.Key_A:
+            return False
+        mods = event.modifiers()
+        if not (mods & (Qt.ControlModifier | Qt.MetaModifier)):
+            return False
+        if mods & Qt.AltModifier:      # Ctrl+Alt+A 之类不抢
+            return False
+        select_all = getattr(obj, "selectAll", None)
+        if not callable(select_all):
+            return False
+        select_all()
+        return True
+
+
 def _primary_btn():
     return """
         QPushButton { color: #FFFFFF; background: #1A73E8; border: none;

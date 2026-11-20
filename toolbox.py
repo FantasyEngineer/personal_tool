@@ -76,6 +76,7 @@ from toolbox_app.assets import app_asset_path, app_icon
 from toolbox_app.theme import (
     ui_font, FlowLayout, tool_win_geometry, _lineedit_style, _combo_style, _ComboClickFilter,
     _primary_btn, _secondary_btn, _plain_style, _output_style, _tab_style,
+    _SelectAllFilter,
 )
 from toolbox_app.storage import (
     user_path, _read_text, _write_text,
@@ -363,7 +364,7 @@ class JsonFormatterWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("JSON 处理")
+        self.setWindowTitle("JSON 格式化")
         self.setGeometry(*tool_win_geometry())
         self.setStyleSheet("QMainWindow { background: #FFFFFF; }")
         self._pages = {}
@@ -419,6 +420,7 @@ class JsonFormatterWindow(QMainWindow):
         tab_bar = BlankClickTabBar(self.tabs)
         self.tabs.setTabBar(tab_bar)
         tab_bar.blank_clicked.connect(self.add_tab)
+        tab_bar.tabBarDoubleClicked.connect(self.begin_rename)
         # 标签栏本身只有标签那么宽，右侧那一截空白属于 QTabWidget，
         # 在这里补一次判断，让两处空白都能新增标签。
         self.tabs.installEventFilter(self)
@@ -583,6 +585,9 @@ class JsonFormatterWindow(QMainWindow):
             }
             QTreeWidget::item { height: 22px; }
         """)
+        tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        tree.customContextMenuRequested.connect(
+            lambda pos, w=tree: self.show_tree_menu(w, pos))
         stack.addWidget(tree)
 
         text_out = QPlainTextEdit()
@@ -597,6 +602,9 @@ class JsonFormatterWindow(QMainWindow):
                 background: #FAFAFA;
             }
         """)
+        text_out.setContextMenuPolicy(Qt.CustomContextMenu)
+        text_out.customContextMenuRequested.connect(
+            lambda pos, w=text_out: self.show_text_menu(w, pos))
         stack.addWidget(text_out)
 
         right_layout.addWidget(stack)
@@ -615,9 +623,96 @@ class JsonFormatterWindow(QMainWindow):
     def add_tab(self, title=None):
         page = self._build_page()
         index = self.tabs.addTab(page["widget"], title or self._next_title())
+        self.tabs.setTabToolTip(index, "双击标签可以重命名")
         self.tabs.setCurrentIndex(index)
         page["input"].setFocus()
         return page
+
+    def begin_rename(self, index=None):
+        """双击底部标签就地改名：回车或失焦生效，Esc 放弃。"""
+        if index is None:
+            index = self.tabs.currentIndex()
+        if index is None or index < 0 or index >= self.tabs.count():
+            return
+        bar = self.tabs.tabBar()
+        rect = bar.tabRect(index)
+        if not rect.isValid():
+            return
+        edit = QLineEdit(bar)
+        edit.setText(self.tabs.tabText(index))
+        edit.setGeometry(rect.adjusted(1, 1, -1, -1))
+        edit.setStyleSheet("""
+            QLineEdit { background: #FFFFFF; color: #1A73E8; border: 1px solid #1A73E8;
+                border-radius: 4px; padding: 0 4px; font-size: 12px; }
+        """)
+        edit.selectAll()
+        edit.show()
+        edit.setFocus()
+        state = {"done": False}
+
+        def finish(accept):
+            if state["done"]:
+                return
+            state["done"] = True
+            if accept:
+                text = edit.text().strip()
+                if text:
+                    self.tabs.setTabText(index, text)
+            edit.hide()
+            edit.deleteLater()
+
+        edit.returnPressed.connect(lambda: finish(True))
+        edit.editingFinished.connect(lambda: finish(True))
+        edit.keyPressEvent = self._rename_key_handler(edit, finish)
+        self._rename_edit = edit      # 留住引用，避免输入框被提前回收
+
+    @staticmethod
+    def _rename_key_handler(edit, finish):
+        original = QLineEdit.keyPressEvent
+
+        def handler(event):
+            if event.key() == Qt.Key_Escape:
+                finish(False)
+                return
+            original(edit, event)
+
+        return handler
+
+    @staticmethod
+    def _copy_text(text):
+        if text:
+            QApplication.clipboard().setText(text)
+
+    def show_tree_menu(self, tree, pos):
+        """结果树里右键：复制本行 / 复制值 / 复制字段名，对象数组还能整段复制。"""
+        item = tree.itemAt(pos)
+        if item is None:
+            return
+        field = item.text(0)
+        shown = item.text(1)
+        node = item.data(0, Qt.UserRole)
+        container = isinstance(node, (dict, list))
+        node_json = json.dumps(node, ensure_ascii=False, indent=2) if container else shown
+        menu = QMenu(tree)
+        menu.addAction("复制本行", lambda: self._copy_text("%s: %s" % (field, node_json)))
+        menu.addAction("复制值", lambda: self._copy_text(node_json))
+        menu.addAction("复制字段名", lambda: self._copy_text(field))
+        if container:
+            menu.addAction("复制此节点的 JSON", lambda: self._copy_text(node_json))
+        menu.exec_(tree.viewport().mapToGlobal(pos))
+
+    def show_text_menu(self, editor, pos):
+        """纯文本结果（压缩/转义/报错）右键：复制本行、选中内容、全文。"""
+        cursor = editor.textCursor()
+        cursor.select(QTextCursor.LineUnderCursor)
+        line = cursor.selectedText()
+        menu = QMenu(editor)
+        menu.addAction("复制本行", lambda: self._copy_text(line))
+        if editor.textCursor().hasSelection():
+            menu.addAction("复制选中内容",
+                           lambda: self._copy_text(editor.textCursor().selectedText()))
+        menu.addAction("复制全部", lambda: self._copy_text(editor.toPlainText()))
+        menu.exec_(editor.viewport().mapToGlobal(pos))
 
     def _next_title(self):
         used = {self.tabs.tabText(i) for i in range(self.tabs.count())}
@@ -666,12 +761,14 @@ class JsonFormatterWindow(QMainWindow):
         if isinstance(value, (dict, list)):
             item = QTreeWidgetItem(parent, [label, self._hint(value)])
             item.setForeground(1, QBrush(QColor("#8A8A8A")))
+            item.setData(0, Qt.UserRole, value)
             self._add_children(item, value)
         else:
             text, color = self._scalar(value)
             item = QTreeWidgetItem(parent, [label, text])
             item.setForeground(1, QBrush(QColor(color)))
             item.setToolTip(1, text)
+            item.setData(0, Qt.UserRole, value)
 
     def _add_children(self, parent, data):
         if isinstance(data, dict):
@@ -685,6 +782,7 @@ class JsonFormatterWindow(QMainWindow):
         tree.clear()
         root = QTreeWidgetItem(tree, ["$", self._hint(data)])
         root.setForeground(1, QBrush(QColor("#8A8A8A")))
+        root.setData(0, Qt.UserRole, data)
         self._add_children(root, data)
         root.setExpanded(True)
 
@@ -1298,7 +1396,6 @@ class CodecWindow(TabbedToolWindow):
 class DataFormatWindow(TabbedToolWindow):
     def __init__(self):
         super().__init__("数据格式", (
-            (JsonFormatterWindow, "JSON"),
             (XmlFormatterWindow, "XML"),
             (JsonYamlWindow, "JSON ↔ YAML"),
         ))
@@ -11723,7 +11820,8 @@ TOOL_TIPS = {
     "网络诊断": "页签：Ping 测试 / 路由追踪 / DNS 查询 / 端口扫描 / 网络测速 · 目标地址跨页签同步",
     "进程管理": "功能：进程列表 · 按名称/PID/窗口标题搜索 · 按端口过滤 · 结束进程",
     "配置": "页签：环境变量 / 进程内变量 / Git 配置 / 镜像源 / SSH 密钥 / SSH 主机 / 显示开关",
-    "数据格式": "页签：JSON / XML / JSON ↔ YAML · 格式化 · 校验 · 转换",
+    "JSON 格式化": "功能：多标签各自独立输入与结果 · 结果可折叠树 · 双击标签重命名 · 结果逐行右键复制 · 压缩 / 转义 / 中文符号转英文",
+    "数据格式": "页签：XML / JSON ↔ YAML · 格式化 · 校验 · 转换",
     "编解码": "页签：Base64 / URL / Unicode 转义",
     "加解密": "页签：JWT / AES / RSA / HMAC / 口令哈希 / 随机密钥",
     "正则测试": "功能：常用正则预设 · 实时匹配与高亮",
@@ -11800,7 +11898,7 @@ PINYIN_MAP = {
     "shijianchuo": ["日期时间"],
     "timestamp": ["日期时间"],
     "unix": ["日期时间"],
-    "json": ["数据格式"],
+    "json": ["JSON 格式化", "数据格式"],
     "xml": ["数据格式"],
     "yaml": ["数据格式"],
     "wenben": ["文本工具"],
@@ -13736,6 +13834,7 @@ class ToolboxWindow(QMainWindow):
         self.ip, self.mac, self.adapter = get_effective_ip()
         self.popup = None
         self.data_format_window = None
+        self.json_format_window = None
         self.codec_window = None
         self.hash_window = None
         self.crypto_window = None
@@ -13905,7 +14004,8 @@ class ToolboxWindow(QMainWindow):
             "哈希计算": self.show_hash
         })
 
-        self.create_section("文本与数据", ["数据格式", "文本工具", "正则测试"], {
+        self.create_section("文本与数据", ["JSON 格式化", "数据格式", "文本工具", "正则测试"], {
+            "JSON 格式化": self.show_json_format,
             "数据格式": self.show_data_format,
             "文本工具": self.show_text_tool,
             "正则测试": self.show_regex
@@ -14528,6 +14628,12 @@ class ToolboxWindow(QMainWindow):
         self.popup = ProcessManagerWindow(self)
         self.popup.show()
 
+    def show_json_format(self):
+        if self.json_format_window is None:
+            self.json_format_window = JsonFormatterWindow()
+        self.json_format_window.show()
+        self.json_format_window.activateWindow()
+
     def show_data_format(self):
         if self.data_format_window is None:
             self.data_format_window = DataFormatWindow()
@@ -15086,7 +15192,12 @@ class ToolboxWindow(QMainWindow):
             box.exec_()
             return
         if not self._is_newer_version(APP_VERSION, data['version']):
-            QMessageBox.information(parent, "检查更新", f"当前已是最新版本 v{APP_VERSION}", QMessageBox.Ok)
+            url = update_package_url(data)
+            if not url:
+                QMessageBox.information(parent, "检查更新", f"当前已是最新版本 v{APP_VERSION}", QMessageBox.Ok)
+                return
+            self._latest_dialog = CurrentVersionDialog(data['version'], url, parent)
+            self._latest_dialog.show()
             return
         self._download_update(data, parent)
 
@@ -15518,6 +15629,83 @@ replaced=1
     return process, ready, error
 
 
+def _download_link_row(html, url):
+    """弹窗里「点开就下载」的一行：蓝色外链 + 复制按钮。返回 (布局, 链接标签, 复制按钮)。"""
+    row = QHBoxLayout()
+    row.setSpacing(8)
+    link = QLabel(html)
+    link.setTextFormat(Qt.RichText)
+    link.setOpenExternalLinks(True)
+    link.setTextInteractionFlags(Qt.TextBrowserInteraction)
+    link.setWordWrap(True)
+    link.setToolTip(url)
+    link.setStyleSheet('font-size: 12px; color: #667085;')
+    row.addWidget(link, 1)
+    copy_btn = QPushButton('复制链接')
+    copy_btn.setStyleSheet(_secondary_btn())
+    copy_btn.setToolTip('把下载地址复制到剪贴板，方便在浏览器里打开')
+
+    def _copy():
+        QApplication.clipboard().setText(url)
+        copy_btn.setText('已复制')
+        QTimer.singleShot(1200, lambda: copy_btn.setText('复制链接'))
+
+    copy_btn.clicked.connect(_copy)
+    row.addWidget(copy_btn)
+    return row, link, copy_btn
+
+
+def _update_package_name():
+    return 'Windows 安装包' if platform.system() == 'Windows' else 'macOS 安装包'
+
+
+def update_package_url(data):
+    """取当前平台对应的安装包地址；没有或不合规就返回空串。"""
+    url = data.get('win_url' if platform.system() == 'Windows' else 'mac_url', '')
+    try:
+        validate_update_url(url)
+    except ValueError:
+        return ''
+    return url
+
+
+class CurrentVersionDialog(QDialog):
+    """已是最新版本时的提示窗：顺手给出这一版的下载地址，换机、包损坏、留备份都用得上。"""
+
+    def __init__(self, version, url, parent):
+        super().__init__(parent)
+        self.url = url
+        self.setWindowTitle('检查更新')
+        self.setWindowModality(Qt.ApplicationModal)
+        self.resize(520, 200)
+        self.setStyleSheet('QDialog { background: #F6F8FC; } QLabel { color: #344054; }')
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(12)
+        title = QLabel('已是最新版本 v' + version)
+        title.setFont(ui_font(18, 22, True))
+        title.setTextFormat(Qt.PlainText)
+        layout.addWidget(title)
+        subtitle = QLabel('当前版本 v%s · 已安装的就是最新发布包' % APP_VERSION)
+        subtitle.setStyleSheet('color: #667085; font-size: 12px;')
+        layout.addWidget(subtitle)
+        html = '需要重新安装或换台机器？<a href="%s">下载 v%s %s</a>' % (url, version, _update_package_name())
+        row, self.download_link, self.copy_link_btn = _download_link_row(html, url)
+        layout.addLayout(row)
+        tip = QLabel('下载得到的是与当前版本完全一致的安装包，可解压后直接替换旧版。')
+        tip.setWordWrap(True)
+        tip.setStyleSheet('color: #667085; font-size: 12px;')
+        layout.addWidget(tip)
+        layout.addStretch()
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        self.close_btn = QPushButton('关闭')
+        self.close_btn.setStyleSheet(_primary_btn())
+        self.close_btn.clicked.connect(self.accept)
+        buttons.addWidget(self.close_btn)
+        layout.addLayout(buttons)
+
+
 class AppUpdateDialog(QDialog):
     install_ready = pyqtSignal()
 
@@ -15549,6 +15737,11 @@ class AppUpdateDialog(QDialog):
         changelog.setMaximumHeight(140)
         changelog.setStyleSheet('QPlainTextEdit { background: white; border: 1px solid #E1E7EF; border-radius: 8px; padding: 10px; }')
         layout.addWidget(changelog)
+        # 应用内下载偶尔会被网络/系统策略拦掉，这里给一条能直接粘到浏览器的下载地址
+        html = '应用内下载失败？<a href="%s">手动下载 v%s %s</a>' % (
+            self.url, data['version'], _update_package_name())
+        link_row, self.download_link, self.copy_link_btn = _download_link_row(html, self.url)
+        layout.addLayout(link_row)
         layout.addWidget(QLabel('安装位置（下次更新覆盖同一位置）'))
         location_row = QHBoxLayout()
         self.location = QLineEdit(self.target)
@@ -15971,6 +16164,9 @@ if __name__ == "__main__":
         # 下拉框整框可点（挂在 app 上，覆盖之后新建的所有 QComboBox）
         combo_click_filter = _ComboClickFilter(app)
         app.installEventFilter(combo_click_filter)
+        # 物理 Ctrl+A 在 mac 上默认不全选，补一层映射（Cmd+A 照旧可用）
+        select_all_filter = _SelectAllFilter(app)
+        app.installEventFilter(select_all_filter)
         # 有托盘时隐藏主窗口不应退出程序（由托盘"退出"显式结束）
         app.setQuitOnLastWindowClosed(not QSystemTrayIcon.isSystemTrayAvailable())
         if cleanup_stale_awake():

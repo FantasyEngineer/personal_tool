@@ -89,7 +89,7 @@ from toolbox_app.natives import (
     mac_input_access, mac_request_post_event_access,
 )
 from toolbox_app.kit.sysinfo import (
-    get_effective_ip, get_system_stats, human_mem, kill_process,
+    collect_system_info, get_effective_ip, get_system_stats, human_mem, kill_process,
     list_processes, process_port_map,
 )
 from toolbox_app.kit.textkit import TEXT_OPS, text_stats, _text_escape_param
@@ -14022,6 +14022,184 @@ class SettingsWindow(QMainWindow):
             super().keyPressEvent(event)
 
 
+class SystemInfoThread(QThread):
+    """在后台采一次系统信息：Windows 那次 CIM 查询要一两秒，别卡住首页。"""
+    done = pyqtSignal(object)
+
+    def __init__(self, force, parent=None):
+        super().__init__(parent)
+        self.force = force
+
+    def run(self):
+        try:
+            self.done.emit(collect_system_info(self.force))
+        except Exception:
+            self.done.emit([])
+
+
+class SystemInfoWindow(QDialog):
+    """本机详细信息：电脑名称、处理器、内存、存储、显卡、网络、运行环境。
+
+    只读当前这台电脑（跑在什么机器上就查什么机器），不涉及任何远端主机。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("系统信息")
+        self.setWindowModality(Qt.NonModal)
+        self.resize(720, 620)
+        self.setStyleSheet("QDialog { background: #F6F8FC; }")
+        self._thread = None
+        self._sections = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 18, 22, 16)
+        layout.setSpacing(12)
+
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        titles = QVBoxLayout()
+        titles.setSpacing(2)
+        self.name_label = QLabel("--")
+        self.name_label.setFont(ui_font(15, 20, True))
+        self.name_label.setStyleSheet("color: #1F2D3D;")
+        titles.addWidget(self.name_label)
+        self.summary_label = QLabel("正在读取本机信息…")
+        self.summary_label.setFont(ui_font(9, 12))
+        self.summary_label.setStyleSheet("color: #7A8798;")
+        titles.addWidget(self.summary_label)
+        header.addLayout(titles, 1)
+        layout.addLayout(header)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setStyleSheet("QScrollArea { background: transparent; }")
+        self.cards_host = QWidget()
+        self.cards_host.setStyleSheet("background: transparent;")
+        self.cards_layout = QVBoxLayout(self.cards_host)
+        self.cards_layout.setContentsMargins(0, 2, 6, 2)
+        self.cards_layout.setSpacing(10)
+        self.cards_layout.addStretch()
+        self.scroll.setWidget(self.cards_host)
+        layout.addWidget(self.scroll, 1)
+
+        footer = QHBoxLayout()
+        footer.setSpacing(8)
+        hint = QLabel("数据来自当前运行的这台电脑，「刷新」会重新采集一次。")
+        hint.setFont(ui_font(9, 11))
+        hint.setStyleSheet("color: #8A96A8;")
+        footer.addWidget(hint, 1)
+        self.refresh_btn = QPushButton("刷新")
+        self.refresh_btn.setStyleSheet(_secondary_btn())
+        self.refresh_btn.clicked.connect(lambda: self.load(force=True))
+        footer.addWidget(self.refresh_btn)
+        self.copy_btn = QPushButton("复制全部")
+        self.copy_btn.setStyleSheet(_secondary_btn())
+        self.copy_btn.clicked.connect(self.copy_all)
+        footer.addWidget(self.copy_btn)
+        self.close_btn = QPushButton("关闭")
+        self.close_btn.setStyleSheet(_primary_btn())
+        self.close_btn.clicked.connect(self.accept)
+        footer.addWidget(self.close_btn)
+        layout.addLayout(footer)
+
+        self.load()
+
+    def load(self, force=False):
+        if self._thread is not None and self._thread.isRunning():
+            return
+        self.refresh_btn.setEnabled(False)
+        self._thread = SystemInfoThread(force, self)
+        self._thread.done.connect(self._show_sections)
+        self._thread.finished.connect(lambda: self.refresh_btn.setEnabled(True))
+        self._thread.start()
+
+    def _clear_cards(self):
+        while self.cards_layout.count() > 1:            # 末尾留那个 stretch
+            item = self.cards_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.hide()
+                widget.setParent(None)
+                widget.deleteLater()
+
+    def _show_sections(self, sections):
+        self._sections = list(sections or [])
+        self._clear_cards()
+        for index, section in enumerate(self._sections):
+            self.cards_layout.insertWidget(index, self._make_card(*section))
+        device = self._sections[0][1] if self._sections else []
+        values = dict(device)
+        self.name_label.setText(values.get("电脑名称") or "--")
+        summary = " · ".join(part for part in (
+            values.get("操作系统") or "", values.get("设备型号") or "",
+            self._cpu_name(), self._memory_total()) if part)
+        self.summary_label.setText(summary or "未取到系统信息")
+
+    def _cpu_name(self):
+        for title, rows in self._sections:
+            if title == "处理器":
+                return dict(rows).get("处理器") or ""
+        return ""
+
+    def _memory_total(self):
+        for title, rows in self._sections:
+            if title == "内存":
+                total = dict(rows).get("总容量")
+                return "内存 %s" % total if total and total != "--" else ""
+        return ""
+
+    def _make_card(self, title, rows):
+        card = QFrame()
+        card.setObjectName("sysCard")
+        card.setStyleSheet("QFrame#sysCard { background: #FFFFFF; border: 1px solid #E4EAF2;"
+                           " border-radius: 10px; }")
+        box = QVBoxLayout(card)
+        box.setContentsMargins(16, 12, 16, 14)
+        box.setSpacing(8)
+        head = QLabel(title)
+        head.setFont(ui_font(10, 13, True))
+        head.setStyleSheet("color: #1F2D3D; border: none; background: transparent;")
+        box.addWidget(head)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(6)
+        for row, (key, value) in enumerate(rows):
+            name = QLabel(str(key))
+            name.setFont(ui_font(9, 12))
+            name.setStyleSheet("color: #7A8798; border: none; background: transparent;")
+            name.setFixedWidth(96)
+            text = QLabel(str(value))
+            text.setFont(ui_font(9, 12))
+            text.setStyleSheet("color: #2B3A4A; border: none; background: transparent;")
+            text.setWordWrap(True)
+            text.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            grid.addWidget(name, row, 0)
+            grid.addWidget(text, row, 1)
+        grid.setColumnStretch(1, 1)
+        box.addLayout(grid)
+        return card
+
+    def copy_all(self):
+        if not self._sections:
+            return
+        lines = ["%s  系统工具箱 v%s" % (self.name_label.text(), APP_VERSION)]
+        for title, rows in self._sections:
+            lines.append("")
+            lines.append("【%s】" % title)
+            for key, value in rows:
+                lines.append("  %s: %s" % (key, value))
+        QApplication.clipboard().setText("\n".join(lines))
+        self.copy_btn.setText("已复制")
+        QTimer.singleShot(1200, lambda: self.copy_btn.setText("复制全部"))
+
+    def closeEvent(self, event):
+        if self._thread is not None and self._thread.isRunning():
+            self._thread.wait(5000)
+        super().closeEvent(event)
+
+
 class ToolboxWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -14328,11 +14506,17 @@ class ToolboxWindow(QMainWindow):
         self.cpu_label = QLabel("CPU: --")
         self.cpu_label.setFont(ui_font(10, 11))
         self.cpu_label.setStyleSheet("color: #8290A5;")
+        self.cpu_label.setCursor(QCursor(Qt.PointingHandCursor))
+        self.cpu_label.setToolTip("点击查看本机系统详细信息")
+        self.cpu_label.mousePressEvent = lambda event: self.show_system_info()
         bottom_layout.addWidget(self.cpu_label)
 
         self.mem_label = QLabel("内存: --")
         self.mem_label.setFont(ui_font(10, 11))
         self.mem_label.setStyleSheet("color: #8290A5;")
+        self.mem_label.setCursor(QCursor(Qt.PointingHandCursor))
+        self.mem_label.setToolTip("点击查看本机系统详细信息")
+        self.mem_label.mousePressEvent = lambda event: self.show_system_info()
         bottom_layout.addWidget(self.mem_label)
         bottom_layout.addStretch()
 
@@ -14357,6 +14541,7 @@ class ToolboxWindow(QMainWindow):
         bottom_layout.addWidget(settings_btn)
 
         self._update_dialog = None
+        self._sysinfo_window = None
         self.check_thread = None
         QApplication.instance().aboutToQuit.connect(self._stop_update_check)
         self.update_btn = QPushButton("检查更新")
@@ -14527,6 +14712,16 @@ class ToolboxWindow(QMainWindow):
             self.cpu_label.setText(f"CPU: {cpu_pct:.0f}%")
         if mem_pct is not None:
             self.mem_label.setText(f"内存: {used_gb:.1f}G / {total_gb:.0f}G ({mem_pct:.0f}%)")
+
+    def show_system_info(self):
+        """点击左下角的 CPU / 内存：看这台电脑的硬件与系统详情。"""
+        window = self._sysinfo_window
+        if window is not None and window.isVisible():
+            window.raise_()
+            window.activateWindow()
+            return
+        self._sysinfo_window = SystemInfoWindow(self)
+        self._sysinfo_window.show()
 
     def create_section(self, title, buttons, callbacks=None, toggle_callbacks=None):
         toggle_callbacks = toggle_callbacks or {}

@@ -13590,6 +13590,11 @@ class SettingsWindow(QMainWindow):
         settings = save_s3_settings(self._current_s3_settings())
         self.s3_feedback.setText("已保存到 %s" % S3_SETTINGS_PATH
                                  if settings["endpoint"] else "已保存（服务地址为空）")
+        # 对象浏览窗口如果开着，按新配置立刻重新列桶，不用手动点刷新
+        main = getattr(self, "main", None)
+        browser = getattr(main, "s3_window", None) if main else None
+        if browser is not None:
+            browser.load_buckets(select=browser._bucket or settings.get("bucket"))
 
     def _test_s3(self):
         QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
@@ -15656,8 +15661,51 @@ class ToolboxWindow(QMainWindow):
             self.show_from_tray()
             return
         if sys.platform == "darwin":
-            self.raise_()
-            self.activateWindow()
+            # 选完文件、上传收尾时系统会触发一次「应用激活」，此刻前台可能正是
+            # 对象存储这类自己的窗口：等事件队列走完再看，别把主窗口硬抢上来。
+            QTimer.singleShot(0, self._raise_if_nothing_else_active)
+
+    def _another_own_window_visible(self):
+        """本应用自己的窗口（工具窗口、对象存储、对话框等）是否有正开着的。
+
+        提示条 / toast 这类带 WA_ShowWithoutActivating 的浮层不算：它们本来就不该
+        抢焦点，也不该阻止主窗口恢复。
+        """
+        try:
+            windows = QApplication.allWidgets()
+        except RuntimeError:
+            return False
+        for widget in windows:
+            if widget is self:
+                continue
+            if not widget.isWindow():
+                continue          # 只关心独立的窗口，不看控件
+            try:
+                if not widget.isVisible() or widget.isMinimized():
+                    continue
+                if widget.testAttribute(Qt.WA_ShowWithoutActivating):
+                    continue
+                if (widget.windowFlags() & Qt.WindowType_Mask) == Qt.ToolTip:
+                    continue
+            except RuntimeError:
+                continue        # 窗口已经被 Qt 销毁
+            return True
+        return False
+
+    def _raise_if_nothing_else_active(self):
+        """应用被激活时，只有自己没有别的窗口在前台，才把主窗口抬起来。"""
+        if self._screen_overlay_active():
+            return
+        try:
+            active = QApplication.activeWindow()
+        except RuntimeError:
+            active = None
+        if active is not None and active is not self and active.isVisible():
+            return
+        if self._another_own_window_visible():
+            return
+        self.raise_()
+        self.activateWindow()
 
     def show_from_tray(self):
         """从托盘图标恢复主窗口：最小化状态也要先解除，再抢到最前。"""
@@ -15728,7 +15776,7 @@ class ToolboxWindow(QMainWindow):
         """主界面入口：打开 MinIO 对象浏览窗口；配置只在本地，界面里不显示密钥。"""
         if self.s3_window is None:
             self.s3_window = S3BrowserWindow()
-            self.s3_window.settings_requested.connect(self.show_config)
+            self.s3_window.settings_requested.connect(lambda: self.show_settings("对象存储"))
         self.s3_window.show()
         self.s3_window.raise_()
         self.s3_window.activateWindow()
@@ -16238,9 +16286,14 @@ class ToolboxWindow(QMainWindow):
         self.section_order_window.raise_()
         self.section_order_window.activateWindow()
 
-    def show_settings(self):
+    def show_settings(self, tab=None):
         if self.settings_window is None:
             self.settings_window = SettingsWindow(self)
+        if tab:
+            for index in range(self.settings_window.tabs.count()):
+                if self.settings_window.tabs.tabText(index) == tab:
+                    self.settings_window.tabs.setCurrentIndex(index)
+                    break
         self.settings_window.show()
         self.settings_window.raise_()
         self.settings_window.activateWindow()

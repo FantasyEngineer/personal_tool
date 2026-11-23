@@ -513,7 +513,7 @@ def _windows_sections():
     vram_sizes = _windows_vram_sizes()
 
     device_rows = [
-        ("电脑名称", platform.node() or "--"),
+        ("电脑名称", _machine_name()),
         ("制造商", computer.get("Manufacturer") or "--"),
         ("设备型号", computer.get("Model") or "--"),
         ("计算机类型", _WINDOWS_SYSTEM_TYPE.get(computer.get("SystemType") or "",
@@ -600,7 +600,7 @@ def _windows_sections():
     primary_ip = _first_ip(primary.get("IPAddress"))
     net_rows = [
         ("IPv4 地址", primary_ip or ip),
-        ("MAC 地址", (primary.get("MACAddress") or mac or "--").replace("-", ":")),
+        ("MAC 地址", (primary.get("MACAddress") or mac or "--").replace("-", ":").upper()),
         ("网卡", primary.get("Description") or adapter or "--"),
     ]
     ipv6 = _first_ip(primary.get("IPAddress"), ipv6=True)
@@ -688,6 +688,23 @@ def _mac_storage_rows():
     return rows or [("存储", "--")]
 
 
+def _machine_name():
+    """电脑名称：macOS 优先用 scutil 的 ComputerName（就是「关于本机」里那个），
+    Windows 用主机名；platform.node() 在 mac 上会带 .local 后缀，去掉更像人话。"""
+    if platform.system() == "Darwin":
+        try:
+            name = subprocess.run(["scutil", "--get", "ComputerName"], capture_output=True,
+                                  text=True, timeout=5).stdout.strip()
+            if name:
+                return name
+        except Exception:
+            pass
+    name = platform.node() or ""
+    if name.lower().endswith(".local"):
+        name = name[:-6]
+    return name or "--"
+
+
 def _mac_uptime_seconds():
     raw = _mac_sysctl("kern.boottime")
     match = re.search(r"sec\s*=\s*(\d+)", raw)
@@ -724,7 +741,7 @@ def _mac_sections():
 
     return [
         ("设备与系统", [
-            ("电脑名称", platform.node() or "--"),
+            ("电脑名称", _machine_name()),
             ("设备型号", model or "--"),
             ("操作系统", "macOS %s" % version),
             ("系统架构", platform.machine() or "--"),
@@ -740,7 +757,7 @@ def _mac_sections():
         ("显卡", _mac_display_rows()),
         ("网络", [
             ("IPv4 地址", ip),
-            ("MAC 地址", mac or "--"),
+            ("MAC 地址", (mac or "--").upper()),
             ("网卡", adapter or "--"),
         ]),
     ]
@@ -771,7 +788,7 @@ def collect_system_info(force=False):
     try:
         sections = _windows_sections() if platform.system() == "Windows" else _mac_sections()
     except Exception:
-        sections = [("设备与系统", [("电脑名称", platform.node() or "--")])]
+        sections = [("设备与系统", [("电脑名称", _machine_name())])]
     try:
         sections = sections + [("运行环境", _runtime_rows())]
     except Exception:

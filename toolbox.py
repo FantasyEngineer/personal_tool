@@ -59,7 +59,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QStyledItemDelegate, QStyle, QGraphicsOpacityEffect,
                               QDialog, QFormLayout, QDialogButtonBox,
                               QDateEdit, QDateTimeEdit, QTimeEdit,
-                              QAbstractItemView, QKeySequenceEdit, QProgressBar, QSizePolicy)
+                              QAbstractItemView, QKeySequenceEdit, QProgressBar, QSizePolicy,
+                              QTableWidget, QTableWidgetItem)
 from PyQt5.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QThread, QObject, pyqtSignal, QTimer, QUrl, QLockFile, QDate, QDateTime, QTime, QAbstractNativeEventFilter, QEvent, QSize, QStandardPaths, QPropertyAnimation, QEasingCurve
 from PyQt5.QtGui import (QFont, QCursor, QTextCursor, QColor, QPen, QPixmap, QPainter, QIcon,
                          QImage, QLinearGradient, QRadialGradient, QBrush, QDesktopServices, QPalette,
@@ -139,8 +140,10 @@ from toolbox_app.kit.ocrkit import (
     ocr_llm_ready, load_ocr_settings, save_ocr_settings,
 )
 from toolbox_app.kit.s3kit import (
-    load_s3_settings, save_s3_settings, s3_test, s3_make_bucket,
-    s3_put_object, s3_upload_file,
+    load_s3_settings, save_s3_settings, s3_test, s3_make_bucket, s3_list_buckets,
+    s3_put_object, s3_list_objects, s3_get_object_bytes,
+    s3_download_file, s3_delete_object, s3_delete_prefix, s3_upload_path,
+    s3_presigned_url,
 )
 from toolbox_app.constants import S3_SETTINGS_PATH
 from toolbox_app.kit.reminderkit import (
@@ -11899,6 +11902,7 @@ TOOL_TIPS = {
     "图片处理": "页签：转 Base64 / 格式转换 / 缩放压缩",
     "文字雨": "功能：桌面字符雨特效，开启时自动防黑屏（开关）",
     "防黑屏": "功能：阻止系统休眠与屏幕关闭（开关）",
+    "对象存储": "功能：连自己的 MinIO · 列桶与目录、上传/下载、预览、复制直链、删除 · 配置与密钥只存本机",
     "模拟锁屏": "功能：模仿 Windows / macOS 的全屏锁屏界面（时间日期 · 点击解锁），人走后挡住桌面，同时让电脑保持唤醒、后台程序继续运行",
     "数字转换": "页签：进制转换（二进制 / 八进制 / 十进制 / 十六进制）/ 罗马数字 / 金额大写",
     "商余计算": "功能：求整除的商和余数",
@@ -13498,7 +13502,7 @@ class SettingsWindow(QMainWindow):
         layout.setContentsMargins(0, 18, 0, 0)
         layout.setSpacing(10)
         layout.addWidget(self._group_title("S3 / MinIO 接入"))
-        hint = QLabel("填好自己的 S3 兼容存储（MinIO、七牛、Cloudflare R2 等）就能在这个工具箱里上传文件。\n"
+        hint = QLabel("填好 MinIO（本机或局域网）的服务地址与密钥，就能在这个工具箱里上传、浏览文件。\n"
                       "配置保存在 ~/.personal_toolbox/s3_settings.json，密钥以明文存放，只留在本机，别同步到仓库里。")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #697386; font-size: 12px;")
@@ -13543,18 +13547,12 @@ class SettingsWindow(QMainWindow):
         test_btn.setStyleSheet(_secondary_btn())
         test_btn.clicked.connect(self._test_s3)
         buttons.addWidget(test_btn)
-        make_btn = QPushButton("建桶")
-        make_btn.setFixedSize(72, 30)
-        make_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        make_btn.setStyleSheet(_secondary_btn())
-        make_btn.clicked.connect(self._make_s3_bucket)
-        buttons.addWidget(make_btn)
-        upload_btn = QPushButton("上传文件")
-        upload_btn.setFixedSize(88, 30)
-        upload_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        upload_btn.setStyleSheet(_secondary_btn())
-        upload_btn.clicked.connect(self._upload_to_s3)
-        buttons.addWidget(upload_btn)
+        browse_btn = QPushButton("浏览对象")
+        browse_btn.setFixedSize(88, 30)
+        browse_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        browse_btn.setStyleSheet(_primary_btn())
+        browse_btn.clicked.connect(self._open_s3_browser)
+        buttons.addWidget(browse_btn)
         buttons.addStretch()
         save = QPushButton("保存")
         save.setFixedSize(88, 30)
@@ -13601,37 +13599,18 @@ class SettingsWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
         self.s3_feedback.setText(("通过 · " if ok else "失败 · ") + message)
 
-    def _make_s3_bucket(self):
-        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+    def _open_s3_browser(self):
+        """先把当前填的配置落盘，再打开对象浏览器（同一个窗口只开一份）。"""
         try:
-            bucket = s3_make_bucket(self._current_s3_settings())
-            message = "桶 %s 已就绪" % bucket
+            save_s3_settings(self._current_s3_settings())
         except Exception as exc:
-            message = "建桶失败：%s" % exc
-        finally:
-            QApplication.restoreOverrideCursor()
-        self.s3_feedback.setText(message)
-
-    def _upload_to_s3(self):
-        settings = self._current_s3_settings()
-        if not (settings["bucket"] or "").strip():
-            self.s3_feedback.setText("请先填 Bucket")
+            self.s3_feedback.setText("配置保存失败：%s" % exc)
             return
-        path, _ = QFileDialog.getOpenFileName(self, "选择要上传的文件", os.path.expanduser("~"))
-        if not path:
+        main = getattr(self, "main", None)
+        if main is None or not hasattr(main, "show_s3_browser"):
+            self.s3_feedback.setText("当前窗口打不开对象浏览器")
             return
-        name = os.path.basename(path)
-        key = "uploads/%s/%s" % (datetime.datetime.now().strftime("%Y%m%d"), name)
-        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
-        try:
-            saved = save_s3_settings(settings)          # 顺手把当前填的配置落盘
-            key, url = s3_upload_file(saved, path, key)
-            message = "已上传 · %s" % url
-        except Exception as exc:
-            message = "上传失败：%s" % exc
-        finally:
-            QApplication.restoreOverrideCursor()
-        self.s3_feedback.setText(message)
+        main.show_s3_browser()
 
     def _build_ocr_page(self):
         page = QWidget()
@@ -14200,6 +14179,726 @@ class SystemInfoWindow(QDialog):
         super().closeEvent(event)
 
 
+# ===== 对象存储（MinIO）浏览器 =====
+
+_S3_LINK_STYLE = """
+QPushButton { border: none; background: transparent; color: #1A73E8;
+    font-size: 12px; padding: 2px 4px; }
+QPushButton:hover { text-decoration: underline; }
+"""
+
+
+def _human_size(value):
+    """字节数转人看的大小；对象是 0 字节时也显示 0 B 而不是 --。"""
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return "--"
+    if size < 1024:
+        return "%d B" % int(size)
+    for unit in ("KB", "MB", "GB", "TB"):
+        size /= 1024.0
+        if size < 1024 or unit == "TB":
+            return "%.1f %s" % (size, unit)
+    return "--"
+
+
+def _s3_time_text(raw):
+    """S3 的时间是 UTC（2026-11-23T10:12:31.000Z），转成本地时区再显示。"""
+    text = (raw or "").strip()
+    if not text:
+        return "--"
+    try:
+        moment = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=datetime.timezone.utc)
+        return moment.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return text.replace("T", " ").replace("Z", "")[:19]
+
+
+class _S3Task(QThread):
+    """S3 请求放后台跑；一次只允许一个任务，避免同一窗口里抢状态。"""
+
+    done = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    step = pyqtSignal(object)
+
+    def __init__(self, func, parent=None):
+        super().__init__(parent)
+        self._func = func
+
+    def run(self):
+        try:
+            self.done.emit(self._func(self.step.emit))
+        except Exception as exc:      # 网络、鉴权、解析都统一回给界面提示
+            self.failed.emit(str(exc) or exc.__class__.__name__)
+
+
+class S3PreviewDialog(QDialog):
+    """图片和文本预览；图片按窗口大小等比缩放，文本只读。"""
+
+    def __init__(self, key, image=None, text=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("预览 · %s" % key.rsplit("/", 1)[-1])
+        self.setWindowModality(Qt.NonModal)
+        self.resize(880, 640)
+        self.setStyleSheet("QDialog { background: #FFFFFF; }")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+
+        head = QLabel(key)
+        head.setFont(ui_font(9, 12))
+        head.setStyleSheet("color: #7A8798;")
+        head.setWordWrap(True)
+        layout.addWidget(head)
+
+        if image is not None:
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.NoFrame)
+            self.pic = QLabel()
+            self.pic.setAlignment(Qt.AlignCenter)
+            shown = image if image.width() <= 860 else image.scaled(
+                860, 620, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.pic.setPixmap(shown)
+            scroll.setWidget(self.pic)
+            layout.addWidget(scroll, 1)
+        else:
+            self.text_view = QPlainTextEdit()
+            self.text_view.setReadOnly(True)
+            self.text_view.setPlainText(text or "")
+            self.text_view.setStyleSheet(
+                "QPlainTextEdit { background: #FAFBFC; border: 1px solid #E4EAF2;"
+                " border-radius: 6px; font-family: Menlo, Consolas, monospace; font-size: 12px; }")
+            layout.addWidget(self.text_view, 1)
+
+        footer = QHBoxLayout()
+        footer.addStretch()
+        if text is not None:
+            copy_btn = QPushButton("复制内容")
+            copy_btn.setFixedHeight(28)
+            copy_btn.setStyleSheet(_secondary_btn())
+            copy_btn.setCursor(QCursor(Qt.PointingHandCursor))
+            copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(text))
+            footer.addWidget(copy_btn)
+        close_btn = QPushButton("关闭")
+        close_btn.setFixedHeight(28)
+        close_btn.setStyleSheet(_primary_btn())
+        close_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        close_btn.clicked.connect(self.accept)
+        footer.addWidget(close_btn)
+        layout.addLayout(footer)
+
+
+class S3BrowserWindow(QDialog):
+    """MinIO 对象浏览：列桶、进目录、上传、下载、预览、删除、复制直链。
+
+    密钥只从本机 ~/.personal_toolbox/s3_settings.json 读，界面不显示、不写日志、不进仓库。
+    """
+
+    settings_requested = pyqtSignal()
+
+    IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tif", ".tiff"}
+    TEXT_EXT = {".txt", ".md", ".markdown", ".json", ".xml", ".yaml", ".yml", ".ini",
+                ".conf", ".toml", ".log", ".csv", ".py", ".js", ".ts", ".html", ".css",
+                ".java", ".go", ".rs", ".sh", ".sql", ".c", ".h", ".cpp", ".gradle"}
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("对象存储（MinIO）")
+        self.setWindowModality(Qt.NonModal)
+        self.resize(1040, 700)
+        self.setStyleSheet("QDialog { background: #FFFFFF; }")
+        self._settings = load_s3_settings()
+        self._bucket = self._settings.get("bucket") or ""
+        self._prefix = ""
+        self._page = None
+        self._task = None
+        self._preview = None
+        self._build_ui()
+        QTimer.singleShot(0, self.load_buckets)
+
+    # ---- 界面 -----------------------------------------------------------
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        title = QLabel("对象存储")
+        title.setFont(ui_font(14, 18, True))
+        title.setStyleSheet("color: #1F2D3D;")
+        header.addWidget(title)
+        self.endpoint_label = QLabel(self._endpoint_text())
+        self.endpoint_label.setFont(ui_font(9, 11))
+        self.endpoint_label.setStyleSheet("color: #8A96A8;")
+        header.addWidget(self.endpoint_label)
+        header.addStretch()
+        self.config_btn = QPushButton("存储配置")
+        self.config_btn.setFixedHeight(28)
+        self.config_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.config_btn.setStyleSheet(_secondary_btn())
+        self.config_btn.clicked.connect(self.settings_requested.emit)
+        header.addWidget(self.config_btn)
+        self.refresh_btn = QPushButton("刷新")
+        self.refresh_btn.setFixedHeight(28)
+        self.refresh_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.refresh_btn.setStyleSheet(_secondary_btn())
+        self.refresh_btn.clicked.connect(lambda: self.load_buckets(select=self._bucket))
+        header.addWidget(self.refresh_btn)
+        layout.addLayout(header)
+
+        bucket_row = QHBoxLayout()
+        bucket_row.setSpacing(8)
+        bucket_label = QLabel("Bucket")
+        bucket_label.setFont(ui_font(9, 12))
+        bucket_label.setStyleSheet("color: #53657E;")
+        bucket_row.addWidget(bucket_label)
+        self.bucket_combo = QComboBox()
+        self.bucket_combo.setFixedWidth(220)
+        self.bucket_combo.setStyleSheet(_combo_style())
+        self.bucket_combo.currentTextChanged.connect(self._on_bucket_changed)
+        bucket_row.addWidget(self.bucket_combo)
+        self.new_bucket_btn = QPushButton("新建桶")
+        self.new_bucket_btn.setFixedSize(76, 26)
+        self.new_bucket_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.new_bucket_btn.setStyleSheet(_secondary_btn())
+        self.new_bucket_btn.setToolTip("在当前 MinIO 上新建一个桶")
+        self.new_bucket_btn.clicked.connect(self.new_bucket)
+        bucket_row.addWidget(self.new_bucket_btn)
+        self.path_host = QWidget()
+        self.path_layout = QHBoxLayout(self.path_host)
+        self.path_layout.setContentsMargins(6, 0, 0, 0)
+        self.path_layout.setSpacing(2)
+        bucket_row.addWidget(self.path_host, 1)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("在当前目录搜索")
+        self.search_edit.setFixedWidth(200)
+        self.search_edit.setStyleSheet(_lineedit_style())
+        self.search_edit.textChanged.connect(self._apply_filter)
+        bucket_row.addWidget(self.search_edit)
+        layout.addLayout(bucket_row)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        self.upload_btn = QPushButton("上传文件")
+        self.upload_btn.setFixedHeight(30)
+        self.upload_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.upload_btn.setStyleSheet(_primary_btn())
+        self.upload_btn.clicked.connect(self.upload_files)
+        actions.addWidget(self.upload_btn)
+        for text, handler, width in (
+                ("新建文件夹", self.new_folder, 96),
+                ("下载", self.download_selected, 64),
+                ("预览", self.preview_selected, 64),
+                ("复制链接", self.copy_link, 88),
+                ("删除", self.delete_selected, 64)):
+            btn = QPushButton(text)
+            btn.setFixedSize(width, 30)
+            btn.setCursor(QCursor(Qt.PointingHandCursor))
+            btn.setStyleSheet(_secondary_btn())
+            btn.clicked.connect(handler)
+            actions.addWidget(btn)
+        actions.addStretch()
+        self.more_btn = QPushButton("加载更多")
+        self.more_btn.setFixedHeight(26)
+        self.more_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.more_btn.setStyleSheet(_secondary_btn())
+        self.more_btn.setVisible(False)
+        self.more_btn.clicked.connect(self._load_more)
+        actions.addWidget(self.more_btn)
+        layout.addLayout(actions)
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["名称", "大小", "修改时间"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setShowGrid(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.setStyleSheet(
+            "QTableWidget { background: #FFFFFF; border: 1px solid #E4EAF2; border-radius: 8px;"
+            " alternate-background-color: #FAFBFD; gridline-color: #EEF2F7; }"
+            "QTableWidget::item { padding: 4px 6px; }"
+            "QTableWidget::item:selected { background: #E8F1FE; color: #1A73E8; }"
+            "QHeaderView::section { background: #F4F7FB; color: #53657E; border: none;"
+            " padding: 6px; font-size: 12px; }")
+        header_view = self.table.horizontalHeader()
+        header_view.setSectionResizeMode(0, QHeaderView.Stretch)
+        header_view.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header_view.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.itemDoubleClicked.connect(self._on_double_click)
+        layout.addWidget(self.table, 1)
+
+        footer = QHBoxLayout()
+        footer.setSpacing(10)
+        self.status_label = QLabel("正在读取…")
+        self.status_label.setFont(ui_font(9, 11))
+        self.status_label.setStyleSheet("color: #8A96A8;")
+        footer.addWidget(self.status_label, 1)
+        self.progress = QProgressBar()
+        self.progress.setFixedWidth(200)
+        self.progress.setFixedHeight(8)
+        self.progress.setTextVisible(False)
+        self.progress.setVisible(False)
+        self.progress.setStyleSheet(
+            "QProgressBar { background: #EEF2F7; border: none; border-radius: 4px; }"
+            "QProgressBar::chunk { background: #1A73E8; border-radius: 4px; }")
+        footer.addWidget(self.progress)
+        layout.addLayout(footer)
+
+        self._update_path()
+
+    def _endpoint_text(self):
+        endpoint = (self._settings.get("endpoint") or "").strip()
+        return endpoint or "未配置 MinIO 地址"
+
+    # ---- 线程与状态 ------------------------------------------------------
+
+    def _run(self, func, on_done, busy="正在处理…"):
+        if self._task is not None and self._task.isRunning():
+            self._set_status("上一个操作还没结束，稍等一下")
+            return
+        self._set_busy(True, busy)
+        task = _S3Task(func, self)
+        self._task = task
+        task.done.connect(lambda result, cb=on_done: self._finish(cb, result))
+        task.failed.connect(self._failed)
+        task.step.connect(self._on_step)
+        task.finished.connect(lambda: self._set_busy(False))
+        task.start()
+
+    def _finish(self, callback, result):
+        self.progress.setVisible(False)
+        if callback:
+            callback(result)
+
+    def _failed(self, message):
+        self.progress.setVisible(False)
+        self._set_status(message, warn=True)
+        QMessageBox.warning(self, "对象存储", message)
+
+    def _on_step(self, payload):
+        if not isinstance(payload, dict):
+            return
+        text = payload.get("text")
+        total = payload.get("total") or 0
+        done = payload.get("done") or 0
+        if text:
+            self._set_status(text)
+        if total:
+            self.progress.setVisible(True)
+            self.progress.setRange(0, 1000)
+            percent = max(0.0, min(1.0, float(done) / float(total)))
+            self.progress.setValue(int(percent * 1000))
+
+    def _set_busy(self, busy, hint=None):
+        for widget in (self.upload_btn, self.refresh_btn, self.config_btn, self.new_bucket_btn,
+                       self.bucket_combo, self.search_edit, self.more_btn):
+            widget.setEnabled(not busy)
+        if busy:
+            self.progress.setVisible(True)
+            self.progress.setRange(0, 0)
+            if hint:
+                self._set_status(hint)
+        else:
+            self.progress.setVisible(False)
+            self.progress.setRange(0, 100)
+
+    def _set_status(self, text, warn=False):
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet("color: #D9534F;" if warn else "color: #8A96A8;")
+
+    # ---- 列表 -----------------------------------------------------------
+
+    def load_buckets(self, select=None):
+        self._settings = load_s3_settings()
+        self.endpoint_label.setText(self._endpoint_text())
+        if not self._s3_ready():
+            self.bucket_combo.clear()
+            self._page = None
+            self.table.setRowCount(0)
+            self._set_status("还没有配置 MinIO：点右上角「存储配置」填地址和密钥（只存本机）", warn=True)
+            return
+        settings = dict(self._settings)
+
+        def work(report):
+            return s3_list_buckets(settings)
+
+        def done(buckets):
+            self.bucket_combo.blockSignals(True)
+            self.bucket_combo.clear()
+            self.bucket_combo.addItems(buckets)
+            target = select or self._settings.get("bucket") or (buckets[0] if buckets else "")
+            if target and target in buckets:
+                self.bucket_combo.setCurrentText(target)
+            self.bucket_combo.blockSignals(False)
+            self._bucket = self.bucket_combo.currentText()
+            self._prefix = ""
+            self._update_path()
+            if self._bucket:
+                self.reload()
+            else:
+                self._page = None
+                self.table.setRowCount(0)
+                self._set_status("这个存储里还没有桶", warn=True)
+
+        self._run(work, done, "正在读取桶列表…")
+
+    def _s3_ready(self):
+        settings = self._settings
+        return all((settings.get(key) or "").strip()
+                   for key in ("endpoint", "access_key", "secret_key"))
+
+    def _on_bucket_changed(self, bucket):
+        if self._task is not None and self._task.isRunning():
+            return
+        self._bucket = bucket
+        self._prefix = ""
+        self._update_path()
+        self.reload()
+
+    def reload(self, token=None, append=False):
+        if not self._bucket or not self._s3_ready():
+            return
+        settings = dict(self._settings)
+        settings["bucket"] = self._bucket
+        prefix = self._prefix
+
+        def work(report):
+            return s3_list_objects(settings, prefix=prefix, delimiter="/", max_keys=500, token=token)
+
+        def done(page):
+            if append and self._page:
+                folders = list(dict.fromkeys(self._page.get("folders", []) + page["folders"]))
+                files = self._page.get("files", []) + page["files"]
+                page = dict(page, folders=folders, files=files)
+            self._page = page
+            self._render(page)
+
+        self._run(work, done, "正在读取 %s…" % ("/" + prefix if prefix else "/"))
+
+    def _load_more(self):
+        if not self._page or not self._page.get("token"):
+            return
+        self.reload(token=self._page["token"], append=True)
+
+    def _render(self, page):
+        self.table.setRowCount(0)
+        folders = sorted(page.get("folders", []))
+        files = sorted(page.get("files", []), key=lambda item: item.get("key", ""))
+        for prefix in folders:
+            name = prefix[len(self._prefix):].strip("/")
+            self._add_row("folder", prefix, name + "/", "", "")
+        for item in files:
+            key = item.get("key", "")
+            if self._prefix and key.rstrip("/") == self._prefix.rstrip("/"):
+                continue                      # 文件夹占位对象（0 字节），不当文件显示
+            name = key[len(self._prefix):] if self._prefix and key.startswith(self._prefix) else \
+                key.rsplit("/", 1)[-1]
+            self._add_row("file", key, name, _human_size(item.get("size")),
+                          _s3_time_text(item.get("last_modified")))
+        self.more_btn.setVisible(bool(page.get("truncated") and page.get("token")))
+        count = self.table.rowCount()
+        self._set_status("共 %d 项 · %s" % (count, self._location()))
+        self._apply_filter(self.search_edit.text())
+
+    def _add_row(self, kind, key, name, size_text, time_text):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        name_item = QTableWidgetItem(name)
+        name_item.setData(Qt.UserRole, {"kind": kind, "key": key, "name": name})
+        if kind == "folder":
+            font = name_item.font()
+            font.setBold(True)
+            name_item.setFont(font)
+            name_item.setForeground(QColor("#1A73E8"))
+        self.table.setItem(row, 0, name_item)
+        self.table.setItem(row, 1, QTableWidgetItem(size_text))
+        self.table.setItem(row, 2, QTableWidgetItem(time_text))
+        self.table.setRowHeight(row, 28)
+
+    def _location(self):
+        return "minio://%s/%s" % (self._bucket or "-", self._prefix or "")
+
+    def _apply_filter(self, text):
+        needle = (text or "").strip().lower()
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            visible = True if not needle else needle in (item.text() or "").lower()
+            self.table.setRowHidden(row, not visible)
+
+    def _update_path(self):
+        while self.path_layout.count():
+            item = self.path_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        if not self._bucket:
+            return
+        root = QPushButton(self._bucket)
+        root.setStyleSheet(_S3_LINK_STYLE)
+        root.setCursor(QCursor(Qt.PointingHandCursor))
+        root.clicked.connect(lambda: self._enter_prefix(""))
+        self.path_layout.addWidget(root)
+        parts = [part for part in self._prefix.split("/") if part]
+        accumulated = ""
+        for part in parts:
+            accumulated += part + "/"
+            separator = QLabel("/")
+            separator.setStyleSheet("color: #B7C2D0;")
+            self.path_layout.addWidget(separator)
+            crumb = QPushButton(part)
+            crumb.setStyleSheet(_S3_LINK_STYLE)
+            crumb.setCursor(QCursor(Qt.PointingHandCursor))
+            crumb.clicked.connect(lambda _checked=False, prefix=accumulated: self._enter_prefix(prefix))
+            self.path_layout.addWidget(crumb)
+        self.path_layout.addStretch(1)
+
+    def _enter_prefix(self, prefix):
+        self._prefix = prefix or ""
+        self.search_edit.clear()
+        self._update_path()
+        self.reload()
+
+    def _on_double_click(self, item):
+        row = item.row()
+        payload = self.table.item(row, 0).data(Qt.UserRole) or {}
+        if payload.get("kind") == "folder":
+            self._enter_prefix(payload.get("key") or "")
+        else:
+            self._preview_key(payload.get("key") or "")
+
+    def _selected(self):
+        rows = sorted({index.row() for index in self.table.selectedIndexes()})
+        result = []
+        for row in rows:
+            payload = self.table.item(row, 0) and self.table.item(row, 0).data(Qt.UserRole)
+            if payload:
+                result.append((payload["kind"], payload["key"], payload["name"]))
+        return result
+
+    # ---- 动作 -----------------------------------------------------------
+
+    def upload_files(self):
+        if not self._bucket:
+            self._set_status("先选一个桶", warn=True)
+            return
+        paths, _ = QFileDialog.getOpenFileNames(self, "选择要上传的文件")
+        if not paths:
+            return
+        settings = dict(self._settings)
+        settings["bucket"] = self._bucket
+        prefix = self._prefix
+        count = len(paths)
+
+        def work(report):
+            uploaded = []
+            for index, path in enumerate(paths, 1):
+                name = os.path.basename(path)
+                key = prefix + name
+                report({"text": "上传 %d/%d %s" % (index, count, name),
+                        "total": count, "done": index - 1})
+
+                def on_bytes(sent, total, idx=index, label=name):
+                    report({"text": "上传 %d/%d %s（%s / %s）" % (
+                        idx, count, label, _human_size(sent), _human_size(total)),
+                        "total": count,
+                        "done": idx - 1 + (sent / total if total else 1)})
+
+                s3_upload_path(settings, path, key=key, report=on_bytes)
+                uploaded.append(key)
+            return uploaded
+
+        def done(uploaded):
+            self._set_status("已上传 %d 个文件" % len(uploaded))
+            self.reload()
+
+        self._run(work, done, "准备上传…")
+
+    def download_selected(self):
+        rows = self._selected()
+        if not rows:
+            self._set_status("先选一个文件", warn=True)
+            return
+        if len(rows) > 1 or rows[0][0] != "file":
+            self._set_status("下载只支持单个文件（目录请先进入再选文件）", warn=True)
+            return
+        key = rows[0][1]
+        default_name = os.path.join(os.path.expanduser("~/Downloads"), rows[0][2].rstrip("/"))
+        target, _ = QFileDialog.getSaveFileName(self, "保存到", default_name)
+        if not target:
+            return
+        settings = dict(self._settings)
+        settings["bucket"] = self._bucket
+        name = rows[0][2]
+
+        def work(report):
+            return s3_download_file(settings, key, target, report=lambda sent, total: report({
+                "text": "下载 %s（%s / %s）" % (name, _human_size(sent), _human_size(total)),
+                "total": total, "done": sent}))
+
+        def done(size):
+            self._set_status("已保存到 %s（%s）" % (target, _human_size(size)))
+
+        self._run(work, done, "开始下载…")
+
+    def delete_selected(self):
+        rows = self._selected()
+        if not rows:
+            self._set_status("先选中要删除的项", warn=True)
+            return
+        has_folder = any(kind == "folder" for kind, _key, _name in rows)
+        message = "确定删除选中的 %d 项？" % len(rows)
+        if has_folder:
+            message += "\n目录里的所有对象都会被删除，S3 没有回收站，删了不可恢复。"
+        if QMessageBox.question(self, "删除确认", message,
+                                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        settings = dict(self._settings)
+        settings["bucket"] = self._bucket
+
+        def work(report):
+            removed = 0
+            for kind, key, name in rows:
+                if kind == "folder":
+                    removed += s3_delete_prefix(settings, key, report=lambda amount, _k: report({
+                        "text": "正在删除 %s（已删 %d 个对象）" % (name, amount)}))
+                else:
+                    s3_delete_object(settings, key)
+                    removed += 1
+            return removed
+
+        def done(removed):
+            self._set_status("已删除 %d 个对象" % removed)
+            self.reload()
+
+        self._run(work, done, "正在删除…")
+
+    def copy_link(self):
+        rows = self._selected()
+        if len(rows) != 1 or rows[0][0] != "file":
+            self._set_status("复制链接需要选中单个文件", warn=True)
+            return
+        settings = dict(self._settings)
+        settings["bucket"] = self._bucket
+        try:
+            url = s3_presigned_url(settings, rows[0][1], expires=3600)
+        except Exception as exc:
+            self._set_status(str(exc), warn=True)
+            return
+        QApplication.clipboard().setText(url)
+        self._set_status("已复制直链（1 小时内有效），可以在浏览器里直接打开")
+
+    def new_bucket(self):
+        if not (self._settings.get("endpoint") or "").strip():
+            self._set_status("先点右上角「存储配置」填好地址和密钥", warn=True)
+            return
+        name, ok = QInputDialog.getText(
+            self, "新建桶", "桶名称（小写字母开头，可用字母、数字、- 和 .，3–63 位）：")
+        if not ok:
+            return
+        name = (name or "").strip()
+        if not name:
+            return
+        if not (3 <= len(name) <= 63 and name[0].islower() and name[-1].isalnum()
+                and all(ch.islower() or ch.isdigit() or ch in "-." for ch in name)):
+            self._set_status("桶名只能用 3–63 位小写字母、数字、- 和 .，且不能以 - 或 . 开头结尾", warn=True)
+            return
+        settings = dict(self._settings)
+        settings["bucket"] = name
+
+        def work(report):
+            return s3_make_bucket(settings, name)
+
+        def done(bucket):
+            self._set_status("已创建桶 %s" % bucket)
+            self.load_buckets(select=bucket)
+
+        self._run(work, done, "正在创建桶 %s…" % name)
+
+    def new_folder(self):
+        if not self._bucket:
+            self._set_status("先选一个桶", warn=True)
+            return
+        name, ok = QInputDialog.getText(self, "新建文件夹", "文件夹名称：")
+        if not ok:
+            return
+        name = (name or "").strip().strip("/")
+        if not name:
+            return
+        if "/" in name:
+            self._set_status("名称里不要带 /，需要层级就建完再进去建", warn=True)
+            return
+        settings = dict(self._settings)
+        settings["bucket"] = self._bucket
+        key = self._prefix + name + "/"
+
+        def work(report):
+            s3_put_object(settings, b"", key, content_type="application/x-directory")
+            return key
+
+        def done(_key):
+            self._set_status("已创建 %s" % name)
+            self.reload()
+
+        self._run(work, done, "正在创建文件夹…")
+
+    def preview_selected(self):
+        rows = self._selected()
+        if len(rows) != 1 or rows[0][0] != "file":
+            self._set_status("预览需要选中单个文件", warn=True)
+            return
+        self._preview_key(rows[0][1])
+
+    def _preview_key(self, key):
+        settings = dict(self._settings)
+        settings["bucket"] = self._bucket
+        ext = os.path.splitext(key)[1].lower()
+        if ext in self.IMAGE_EXT:
+
+            def work(report):
+                data = s3_get_object_bytes(settings, key, limit=24 * 1024 * 1024, timeout=60)
+                pixmap = QPixmap()
+                if not pixmap.loadFromData(data):
+                    raise RuntimeError("这个文件不是能直接显示的图片")
+                return pixmap
+
+            def done(pixmap):
+                self._show_preview(S3PreviewDialog(key, image=pixmap, parent=self))
+
+            self._run(work, done, "正在读取图片…")
+        elif ext in self.TEXT_EXT:
+
+            def work(report):
+                data = s3_get_object_bytes(settings, key, limit=262144, timeout=30)
+                return data.decode("utf-8", "replace")
+
+            def done(text):
+                self._show_preview(S3PreviewDialog(key, text=text, parent=self))
+
+            self._run(work, done, "正在读取文本…")
+        else:
+            try:
+                url = s3_presigned_url(settings, key, expires=3600)
+            except Exception as exc:
+                self._set_status(str(exc), warn=True)
+                return
+            QDesktopServices.openUrl(QUrl(url))
+            self._set_status("这个类型没有内嵌预览，已用系统默认程序/浏览器打开")
+
+    def _show_preview(self, dialog):
+        self._preview = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+
 class ToolboxWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -14213,6 +14912,7 @@ class ToolboxWindow(QMainWindow):
         self.popup = None
         self.data_format_window = None
         self.json_format_window = None
+        self.s3_window = None
         self.codec_window = None
         self.hash_window = None
         self.crypto_window = None
@@ -14361,9 +15061,10 @@ class ToolboxWindow(QMainWindow):
 
         self.create_section("系统与桌面", [
             "网络诊断", "进程管理", "配置", "截图贴图", "长截图", "取色器", "图片处理",
-            "防黑屏", "模拟锁屏", "文字雨"
+            "防黑屏", "模拟锁屏", "文字雨", "对象存储"
         ], {
             "网络诊断": self.show_network,
+            "对象存储": self.show_s3_browser,
             "进程管理": self.show_process_search,
             "配置": self.show_config,
             "截图贴图": self.show_screenshots,
@@ -15022,6 +15723,16 @@ class ToolboxWindow(QMainWindow):
             return
         self.popup = ProcessManagerWindow(self)
         self.popup.show()
+
+    def show_s3_browser(self):
+        """主界面入口：打开 MinIO 对象浏览窗口；配置只在本地，界面里不显示密钥。"""
+        if self.s3_window is None:
+            self.s3_window = S3BrowserWindow()
+            self.s3_window.settings_requested.connect(self.show_config)
+        self.s3_window.show()
+        self.s3_window.raise_()
+        self.s3_window.activateWindow()
+        self.s3_window.load_buckets(select=self.s3_window._bucket)
 
     def show_json_format(self):
         if self.json_format_window is None:

@@ -11,3 +11,7 @@ assets/icon.iconset/
 
 # 本地派生 spec，只在打包时临时生成
 toolbox_local_ocr.spec
+
+# 本机对象存储密钥，绝不入库
+s3_settings.json
+**/s3_settings.json

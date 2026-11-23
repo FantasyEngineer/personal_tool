@@ -278,3 +278,260 @@ def s3_upload_file(settings, local_path, key=None, timeout=60):
         data = f.read()
     content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
     return key, s3_put_object(settings, data, key, content_type, timeout)
+
+
+# ---- 浏览与传输（列表 / 下载 / 删除 / 预签名） --------------------------------
+
+_LIST_LIMIT = 1000          # ListObjectsV2 单页上限
+_STREAM_THRESHOLD = 32 * 1024 * 1024   # 超过 32 MB 走流式上传，避免整份读进内存
+
+
+def _localname(node, name):
+    return node.tag.rsplit("}", 1)[-1] == name
+
+
+def _parse_list_objects(body):
+    """解析 ListObjectsV2 的 XML；MinIO 与 AWS 返回结构一致。"""
+    root = ElementTree.fromstring(body)
+    items, prefixes = [], []
+    truncated, token = False, ""
+    for child in root:
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "Contents":
+            item = {"key": "", "size": 0, "last_modified": "", "etag": ""}
+            for field in child:
+                field_tag = field.tag.rsplit("}", 1)[-1]
+                if field_tag == "Key":
+                    item["key"] = (field.text or "")
+                elif field_tag == "Size":
+                    try:
+                        item["size"] = int(field.text or 0)
+                    except ValueError:
+                        item["size"] = 0
+                elif field_tag == "LastModified":
+                    item["last_modified"] = (field.text or "")
+                elif field_tag == "ETag":
+                    item["etag"] = (field.text or "").strip('"')
+            if item["key"]:
+                items.append(item)
+        elif tag == "CommonPrefixes":
+            for field in child:
+                if _localname(field, "Prefix"):
+                    prefixes.append(field.text or "")
+        elif tag == "IsTruncated":
+            truncated = (child.text or "").strip().lower() == "true"
+        elif tag == "NextContinuationToken":
+            token = (child.text or "").strip()
+    return {"files": items, "folders": prefixes, "truncated": truncated, "token": token}
+
+
+def s3_list_objects(settings, prefix="", delimiter="/", max_keys=_LIST_LIMIT, token=None, timeout=15):
+    """列对象。delimiter 给 "/" 时按目录分层，返回 folders(公共前缀) 与 files。
+
+    返回 {"prefix": 当前前缀, "folders": [...], "files": [...], "truncated": bool, "token": str}
+    """
+    _check_settings(settings)
+    bucket = (settings.get("bucket") or "").strip()
+    if not bucket:
+        raise ValueError("请先在设置里填 Bucket")
+    params = {"list-type": "2", "prefix": prefix or "", "max-keys": str(max(1, int(max_keys)))}
+    if delimiter:
+        params["delimiter"] = delimiter
+    if token:
+        params["continuation-token"] = token
+    request = _sign_request("GET", _bucket_url(settings, bucket), params, _EMPTY_SHA256, settings)
+    with _open(request, settings, timeout) as response:
+        body = response.read().decode("utf-8", "replace")
+    try:
+        parsed = _parse_list_objects(body)
+    except ElementTree.ParseError:
+        raise RuntimeError("对象列表解析失败，返回内容不是合法的 XML")
+    parsed["prefix"] = prefix or ""
+    parsed["bucket"] = bucket
+    return parsed
+
+
+def s3_get_object_bytes(settings, key, limit=None, timeout=30):
+    """取对象内容；给 limit 时用 Range 只取前 N 字节（预览文本用）。"""
+    _check_settings(settings)
+    bucket = (settings.get("bucket") or "").strip()
+    if not bucket:
+        raise ValueError("请先在设置里填 Bucket")
+    url = _object_path(settings, bucket, key)
+    request = _sign_request("GET", url, {}, _EMPTY_SHA256, settings)
+    if limit:
+        request.add_header("Range", "bytes=0-%d" % max(0, int(limit) - 1))
+    with _open(request, settings, timeout) as response:
+        return response.read(limit if limit else None)
+
+
+def s3_download_file(settings, key, local_path, timeout=120, report=None):
+    """流式下载到本地文件，边读边写，不在内存里堆整份数据。"""
+    _check_settings(settings)
+    bucket = (settings.get("bucket") or "").strip()
+    if not bucket:
+        raise ValueError("请先在设置里填 Bucket")
+    url = _object_path(settings, bucket, key)
+    request = _sign_request("GET", url, {}, _EMPTY_SHA256, settings)
+    total = 0
+    os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
+    with _open(request, settings, timeout) as response, open(local_path, "wb") as output:
+        length = int(response.headers.get("Content-Length") or 0)
+        while True:
+            chunk = response.read(262144)
+            if not chunk:
+                break
+            output.write(chunk)
+            total += len(chunk)
+            if report and length:
+                report(total, length)
+    return total
+
+
+def s3_delete_object(settings, key, timeout=15):
+    _check_settings(settings)
+    bucket = (settings.get("bucket") or "").strip()
+    if not bucket:
+        raise ValueError("请先在设置里填 Bucket")
+    url = _object_path(settings, bucket, key)
+    request = _sign_request("DELETE", url, {}, _EMPTY_SHA256, settings)
+    try:
+        with _open(request, settings, timeout) as response:
+            response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise
+    return True
+
+
+def s3_delete_prefix(settings, prefix, report=None, timeout=15):
+    """删除目录：S3 没有目录概念，只能把该前缀下的对象逐个删掉。"""
+    removed = 0
+    token = None
+    while True:
+        page = s3_list_objects(settings, prefix=prefix, delimiter="", token=token, timeout=timeout)
+        for item in page["files"]:
+            s3_delete_object(settings, item["key"], timeout=timeout)
+            removed += 1
+            if report:
+                report(removed, item["key"])
+        if not page["truncated"] or not page["token"]:
+            break
+        token = page["token"]
+    return removed
+
+
+def _stream_put(settings, local_path, key, content_type, payload_hash, size, timeout=None, report=None):
+    """大文件流式 PUT：先算好 payload hash，再用 http.client 分块发送。"""
+    parsed = urllib.parse.urlsplit(_object_path(settings, settings["bucket"], key))
+    host = parsed.netloc
+    path = urllib.parse.quote(parsed.path or "/", safe="/-_.~")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = now.strftime("%Y%m%d")
+    region = settings.get("region") or "us-east-1"
+    canonical_headers = ("host:%s\n" % host
+                         + "x-amz-content-sha256:%s\n" % payload_hash
+                         + "x-amz-date:%s\n" % amz_date)
+    signed_headers = "host;x-amz-content-sha256;x-amz-date"
+    canonical_request = "\n".join(["PUT", path, "", canonical_headers, signed_headers, payload_hash])
+    scope = "%s/%s/s3/aws4_request" % (date_stamp, region)
+    string_to_sign = "\n".join([_ALGORITHM, amz_date, scope,
+                                hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()])
+    signature = hmac.new(_signing_key(settings["secret_key"], date_stamp, region),
+                         string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    headers = {
+        "Host": host,
+        "x-amz-date": amz_date,
+        "x-amz-content-sha256": payload_hash,
+        "Authorization": "%s Credential=%s/%s, SignedHeaders=%s, Signature=%s"
+                         % (_ALGORITHM, settings["access_key"], scope, signed_headers, signature),
+        "Content-Type": content_type,
+        "Content-Length": str(size),
+    }
+    if parsed.scheme == "https":
+        context = https_context() if settings.get("verify_ssl", True) else ssl._create_unverified_context()
+        import http.client as _http
+        conn = _http.HTTPSConnection(host, timeout=timeout or 120, context=context)
+    else:
+        import http.client as _http
+        conn = _http.HTTPConnection(host, timeout=timeout or 120)
+    try:
+        conn.putrequest("PUT", path, skip_host=True, skip_accept_encoding=True)
+        for name, value in headers.items():
+            conn.putheader(name, value)
+        conn.endheaders()
+        sent = 0
+        with open(local_path, "rb") as source:
+            while True:
+                chunk = source.read(262144)
+                if not chunk:
+                    break
+                conn.send(chunk)
+                sent += len(chunk)
+                if report:
+                    report(sent, size)
+        response = conn.getresponse()
+        response.read()
+        if response.status not in (200, 201):
+            raise RuntimeError("上传失败：HTTP %d %s" % (response.status, response.reason))
+    finally:
+        conn.close()
+
+
+def s3_upload_path(settings, local_path, key=None, timeout=None, report=None):
+    """上传文件：小文件走内存 PUT，大文件走流式 PUT，都支持进度回调。"""
+    _check_settings(settings)
+    if not (settings.get("bucket") or "").strip():
+        raise ValueError("请先在设置里填 Bucket")
+    name = os.path.basename(local_path)
+    key = key or name
+    size = os.path.getsize(local_path)
+    content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    if size <= _STREAM_THRESHOLD:
+        with open(local_path, "rb") as f:
+            data = f.read()
+        s3_put_object(settings, data, key, content_type, timeout or 120)
+        if report:
+            report(size, size)
+        return key
+    digest = hashlib.sha256()
+    with open(local_path, "rb") as f:
+        while True:
+            chunk = f.read(1048576)
+            if not chunk:
+                break
+            digest.update(chunk)
+    _stream_put(settings, local_path, key, content_type, digest.hexdigest(), size,
+                timeout=timeout, report=report)
+    return key
+
+
+def s3_presigned_url(settings, key, expires=3600, bucket=None, method="GET"):
+    """生成预签名直链（默认 1 小时），拿出去就能在浏览器/下载器里直接开。"""
+    _check_settings(settings)
+    bucket = (bucket or settings.get("bucket") or "").strip()
+    if not bucket:
+        raise ValueError("请先在设置里填 Bucket")
+    url = _object_path(settings, bucket, key)
+    parsed = urllib.parse.urlsplit(url)
+    host, path = parsed.netloc, urllib.parse.quote(parsed.path or "/", safe="/-_.~")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = now.strftime("%Y%m%d")
+    region = settings.get("region") or "us-east-1"
+    scope = "%s/%s/s3/aws4_request" % (date_stamp, region)
+    params = {
+        "X-Amz-Algorithm": _ALGORITHM,
+        "X-Amz-Credential": "%s/%s" % (settings["access_key"], scope),
+        "X-Amz-Date": amz_date,
+        "X-Amz-Expires": str(max(1, int(expires))),
+        "X-Amz-SignedHeaders": "host",
+    }
+    query = _canonical_query(params)
+    canonical_request = "\n".join([method, path, query, "host:%s\n" % host, "host", "UNSIGNED-PAYLOAD"])
+    string_to_sign = "\n".join([_ALGORITHM, amz_date, scope,
+                                hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()])
+    signature = hmac.new(_signing_key(settings["secret_key"], date_stamp, region),
+                         string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    return "%s://%s%s?%s&X-Amz-Signature=%s" % (parsed.scheme, host, path, query, signature)

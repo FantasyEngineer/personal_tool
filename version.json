@@ -1,38 +1,38 @@
 {
-  "version": "1.0.68",
-  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.68/Toolbox-macos.zip",
-  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.68/Toolbox-windows.zip",
-  "changelog": "- 主界面「系统与桌面」新增「对象存储」入口（MinIO）\n- 原生 Qt 浏览窗口：列桶、新建桶、进入目录、面包屑、当前目录搜索、加载更多\n- 上传落到当前所在目录，可先新建文件夹再上传；不再自动生成 uploads/日期 目录\n- 下载、文本/图片预览、复制预签名直链、删除对象或整个目录\n- 列表区分目录与文件，隐藏文件夹占位对象，条目数按实际行统计\n- 修改时间统一转成本地时区；密钥只存本机，不入仓库",
+  "version": "1.0.69",
+  "mac_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.69/Toolbox-macos.zip",
+  "win_url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.69/Toolbox-windows.zip",
+  "changelog": "- 对象存储右上角「存储配置」改为打开设置并定位到「对象存储」页\n- 保存对象存储配置后，浏览窗口自动按新配置重新列桶\n- 修复选完文件/上传收尾时主窗口跳到最前、盖住上传窗口的问题\n- 该保护覆盖所有自有窗口（对象存储、工具窗口、对话框），提示条与 toast 不参与判断\n- 修正窗口类型判断写错导致误判的逻辑",
   "ocr_runtime": {
-    "version": "1.0.68",
+    "version": "1.0.69",
     "windows": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.68/ocr-runtime-windows.zip",
-      "sha256": "83df72711610b7c79a80154d083acad657dd8028350a08736b81c8775f435ab5",
-      "size": 96590944
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.69/ocr-runtime-windows.zip",
+      "sha256": "63529ae3d305a062fd587a50b8aa6b4627feb22507e355bbdbd49ad7e9fb80ec",
+      "size": 96590945
     },
     "windows_3_11": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.68/ocr-runtime-windows.zip",
-      "sha256": "83df72711610b7c79a80154d083acad657dd8028350a08736b81c8775f435ab5",
-      "size": 96590944
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.69/ocr-runtime-windows.zip",
+      "sha256": "63529ae3d305a062fd587a50b8aa6b4627feb22507e355bbdbd49ad7e9fb80ec",
+      "size": 96590945
     },
     "windows_3_12": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.68/ocr-runtime-windows-312.zip",
-      "sha256": "e0f719d309fbc8e5a83c6a75c9f232c96cbb43f7a6ddac890e5e0f9f31dfd0a5",
-      "size": 96516043
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.69/ocr-runtime-windows-312.zip",
+      "sha256": "90bdd2fcbfbe34a22efef2e742b100a4d9b87b321d6b91703617237db58fb74c",
+      "size": 96516040
     },
     "macos": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.68/ocr-runtime-macos.zip",
-      "sha256": "a99621df94aff68b3b255aadfbf43367622b8b61d27855bad0a8ee2b714998f0",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.69/ocr-runtime-macos.zip",
+      "sha256": "2440fb318cc74a1f17bc11b34f9e8c8a0352b2441c7a7312c82b07d636564348",
       "size": 83203688
     },
     "macos_3_11": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.68/ocr-runtime-macos.zip",
-      "sha256": "a99621df94aff68b3b255aadfbf43367622b8b61d27855bad0a8ee2b714998f0",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.69/ocr-runtime-macos.zip",
+      "sha256": "2440fb318cc74a1f17bc11b34f9e8c8a0352b2441c7a7312c82b07d636564348",
       "size": 83203688
     },
     "macos_3_12": {
-      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.68/ocr-runtime-macos-312.zip",
-      "sha256": "3a61b63da14a1a69ae876f8e58313e1c7ffd7b01d49b5536675c5dc31905180d",
+      "url": "https://pub-6df008c7dbb144a0bb95061716d54ce4.r2.dev/releases/v1.0.69/ocr-runtime-macos-312.zip",
+      "sha256": "788afc4988eac4dde892402a8478b004df2bc959b50d0b9f96f48d5f353f106c",
       "size": 83192516
     }
   }

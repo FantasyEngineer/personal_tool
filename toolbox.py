@@ -3118,15 +3118,22 @@ def capture_desktop():
 
 
 def scroll_screen_at(point, notches):
-    """在屏幕指定位置模拟鼠标滚轮（notches 为格数，正数向下滚动）。"""
-    if notches == 0:
+    """在屏幕指定位置模拟鼠标滚轮（notches 为格数，可为小数，正数向下滚动）。
+
+    Windows 上系统「一次滚 N 行」时一格就有 200 px 甚至更多，
+    长截图要能发不满一格的滚动量，否则短选区第一步就会把重叠冲掉。
+    """
+    if not notches:
         return
     system = platform.system()
     try:
         if system == "Windows":
+            delta = int(round(120 * float(notches)))
+            if delta == 0:
+                return
             user32 = ctypes.windll.user32
             user32.SetCursorPos(int(point.x()), int(point.y()))
-            user32.mouse_event(0x0800, 0, 0, -120 * int(notches), 0)
+            user32.mouse_event(0x0800, 0, 0, -delta, 0)
         elif system == "Darwin":
             from ctypes.util import find_library
             cg = ctypes.cdll.LoadLibrary(find_library("CoreGraphics"))
@@ -3160,7 +3167,10 @@ def scroll_screen_at(point, notches):
                 # - isContinuous=0 不会触发系统惯性，滚动量不会忽大忽小
                 # - 行增量 + 定点增量一起给，AppKit 各控件都认
                 cg.CGEventSetIntegerValueField(event, 88, 0)  # kCGScrollWheelEventIsContinuous
-                ticks = int(notches)
+                ticks = int(round(float(notches)))
+                if ticks == 0:
+                    # mac 只认整数单位，小数格数凑成至少 1 个单位，别变成「滚了但没动」
+                    ticks = 1 if notches > 0 else -1
                 cg.CGEventSetIntegerValueField(event, 11, -ticks)             # kCGScrollWheelEventDeltaAxis1
                 cg.CGEventSetIntegerValueField(event, 93, -ticks * 65536)     # kCGScrollWheelEventFixedPtDeltaAxis1
                 cg.CGEventPost(0, event)
@@ -4618,11 +4628,19 @@ class LongShotSession(QObject):
         self._done = False
         self._frames = 0
         self._busy = False
-        self._notches = 1
-        self._pixels_per_notch = 160.0
+        self._notches = 1.0
+        # 一格滚多少像素：首帧后按实测校准；默认值只是占位
+        self._pixels_per_notch = 200.0
         self._calibrated = False
-        # 没校准前先滚 6 格探一下：步子太小拼不上，太大会跳过头，失败后自动折半/加倍
-        self._probe_notches = 6
+        # 先滚不足一格探一下（Windows 实测 0.4 格≈80 px）：步子太大第一步就会把重叠冲掉。
+        # 不同 App 一格位移差别极大，滚不动时由 _adapt_probe 逐次加倍。
+        self._probe_notches = 0.4
+        # 最小步长：再小不少程序会先把滚轮量累积起来、之后突跳，反而更不可控
+        self._min_notches = 0.4
+        # 滚过头时逐步缩小步长
+        self._step_scale = 1.0
+        # 刚回滚过一帧，下一帧画面不变属于预期，不计入「到底部」判定
+        self._resyncing = False
         self._adapt_retry = 0
         self._no_tail_streak = 0
         self._last_result = "ok"
@@ -4675,14 +4693,15 @@ class LongShotSession(QObject):
             return
         frame_height = self._rows[0].height
         if self._calibrated:
-            target = max(60, int(frame_height * 0.45))
-            notches = max(1, int(round(target / self._pixels_per_notch)))
+            target = max(60.0, frame_height * 0.45) * self._step_scale
+            notches = target / self._pixels_per_notch
             # 单次滚动不超过选区高度的 70%，保证两帧之间总有重叠
-            limit = max(1, int(frame_height * 0.7 / self._pixels_per_notch))
-            notches = min(notches, limit, 12)
+            ceiling = max(self._min_notches, frame_height * 0.7 / self._pixels_per_notch)
+            notches = min(notches, ceiling)
         else:
-            # 还没实测出「一格滚多少像素」：先用探测步长，失败后自动调整
-            notches = self._probe_notches
+            # 还没实测出「一格滚多少像素」：先用很小的探测步长，失败后自动调整
+            notches = self._probe_notches * self._step_scale
+        notches = max(self._min_notches, min(float(notches), 12.0))
         self._notches = notches
         scroll_screen_at(self.rect.center(), notches)
         QTimer.singleShot(320, lambda: self._request_grab(first=False))
@@ -4742,6 +4761,15 @@ class LongShotSession(QObject):
             return True
         if frame_identical(current, self._last_frame):
             self._last_result = "still"
+            if self._resyncing:
+                # 刚从「滚过头」回退，画面回到原样是正常的，接着用更小的步长重试
+                self._resyncing = False
+                self._still = 0
+                return False
+            if self.auto and self._notches < 1.0 and self._still == 0:
+                # 不足一格时有的程序会先累积滚轮量，当帧没动不代表到底
+                self._last_result = "still"
+                return False
             if self.auto:
                 self._still += 1
                 # 连续两次画面不动就认为到底了，自动完成
@@ -4753,8 +4781,21 @@ class LongShotSession(QObject):
         start = self._overlap_offset(self._last_frame, current)
         if start is None:
             self._last_result = "no_overlap"
+            if self.auto and self._notches > self._min_notches * 1.01:
+                # 滚过头了：先退回原位，再用一半步长重来，别直接丢内容/报废本次长截图
+                scroll_screen_at(self.rect.center(), -self._notches)
+                self._step_scale = max(0.25, self._step_scale * 0.5)
+                self._resyncing = True
+                self._still = 0
+                self._last_result = "rolled_back"
+                self.notice.emit("滚动幅度过大，已回退并按一半步长重试")
+                return False
             if not self.auto:
                 self.notice.emit("找不到重叠部分：滚动幅度请控制在选区高度的 80% 以内再按空格")
+            elif self._calibrated or self._notches <= self._min_notches * 1.01:
+                # 已经是最小步长还是找不到重叠：别再空转，交回手动模式
+                self.set_auto(False)
+                self.notice.emit("自动滚动没找到重叠部分，已暂停 · 手动滚动后按空格继续")
             return False
         tail = current.crop((0, start, current.width, current.height))
         remaining = LONG_SHOT_MAX_HEIGHT - self._total_height()
@@ -4771,14 +4812,25 @@ class LongShotSession(QObject):
         self._last_frame = current
         self._frames += 1
         self._still = 0
+        self._resyncing = False
         self._adapt_retry = 0
         self._no_tail_streak = 0
         self._last_result = "ok"
         if start > 0:
             # start 是「新内容在当帧里的起始行」，实际位移 = 帧高 - start
             shift = float(current.height - start)
-            self._pixels_per_notch = max(4.0, shift / max(1, self._notches))
-            self._calibrated = True
+            measured = shift / max(0.01, float(self._notches))
+            if not self._calibrated and measured >= 20.0:
+                self._pixels_per_notch = measured
+                self._calibrated = True
+            elif self._calibrated and measured >= 20.0:
+                # 用本次实测轻微修正，避免一路累积误差
+                self._pixels_per_notch = 0.7 * self._pixels_per_notch + 0.3 * measured
+            overlap_ratio = start / max(1.0, float(current.height))
+            if overlap_ratio < 0.2:
+                self._step_scale = max(0.25, self._step_scale * 0.6)
+            elif overlap_ratio > 0.45:
+                self._step_scale = min(1.0, self._step_scale * 1.2)
         self.progress.emit(self._total_height(), self._frames)
         return True
 
@@ -4804,9 +4856,9 @@ class LongShotSession(QObject):
                 return
             self._probe_notches = min(40, self._probe_notches * 2)
         elif result == "no_overlap":
-            # 滚过头了，「新内容」全部跑出画面
+            # 滚过头了，「新内容」全部跑出画面（步长已到下限时 _take 会直接转手动）
             self._no_tail_streak = 0
-            self._probe_notches = max(1, self._probe_notches // 2)
+            self._probe_notches = max(self._min_notches, self._probe_notches / 2)
         else:
             return
         self._adapt_retry += 1

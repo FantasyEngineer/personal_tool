@@ -138,6 +138,11 @@ from toolbox_app.kit.ocrkit import (
     extract_runtime_zip, file_sha256, join_ocr_spans, run_ocr, ocr_mode_hint,
     ocr_llm_ready, load_ocr_settings, save_ocr_settings,
 )
+from toolbox_app.kit.s3kit import (
+    load_s3_settings, save_s3_settings, s3_test, s3_make_bucket,
+    s3_put_object, s3_upload_file,
+)
+from toolbox_app.constants import S3_SETTINGS_PATH
 from toolbox_app.kit.reminderkit import (
     REPEAT_CHOICES, REPEAT_DAILY, REPEAT_ONCE, REPEAT_WEEKDAY, REPEAT_INTERVAL,
     UNIT_CHOICES, INTERVAL_MAX, SNOOZE_MINUTES, MISSED_QUIET_SECONDS,
@@ -3118,15 +3123,22 @@ def capture_desktop():
 
 
 def scroll_screen_at(point, notches):
-    """在屏幕指定位置模拟鼠标滚轮（notches 为格数，正数向下滚动）。"""
-    if notches == 0:
+    """在屏幕指定位置模拟鼠标滚轮（notches 为格数，可为小数，正数向下滚动）。
+
+    Windows 上系统「一次滚 N 行」时一格就有 200 px 甚至更多，
+    长截图要能发不满一格的滚动量，否则短选区第一步就会把重叠冲掉。
+    """
+    if not notches:
         return
     system = platform.system()
     try:
         if system == "Windows":
+            delta = int(round(120 * float(notches)))
+            if delta == 0:
+                return
             user32 = ctypes.windll.user32
             user32.SetCursorPos(int(point.x()), int(point.y()))
-            user32.mouse_event(0x0800, 0, 0, -120 * int(notches), 0)
+            user32.mouse_event(0x0800, 0, 0, -delta, 0)
         elif system == "Darwin":
             from ctypes.util import find_library
             cg = ctypes.cdll.LoadLibrary(find_library("CoreGraphics"))
@@ -3160,7 +3172,10 @@ def scroll_screen_at(point, notches):
                 # - isContinuous=0 不会触发系统惯性，滚动量不会忽大忽小
                 # - 行增量 + 定点增量一起给，AppKit 各控件都认
                 cg.CGEventSetIntegerValueField(event, 88, 0)  # kCGScrollWheelEventIsContinuous
-                ticks = int(notches)
+                ticks = int(round(float(notches)))
+                if ticks == 0:
+                    # mac 只认整数单位，小数格数凑成至少 1 个单位，别变成「滚了但没动」
+                    ticks = 1 if notches > 0 else -1
                 cg.CGEventSetIntegerValueField(event, 11, -ticks)             # kCGScrollWheelEventDeltaAxis1
                 cg.CGEventSetIntegerValueField(event, 93, -ticks * 65536)     # kCGScrollWheelEventFixedPtDeltaAxis1
                 cg.CGEventPost(0, event)
@@ -4618,11 +4633,19 @@ class LongShotSession(QObject):
         self._done = False
         self._frames = 0
         self._busy = False
-        self._notches = 1
-        self._pixels_per_notch = 160.0
+        self._notches = 1.0
+        # 一格滚多少像素：首帧后按实测校准；默认值只是占位
+        self._pixels_per_notch = 200.0
         self._calibrated = False
-        # 没校准前先滚 6 格探一下：步子太小拼不上，太大会跳过头，失败后自动折半/加倍
-        self._probe_notches = 6
+        # 先滚不足一格探一下（Windows 实测 0.4 格≈80 px）：步子太大第一步就会把重叠冲掉。
+        # 不同 App 一格位移差别极大，滚不动时由 _adapt_probe 逐次加倍。
+        self._probe_notches = 0.4
+        # 最小步长：再小不少程序会先把滚轮量累积起来、之后突跳，反而更不可控
+        self._min_notches = 0.4
+        # 滚过头时逐步缩小步长
+        self._step_scale = 1.0
+        # 刚回滚过一帧，下一帧画面不变属于预期，不计入「到底部」判定
+        self._resyncing = False
         self._adapt_retry = 0
         self._no_tail_streak = 0
         self._last_result = "ok"
@@ -4675,14 +4698,15 @@ class LongShotSession(QObject):
             return
         frame_height = self._rows[0].height
         if self._calibrated:
-            target = max(60, int(frame_height * 0.45))
-            notches = max(1, int(round(target / self._pixels_per_notch)))
+            target = max(60.0, frame_height * 0.45) * self._step_scale
+            notches = target / self._pixels_per_notch
             # 单次滚动不超过选区高度的 70%，保证两帧之间总有重叠
-            limit = max(1, int(frame_height * 0.7 / self._pixels_per_notch))
-            notches = min(notches, limit, 12)
+            ceiling = max(self._min_notches, frame_height * 0.7 / self._pixels_per_notch)
+            notches = min(notches, ceiling)
         else:
-            # 还没实测出「一格滚多少像素」：先用探测步长，失败后自动调整
-            notches = self._probe_notches
+            # 还没实测出「一格滚多少像素」：先用很小的探测步长，失败后自动调整
+            notches = self._probe_notches * self._step_scale
+        notches = max(self._min_notches, min(float(notches), 12.0))
         self._notches = notches
         scroll_screen_at(self.rect.center(), notches)
         QTimer.singleShot(320, lambda: self._request_grab(first=False))
@@ -4742,6 +4766,15 @@ class LongShotSession(QObject):
             return True
         if frame_identical(current, self._last_frame):
             self._last_result = "still"
+            if self._resyncing:
+                # 刚从「滚过头」回退，画面回到原样是正常的，接着用更小的步长重试
+                self._resyncing = False
+                self._still = 0
+                return False
+            if self.auto and self._notches < 1.0 and self._still == 0:
+                # 不足一格时有的程序会先累积滚轮量，当帧没动不代表到底
+                self._last_result = "still"
+                return False
             if self.auto:
                 self._still += 1
                 # 连续两次画面不动就认为到底了，自动完成
@@ -4753,8 +4786,21 @@ class LongShotSession(QObject):
         start = self._overlap_offset(self._last_frame, current)
         if start is None:
             self._last_result = "no_overlap"
+            if self.auto and self._notches > self._min_notches * 1.01:
+                # 滚过头了：先退回原位，再用一半步长重来，别直接丢内容/报废本次长截图
+                scroll_screen_at(self.rect.center(), -self._notches)
+                self._step_scale = max(0.25, self._step_scale * 0.5)
+                self._resyncing = True
+                self._still = 0
+                self._last_result = "rolled_back"
+                self.notice.emit("滚动幅度过大，已回退并按一半步长重试")
+                return False
             if not self.auto:
                 self.notice.emit("找不到重叠部分：滚动幅度请控制在选区高度的 80% 以内再按空格")
+            elif self._calibrated or self._notches <= self._min_notches * 1.01:
+                # 已经是最小步长还是找不到重叠：别再空转，交回手动模式
+                self.set_auto(False)
+                self.notice.emit("自动滚动没找到重叠部分，已暂停 · 手动滚动后按空格继续")
             return False
         tail = current.crop((0, start, current.width, current.height))
         remaining = LONG_SHOT_MAX_HEIGHT - self._total_height()
@@ -4771,14 +4817,25 @@ class LongShotSession(QObject):
         self._last_frame = current
         self._frames += 1
         self._still = 0
+        self._resyncing = False
         self._adapt_retry = 0
         self._no_tail_streak = 0
         self._last_result = "ok"
         if start > 0:
             # start 是「新内容在当帧里的起始行」，实际位移 = 帧高 - start
             shift = float(current.height - start)
-            self._pixels_per_notch = max(4.0, shift / max(1, self._notches))
-            self._calibrated = True
+            measured = shift / max(0.01, float(self._notches))
+            if not self._calibrated and measured >= 20.0:
+                self._pixels_per_notch = measured
+                self._calibrated = True
+            elif self._calibrated and measured >= 20.0:
+                # 用本次实测轻微修正，避免一路累积误差
+                self._pixels_per_notch = 0.7 * self._pixels_per_notch + 0.3 * measured
+            overlap_ratio = start / max(1.0, float(current.height))
+            if overlap_ratio < 0.2:
+                self._step_scale = max(0.25, self._step_scale * 0.6)
+            elif overlap_ratio > 0.45:
+                self._step_scale = min(1.0, self._step_scale * 1.2)
         self.progress.emit(self._total_height(), self._frames)
         return True
 
@@ -4804,9 +4861,9 @@ class LongShotSession(QObject):
                 return
             self._probe_notches = min(40, self._probe_notches * 2)
         elif result == "no_overlap":
-            # 滚过头了，「新内容」全部跑出画面
+            # 滚过头了，「新内容」全部跑出画面（步长已到下限时 _take 会直接转手动）
             self._no_tail_streak = 0
-            self._probe_notches = max(1, self._probe_notches // 2)
+            self._probe_notches = max(self._min_notches, self._probe_notches / 2)
         else:
             return
         self._adapt_retry += 1
@@ -13430,8 +13487,151 @@ class SettingsWindow(QMainWindow):
         layout.addStretch()
         self._build_shortcuts_page()
         self._build_ocr_page()
+        self._build_s3_page()
         self.tabs.currentChanged.connect(self._sync_hotkeys)
         self.main.hotkey.status_changed.connect(self._refresh_shortcut_status)
+
+    def _build_s3_page(self):
+        page = QWidget()
+        self.tabs.addTab(page, "对象存储")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 18, 0, 0)
+        layout.setSpacing(10)
+        layout.addWidget(self._group_title("S3 / MinIO 接入"))
+        hint = QLabel("填好自己的 S3 兼容存储（MinIO、七牛、Cloudflare R2 等）就能在这个工具箱里上传文件。\n"
+                      "配置保存在 ~/.personal_toolbox/s3_settings.json，密钥以明文存放，只留在本机，别同步到仓库里。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #697386; font-size: 12px;")
+        layout.addWidget(hint)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setSpacing(8)
+        self.s3_endpoint_edit = QLineEdit()
+        self.s3_endpoint_edit.setPlaceholderText("http://192.168.1.12:9000")
+        self.s3_region_edit = QLineEdit()
+        self.s3_region_edit.setPlaceholderText("us-east-1")
+        self.s3_key_edit = QLineEdit()
+        self.s3_secret_edit = QLineEdit()
+        self.s3_secret_edit.setEchoMode(QLineEdit.Password)
+        self.s3_bucket_edit = QLineEdit()
+        self.s3_bucket_edit.setPlaceholderText("例如 toolbox")
+        for label, widget in (("服务地址", self.s3_endpoint_edit), ("区域", self.s3_region_edit),
+                              ("Access Key", self.s3_key_edit), ("Secret Key", self.s3_secret_edit),
+                              ("Bucket", self.s3_bucket_edit)):
+            widget.setMinimumHeight(28)
+            form.addRow(label, widget)
+        layout.addLayout(form)
+
+        self.s3_path_style_check = QCheckBox("使用 path-style 寻址（MinIO 默认；虚拟主机风格才取消）")
+        self.s3_path_style_check.setChecked(True)
+        layout.addWidget(self.s3_path_style_check)
+        self.s3_verify_check = QCheckBox("校验 HTTPS 证书（局域网自签证书访问不通时可取消）")
+        self.s3_verify_check.setChecked(True)
+        layout.addWidget(self.s3_verify_check)
+
+        self.s3_feedback = QLabel("")
+        self.s3_feedback.setWordWrap(True)
+        self.s3_feedback.setStyleSheet("color: #697386; font-size: 12px;")
+        layout.addWidget(self.s3_feedback)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        test_btn = QPushButton("测试连接")
+        test_btn.setFixedSize(96, 30)
+        test_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        test_btn.setStyleSheet(_secondary_btn())
+        test_btn.clicked.connect(self._test_s3)
+        buttons.addWidget(test_btn)
+        make_btn = QPushButton("建桶")
+        make_btn.setFixedSize(72, 30)
+        make_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        make_btn.setStyleSheet(_secondary_btn())
+        make_btn.clicked.connect(self._make_s3_bucket)
+        buttons.addWidget(make_btn)
+        upload_btn = QPushButton("上传文件")
+        upload_btn.setFixedSize(88, 30)
+        upload_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        upload_btn.setStyleSheet(_secondary_btn())
+        upload_btn.clicked.connect(self._upload_to_s3)
+        buttons.addWidget(upload_btn)
+        buttons.addStretch()
+        save = QPushButton("保存")
+        save.setFixedSize(88, 30)
+        save.setStyleSheet(_primary_btn())
+        save.setCursor(QCursor(Qt.PointingHandCursor))
+        save.clicked.connect(self._save_s3)
+        buttons.addWidget(save)
+        layout.addLayout(buttons)
+        layout.addStretch()
+        self._load_s3()
+
+    def _current_s3_settings(self):
+        return {
+            "endpoint": self.s3_endpoint_edit.text().strip(),
+            "region": self.s3_region_edit.text().strip() or "us-east-1",
+            "access_key": self.s3_key_edit.text().strip(),
+            "secret_key": self.s3_secret_edit.text().strip(),
+            "bucket": self.s3_bucket_edit.text().strip(),
+            "path_style": self.s3_path_style_check.isChecked(),
+            "verify_ssl": self.s3_verify_check.isChecked(),
+        }
+
+    def _load_s3(self):
+        settings = load_s3_settings()
+        self.s3_endpoint_edit.setText(settings["endpoint"])
+        self.s3_region_edit.setText(settings["region"])
+        self.s3_key_edit.setText(settings["access_key"])
+        self.s3_secret_edit.setText(settings["secret_key"])
+        self.s3_bucket_edit.setText(settings["bucket"])
+        self.s3_path_style_check.setChecked(settings["path_style"])
+        self.s3_verify_check.setChecked(settings["verify_ssl"])
+        self.s3_feedback.setText("未配置" if not settings["endpoint"] else "已配置")
+
+    def _save_s3(self):
+        settings = save_s3_settings(self._current_s3_settings())
+        self.s3_feedback.setText("已保存到 %s" % S3_SETTINGS_PATH
+                                 if settings["endpoint"] else "已保存（服务地址为空）")
+
+    def _test_s3(self):
+        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+        try:
+            ok, message = s3_test(self._current_s3_settings())
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.s3_feedback.setText(("通过 · " if ok else "失败 · ") + message)
+
+    def _make_s3_bucket(self):
+        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+        try:
+            bucket = s3_make_bucket(self._current_s3_settings())
+            message = "桶 %s 已就绪" % bucket
+        except Exception as exc:
+            message = "建桶失败：%s" % exc
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.s3_feedback.setText(message)
+
+    def _upload_to_s3(self):
+        settings = self._current_s3_settings()
+        if not (settings["bucket"] or "").strip():
+            self.s3_feedback.setText("请先填 Bucket")
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "选择要上传的文件", os.path.expanduser("~"))
+        if not path:
+            return
+        name = os.path.basename(path)
+        key = "uploads/%s/%s" % (datetime.datetime.now().strftime("%Y%m%d"), name)
+        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+        try:
+            saved = save_s3_settings(settings)          # 顺手把当前填的配置落盘
+            key, url = s3_upload_file(saved, path, key)
+            message = "已上传 · %s" % url
+        except Exception as exc:
+            message = "上传失败：%s" % exc
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.s3_feedback.setText(message)
 
     def _build_ocr_page(self):
         page = QWidget()

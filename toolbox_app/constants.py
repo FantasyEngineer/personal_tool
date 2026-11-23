@@ -24,6 +24,7 @@ SECTION_ORDER_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", 
 TOOL_ORDER_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "tool_order.json")
 SHORTCUTS_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "shortcuts.json")
 OCR_SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "ocr_settings.json")
+S3_SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "s3_settings.json")
 UPDATE_TARGET_PATH = os.path.join(os.path.expanduser("~"), ".personal_toolbox", "update_target.json")
 
 TOOL_RENAMES = {

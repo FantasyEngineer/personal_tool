@@ -138,6 +138,11 @@ from toolbox_app.kit.ocrkit import (
     extract_runtime_zip, file_sha256, join_ocr_spans, run_ocr, ocr_mode_hint,
     ocr_llm_ready, load_ocr_settings, save_ocr_settings,
 )
+from toolbox_app.kit.s3kit import (
+    load_s3_settings, save_s3_settings, s3_test, s3_make_bucket,
+    s3_put_object, s3_upload_file,
+)
+from toolbox_app.constants import S3_SETTINGS_PATH
 from toolbox_app.kit.reminderkit import (
     REPEAT_CHOICES, REPEAT_DAILY, REPEAT_ONCE, REPEAT_WEEKDAY, REPEAT_INTERVAL,
     UNIT_CHOICES, INTERVAL_MAX, SNOOZE_MINUTES, MISSED_QUIET_SECONDS,
@@ -13482,8 +13487,151 @@ class SettingsWindow(QMainWindow):
         layout.addStretch()
         self._build_shortcuts_page()
         self._build_ocr_page()
+        self._build_s3_page()
         self.tabs.currentChanged.connect(self._sync_hotkeys)
         self.main.hotkey.status_changed.connect(self._refresh_shortcut_status)
+
+    def _build_s3_page(self):
+        page = QWidget()
+        self.tabs.addTab(page, "对象存储")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 18, 0, 0)
+        layout.setSpacing(10)
+        layout.addWidget(self._group_title("S3 / MinIO 接入"))
+        hint = QLabel("填好自己的 S3 兼容存储（MinIO、七牛、Cloudflare R2 等）就能在这个工具箱里上传文件。\n"
+                      "配置保存在 ~/.personal_toolbox/s3_settings.json，密钥以明文存放，只留在本机，别同步到仓库里。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #697386; font-size: 12px;")
+        layout.addWidget(hint)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setSpacing(8)
+        self.s3_endpoint_edit = QLineEdit()
+        self.s3_endpoint_edit.setPlaceholderText("http://192.168.1.12:9000")
+        self.s3_region_edit = QLineEdit()
+        self.s3_region_edit.setPlaceholderText("us-east-1")
+        self.s3_key_edit = QLineEdit()
+        self.s3_secret_edit = QLineEdit()
+        self.s3_secret_edit.setEchoMode(QLineEdit.Password)
+        self.s3_bucket_edit = QLineEdit()
+        self.s3_bucket_edit.setPlaceholderText("例如 toolbox")
+        for label, widget in (("服务地址", self.s3_endpoint_edit), ("区域", self.s3_region_edit),
+                              ("Access Key", self.s3_key_edit), ("Secret Key", self.s3_secret_edit),
+                              ("Bucket", self.s3_bucket_edit)):
+            widget.setMinimumHeight(28)
+            form.addRow(label, widget)
+        layout.addLayout(form)
+
+        self.s3_path_style_check = QCheckBox("使用 path-style 寻址（MinIO 默认；虚拟主机风格才取消）")
+        self.s3_path_style_check.setChecked(True)
+        layout.addWidget(self.s3_path_style_check)
+        self.s3_verify_check = QCheckBox("校验 HTTPS 证书（局域网自签证书访问不通时可取消）")
+        self.s3_verify_check.setChecked(True)
+        layout.addWidget(self.s3_verify_check)
+
+        self.s3_feedback = QLabel("")
+        self.s3_feedback.setWordWrap(True)
+        self.s3_feedback.setStyleSheet("color: #697386; font-size: 12px;")
+        layout.addWidget(self.s3_feedback)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        test_btn = QPushButton("测试连接")
+        test_btn.setFixedSize(96, 30)
+        test_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        test_btn.setStyleSheet(_secondary_btn())
+        test_btn.clicked.connect(self._test_s3)
+        buttons.addWidget(test_btn)
+        make_btn = QPushButton("建桶")
+        make_btn.setFixedSize(72, 30)
+        make_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        make_btn.setStyleSheet(_secondary_btn())
+        make_btn.clicked.connect(self._make_s3_bucket)
+        buttons.addWidget(make_btn)
+        upload_btn = QPushButton("上传文件")
+        upload_btn.setFixedSize(88, 30)
+        upload_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        upload_btn.setStyleSheet(_secondary_btn())
+        upload_btn.clicked.connect(self._upload_to_s3)
+        buttons.addWidget(upload_btn)
+        buttons.addStretch()
+        save = QPushButton("保存")
+        save.setFixedSize(88, 30)
+        save.setStyleSheet(_primary_btn())
+        save.setCursor(QCursor(Qt.PointingHandCursor))
+        save.clicked.connect(self._save_s3)
+        buttons.addWidget(save)
+        layout.addLayout(buttons)
+        layout.addStretch()
+        self._load_s3()
+
+    def _current_s3_settings(self):
+        return {
+            "endpoint": self.s3_endpoint_edit.text().strip(),
+            "region": self.s3_region_edit.text().strip() or "us-east-1",
+            "access_key": self.s3_key_edit.text().strip(),
+            "secret_key": self.s3_secret_edit.text().strip(),
+            "bucket": self.s3_bucket_edit.text().strip(),
+            "path_style": self.s3_path_style_check.isChecked(),
+            "verify_ssl": self.s3_verify_check.isChecked(),
+        }
+
+    def _load_s3(self):
+        settings = load_s3_settings()
+        self.s3_endpoint_edit.setText(settings["endpoint"])
+        self.s3_region_edit.setText(settings["region"])
+        self.s3_key_edit.setText(settings["access_key"])
+        self.s3_secret_edit.setText(settings["secret_key"])
+        self.s3_bucket_edit.setText(settings["bucket"])
+        self.s3_path_style_check.setChecked(settings["path_style"])
+        self.s3_verify_check.setChecked(settings["verify_ssl"])
+        self.s3_feedback.setText("未配置" if not settings["endpoint"] else "已配置")
+
+    def _save_s3(self):
+        settings = save_s3_settings(self._current_s3_settings())
+        self.s3_feedback.setText("已保存到 %s" % S3_SETTINGS_PATH
+                                 if settings["endpoint"] else "已保存（服务地址为空）")
+
+    def _test_s3(self):
+        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+        try:
+            ok, message = s3_test(self._current_s3_settings())
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.s3_feedback.setText(("通过 · " if ok else "失败 · ") + message)
+
+    def _make_s3_bucket(self):
+        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+        try:
+            bucket = s3_make_bucket(self._current_s3_settings())
+            message = "桶 %s 已就绪" % bucket
+        except Exception as exc:
+            message = "建桶失败：%s" % exc
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.s3_feedback.setText(message)
+
+    def _upload_to_s3(self):
+        settings = self._current_s3_settings()
+        if not (settings["bucket"] or "").strip():
+            self.s3_feedback.setText("请先填 Bucket")
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "选择要上传的文件", os.path.expanduser("~"))
+        if not path:
+            return
+        name = os.path.basename(path)
+        key = "uploads/%s/%s" % (datetime.datetime.now().strftime("%Y%m%d"), name)
+        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+        try:
+            saved = save_s3_settings(settings)          # 顺手把当前填的配置落盘
+            key, url = s3_upload_file(saved, path, key)
+            message = "已上传 · %s" % url
+        except Exception as exc:
+            message = "上传失败：%s" % exc
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.s3_feedback.setText(message)
 
     def _build_ocr_page(self):
         page = QWidget()

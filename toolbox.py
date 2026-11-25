@@ -12034,7 +12034,8 @@ PINYIN_MAP = {
 LAUNCH_AGENT_PATH = os.path.join(os.path.expanduser("~"), "Library",
                                  "LaunchAgents", "com.personal.toolbox.plist")
 LAUNCH_AGENT_LABEL = "com.personal.toolbox"
-WIN_RUN_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
+WIN_RUN_SUBKEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+WIN_RUN_KEY = r"HKCU" + "\\" + WIN_RUN_SUBKEY
 WIN_RUN_NAME = "PersonalToolbox"
 
 
@@ -12086,6 +12087,45 @@ def autostart_programs():
     return [sys.executable, app_launch_path()]
 
 
+def win_run_command():
+    """写进 HKCU Run 的命令行：路径带引号，避免安装路径里有空格时被拆开。"""
+    return '"%s"' % app_launch_path()
+
+
+def win_autostart_value():
+    """读 HKCU Run 里本应用的自启命令；没有则返回 None。
+
+    这里用 winreg 而不是 reg.exe：有些机器在 HKCU\\Software\\Microsoft\\Windows\\
+    CurrentVersion\\Policies\\System 里设了 DisableRegistryTools=1，reg/regedit 会直接
+    报 "Registry editing has been disabled by your administrator" 并退出 1，而注册表
+    写入 API 仍然可用。顺带也躲开了 reg.exe 不在 PATH 里的情况。
+    """
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WIN_RUN_SUBKEY) as key:
+            value, _ = winreg.QueryValueEx(key, WIN_RUN_NAME)
+    except OSError:
+        return None
+    return str(value) if value else None
+
+
+def win_write_autostart(command):
+    import winreg
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, WIN_RUN_SUBKEY, 0,
+                            winreg.KEY_SET_VALUE) as key:
+        winreg.SetValueEx(key, WIN_RUN_NAME, 0, winreg.REG_SZ, command)
+
+
+def win_remove_autostart():
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WIN_RUN_SUBKEY, 0,
+                            winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, WIN_RUN_NAME)
+    except FileNotFoundError:
+        pass
+
+
 def autostart_status():
     if platform.system() == "Darwin":
         if not os.path.exists(LAUNCH_AGENT_PATH):
@@ -12101,9 +12141,12 @@ def autostart_status():
             return False
         return bool(target) and os.path.exists(target)
     if platform.system() == "Windows":
-        result = subprocess.run(["reg", "query", WIN_RUN_KEY, "/v", WIN_RUN_NAME],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return result.returncode == 0
+        value = win_autostart_value()
+        if not value:
+            return False
+        # 记录的路径已经不是当前这份程序（移动过安装位置 / 换过版本）时不算开启，
+        # 否则界面显示"已开启"而开机时指向一个不存在的 exe。
+        return os.path.normcase(app_launch_path()) in os.path.normcase(value)
     return False
 
 
@@ -12170,12 +12213,10 @@ def set_autostart(enable):
 
     if system == "Windows":
         if enable:
-            subprocess.run(["reg", "add", WIN_RUN_KEY, "/v", WIN_RUN_NAME,
-                            "/t", "REG_SZ", "/d", '"%s"' % app_launch_path(), "/f"],
-                           check=True)
-            return "已开启：HKCU 启动项 %s = %s" % (WIN_RUN_NAME, app_launch_path())
-        subprocess.run(["reg", "delete", WIN_RUN_KEY, "/v", WIN_RUN_NAME, "/f"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            command = win_run_command()
+            win_write_autostart(command)
+            return "已开启：HKCU 启动项 %s = %s" % (WIN_RUN_NAME, command)
+        win_remove_autostart()
         return "已关闭：删除启动项 %s" % WIN_RUN_NAME
 
     return "当前平台不支持开机自启，请保持应用运行（含最小化到托盘）"
